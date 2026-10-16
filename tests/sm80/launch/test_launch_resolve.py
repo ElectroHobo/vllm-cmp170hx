@@ -241,3 +241,54 @@ def test_cli_change_breaks_functional_match(w):
     d = w.resolve("--set", "env.VLLM_FAST_PATH=0")
     assert d["validated"]["functional_match"] is False
     assert "functional ≠ validated" in d["validated"]["reasons"]
+
+
+# -- hardware cuda_home per runtime ---------------------------------------------------------
+
+def with_cuda_home(w, line: str) -> None:
+    from helpers import HARDWARE_TOML
+    write(os.path.join(w.settings, "hardware", "two-card.toml"), HARDWARE_TOML + line + "\n")
+
+
+def cuda_homes(w) -> tuple[str, str]:
+    native = w.resolve()["child_env"]["CUDA_HOME"]["value"]
+    container = w.resolve("--runtime", "container", "--tree", w.tree)["child_env"]["CUDA_HOME"]["value"]
+    return native, container
+
+
+@pytest.mark.parametrize("line, native, container", [
+    ("", "/usr/local/cuda", "/usr/local/cuda"),
+    ('cuda_home = "/opt/cuda-13.3"', "/opt/cuda-13.3", "/usr/local/cuda"),
+    ('cuda_home = { native = "/opt/cuda-13.3", container = "/usr/local/cuda-13.3" }',
+     "/opt/cuda-13.3", "/usr/local/cuda-13.3"),
+    ('cuda_home = { container = "/usr/local/cuda-13.3" }', "/usr/local/cuda", "/usr/local/cuda-13.3"),
+    ('cuda_home = { native = "/opt/cuda-13.3" }', "/opt/cuda-13.3", "/usr/local/cuda"),
+])
+def test_hardware_cuda_home_per_runtime(w, line, native, container):
+    """A plain cuda_home names the native CUDA only; a { native, container }
+    table names it per runtime; a runtime it leaves out keeps the default."""
+    with_cuda_home(w, line)
+    assert cuda_homes(w) == (native, container)
+
+
+def test_plain_cuda_home_resolves_as_before(w):
+    """The plain form and a table naming the same native CUDA resolve the
+    same launch; PATH follows the CUDA chosen."""
+    with_cuda_home(w, 'cuda_home = "/opt/cuda-13.3"')
+    plain = w.resolve()
+    with_cuda_home(w, 'cuda_home = { native = "/opt/cuda-13.3" }')
+    table = w.resolve()
+    for key in ("argv", "child_env", "functional_sha256"):
+        assert plain[key] == table[key], key
+    assert "/opt/cuda-13.3/bin" in plain["child_env"]["PATH"]["value"].split(":")
+
+
+@pytest.mark.parametrize("line, expect", [
+    ('cuda_home = { native = "/opt/cuda", gpu = "/x" }', "unknown runtime gpu"),
+    ('cuda_home = { native = 13 }', "cuda_home.native: not a directory name"),
+    ('cuda_home = { native = "" }', "cuda_home.native: not a directory name"),
+    ("cuda_home = 13", "a directory name or a { native, container } table"),
+])
+def test_hardware_cuda_home_malformed_refused(w, line, expect):
+    with_cuda_home(w, line)
+    assert expect in w.refused()
