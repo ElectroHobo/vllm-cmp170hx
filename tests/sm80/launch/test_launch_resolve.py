@@ -73,31 +73,57 @@ def test_variant_with_layout_subtable_and_unset(w):
     assert d["unset"]["args.trust-remote-code"] == "variant"
 
 
-@pytest.mark.parametrize("text, key", [
-    ('[env]\nVLLM_FAST_PATH = { value = "1", why = "x" }\nunset_here = ["env.VLLM_FAST_PATH"]\n',
-     "env.VLLM_FAST_PATH"),
-    ('[args]\nmax-num-seqs = 4\nunset_here = ["args.max_num_seqs"]\n', "args.max-num-seqs"),
-    ('[args.compilation-config]\nlevel = 1\nunset_here = ["args.compilation-config.level"]\n',
-     "args.compilation-config.level"),
-    ('[location]\nTMPDIR = "/x"\nunset_here = ["loc.TMPDIR"]\n', "loc.TMPDIR"),
-    ('[layout.pp2]\nunset = ["args.block-size"]\n[layout.pp2.args]\nblock-size = 16\n',
-     "args.block-size"),
-])
+SET_AND_UNSET = {
+    # one table
+    "env": ('unset = ["env.VLLM_FAST_PATH"]\n[env]\nVLLM_FAST_PATH = { value = "1", why = "x" }\n',
+            "env.VLLM_FAST_PATH"),
+    "args": ('unset = ["args.max_num_seqs"]\n[args]\nmax-num-seqs = 4\n', "args.max-num-seqs"),
+    "nested": ('unset = ["args.compilation-config.level"]\n[args.compilation-config]\nlevel = 1\n',
+               "args.compilation-config.level"),
+    "location": ('unset = ["loc.TMPDIR"]\n[location]\nTMPDIR = "/x"\n', "loc.TMPDIR"),
+    "layout": ('[layout.pp2]\nunset = ["args.block-size"]\n[layout.pp2.args]\nblock-size = 16\n',
+               "args.block-size"),
+    # across the tables of one file
+    "top-unset-layout-set": ('unset = ["env.VLLM_FAST_PATH"]\n[layout.tp2.env]\nVLLM_FAST_PATH = "1"\n',
+                             "env.VLLM_FAST_PATH"),
+    "top-set-layout-unset": ('[args]\nmax-num-seqs = 4\n[layout.pp2]\nunset = ["args.max-num-seqs"]\n',
+                             "args.max-num-seqs"),
+    "two-layouts": ('[layout.tp2]\nunset = ["env.VLLM_KERNEL_X"]\n[layout.pp2.env]\nVLLM_KERNEL_X = "1"\n',
+                    "env.VLLM_KERNEL_X"),
+    "parent-child": ('unset = ["args.compilation-config"]\n[layout.tp2.args.compilation-config]\nlevel = 1\n',
+                     "args.compilation-config"),
+}
+
+
+@pytest.mark.parametrize("layout", ["tp2", "pp2"])
+@pytest.mark.parametrize("case", sorted(SET_AND_UNSET))
 @pytest.mark.parametrize("kind", ["variant", "overlay"])
-def test_key_both_set_and_unset_in_one_table_refused(w, tmp_path, text, key, kind):
-    """One table that both sets and unsets a key contradicts itself: refused
-    (variant and overlay files alike), whichever layout it targets."""
-    head = f'schema = "launch-{kind}/1"\n'
-    if "unset_here" in text:
-        body, _, unset = text.partition("unset_here = ")
-        text = f"unset = {unset}" + body       # top-level keys come before tables
-    path = write(str(tmp_path / f"{kind}.toml"), head + text)
+def test_key_both_set_and_unset_in_one_file_refused(w, tmp_path, case, kind, layout):
+    """One file that both sets and unsets a key (or a parent or child key)
+    contradicts itself, in one table or across its top level and its
+    [layout.*] tables: refused for variant and overlay files alike, whichever
+    layout is launched."""
+    text, key = SET_AND_UNSET[case]
+    text = f'schema = "launch-{kind}/1"\n' + text
     if kind == "variant":
-        write(os.path.join(w.settings, "variants", "both.toml"), head + text)
-        assert "both set" in w.refused("--variant", "both", layout="pp2") and key in w.refused(
-            "--variant", "both", layout="pp2")
+        write(os.path.join(w.settings, "variants", "both.toml"), text)
+        msg = w.refused("--variant", "both", layout=layout)
     else:
-        assert "both set" in w.refused("--overlay", path, "--experiment", "e", layout="pp2")
+        msg = w.refused("--overlay", write(str(tmp_path / "o.toml"), text), "--experiment", "e",
+                        layout=layout)
+    assert "in the same file" in msg and key in msg, msg
+
+
+def test_one_file_unsetting_what_another_sets_still_applies(w, tmp_path):
+    """Across files the layering decides, as before: a variant unsets a key
+    the layout file sets, and an overlay sets a key the variant unsets."""
+    write(os.path.join(w.settings, "variants", "off.toml"),
+          'schema = "launch-variant/1"\nunset = ["env.VLLM_FAST_PATH"]\n')
+    d = w.resolve("--variant", "off", layout="tp2")
+    assert "VLLM_FAST_PATH" not in d["child_env"] and d["unset"]["env.VLLM_FAST_PATH"] == "variant"
+    ov = write(str(tmp_path / "on.toml"), 'schema = "launch-overlay/1"\n[env]\nVLLM_FAST_PATH = "1"\n')
+    d = w.resolve("--variant", "off", "--overlay", ov, "--experiment", "e", layout="tp2")
+    assert d["child_env"]["VLLM_FAST_PATH"]["value"] == "1"
 
 
 def test_user_knobs(w, tmp_path):

@@ -133,14 +133,45 @@ def _env_value(v: Any, where: str) -> str:
     return str(v)
 
 
+def _set_and_unset(table: dict) -> tuple[list[str], list[str]]:
+    """The keys one table sets and the keys it unsets (its own level only)."""
+    sets = [key for key in _TOP_KEYS if key in table]
+    sets += ["args." + normalize_arg_name(k) for k in table.get("args", {})]
+    for section, prefix in (("env", "env."), ("location", "loc.")):
+        sets += [prefix + k for k in table.get(section, {})]
+    unsets = [normalize_key(k) for k in table.get("unset", []) if isinstance(k, str)]
+    return sets, unsets
+
+
+def _check_set_and_unset(table: dict, source: str) -> None:
+    """A file that both sets and unsets a key (or a parent or child key of
+    it) contradicts itself, wherever in the file the two are: its top level
+    and every [layout.<L>] sub-table count together."""
+    sets, unsets = [], []
+    parts = [("", table)] + [(f"[layout.{name}]", sub) for name, sub in table.get("layout", {}).items()
+                             if isinstance(sub, dict)]
+    for where, part in parts:
+        s, u = _set_and_unset(part)
+        sets += [(key, where) for key in s]
+        unsets += [(key, where) for key in u]
+    for key, where in unsets:
+        both = [f"{s}{w}" for s, w in sets if s == key or s.startswith(key + ".") or key.startswith(s + ".")]
+        if both:
+            raise Refusal(f"{source}: {key} is unset{where or ' at the top level'} and set "
+                          f"({', '.join(both)}) in the same file; keep one")
+
+
 def apply_table(final: Final, table: dict, layer: str, source: str, *,
-                layout: str | None = None, runtime: str | None = None) -> None:
+                layout: str | None = None, runtime: str | None = None,
+                whole_file: bool = True) -> None:
     """Apply one settings table (layout, variant, overlay, hardware, model).
 
     A [location] value may be ``{ native = "...", container = "..." }``:
     only the current runtime's entry applies (none if it is missing). A key
-    the table both sets and unsets is refused."""
-    set_keys = [key for key in _TOP_KEYS if key in table]
+    the file both sets and unsets, in any of its tables, is refused; one
+    file overriding another is the layering's job."""
+    if whole_file:
+        _check_set_and_unset(table, source)
     for key in _TOP_KEYS:
         if key in table:
             v = table[key]
@@ -155,7 +186,6 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
         key = "args." + normalize_arg_name(k)
         if key in GEOMETRY_ARGS:
             raise Refusal(f"{source}: set tp/pp, not --{key[5:]}")
-        set_keys.append(key)
         sub_whys: dict[str, str] = {}
         val, why = split_value(v, source, sub_whys)
         final.put(key, val, layer, source, why)
@@ -165,7 +195,6 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
         for k, v in table.get(section, {}).items():
             if not _ENV_NAME.match(k):
                 raise Refusal(f"{source}: {k!r} is not an environment name")
-            set_keys.append(prefix + k)
             val, why = split_value(v, source)
             if section == "location" and isinstance(val, dict):
                 if not set(val) <= set(RUNTIMES):
@@ -180,15 +209,12 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
         key = normalize_key(key)
         if key in GEOMETRY_ARGS or key in ("tp", "pp", "cards"):
             raise Refusal(f"{source}: geometry cannot be unset")
-        both = [s for s in set_keys if s == key or s.startswith(key + ".") or key.startswith(s + ".")]
-        if both:
-            raise Refusal(f"{source}: {key} is both set ({', '.join(both)}) and unset in one table; "
-                          "keep one")
         final.drop(key, layer)
     if layout is not None:
         sub = table.get("layout", {}).get(layout)
         if sub:
-            apply_table(final, sub, layer, f"{source}[layout.{layout}]", runtime=runtime)
+            apply_table(final, sub, layer, f"{source}[layout.{layout}]", runtime=runtime,
+                        whole_file=False)
 
 
 def substitute(value: Any, subst: dict[str, str], where: str) -> Any:
