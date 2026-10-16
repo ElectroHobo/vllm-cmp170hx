@@ -15,12 +15,15 @@ Every key of the final object records its value, layer, source file and
 
 Guards on the object: geometry has one representation (``tp``/``pp``;
 the parallel-size arguments are derived from it); ``args.model`` is always
-a checkpoint reference (relocation goes through the verified checkpoint
-path); [fixed] keys and controlled arguments change only under
---experiment, whatever the channel (overlay, .env, ambient, --set, unset);
-only the launcher's own instrumentation list is excluded from the
-functional hash; every child environment name is classified by the closed
-class table whichever table supplied it.
+a checkpoint reference, and the reference (not its directory) is part of
+the functional argv; [fixed] keys and controlled arguments change only
+under --experiment, whatever the channel (overlay, .env, ambient, --set,
+extra arguments, unset); only the launcher's own instrumentation list and
+the host/port location are excluded from the functional hash, and their
+values must be plain scalars; no argument value may carry an option token;
+every child environment name is classified by the closed class table
+whichever table supplied it; secret targets are fixed by the model's
+declarations before any input is read.
 """
 
 from __future__ import annotations
@@ -44,9 +47,12 @@ from settings_dir import check_arg_spellings, normalize_arg_name, normalize_key
 LOCKED_LAYERS = ("overlay", "user", "ambient", "cli")   # [fixed] needs --experiment
 RUNTIMES = ("native", "container")
 GEOMETRY_ARGS = ("args.tensor-parallel-size", "args.pipeline-parallel-size")
+GEOMETRY_ARGS_NAMES = tuple(k[5:] for k in GEOMETRY_ARGS)
+LOCATION_ARGS = ("host", "port")
 _SUBST = re.compile(r"\$\{([^}]*)\}")
 _CHECKPOINT_REF = re.compile(r"^\$\{checkpoint\.([A-Za-z0-9_-]+)\.path\}$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SHORT_OPTION = re.compile(r"^-[A-Za-z]")
 _TOP_KEYS = ("tp", "pp", "cards", "card_ids")
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("", "0", "false", "no", "off")
@@ -184,10 +190,24 @@ def render_arg(name: str, value: Any) -> list[str]:
     if isinstance(value, dict):
         return [f"--{name}", json.dumps(value, separators=(",", ":"), ensure_ascii=False)]
     if isinstance(value, list):
-        return [f"--{name}", *[str(v) for v in value]]
+        items = [str(v) for v in value]
+        if any(i.startswith("-") and not _number(i) for i in items):
+            raise Refusal(f"--{name}: a list value may not carry an option token ({items})")
+        return [f"--{name}", *items]
     if isinstance(value, float):
         return [f"--{name}", repr(value)]
-    return [f"--{name}", str(value)]
+    text = str(value)
+    if text.startswith("-") and not _number(text):
+        raise Refusal(f"--{name}: a value may not start with '-' ({text!r})")
+    return [f"--{name}", text]
+
+
+def _number(text: str) -> bool:
+    try:
+        float(text)
+        return True
+    except ValueError:
+        return False
 
 
 def parse_set(item: str) -> tuple[str, Any]:
@@ -266,6 +286,33 @@ class Resolved:
     checkpoint_refs: list[str]
 
 
+def declared_secrets(ms: ModelSettings) -> set[str]:
+    """Environment names the model declares secret through [user] knobs."""
+    out: set[str] = set()
+    for spec in ms.user.values():
+        if spec.get("secret") and spec.get("target"):
+            targets = spec["target"] if isinstance(spec["target"], list) else [spec["target"]]
+            out |= {t[4:] for t in targets if t.startswith("env.")}
+    return out
+
+
+def check_knob_names(ms: ModelSettings, classes: ClassTable, secrets: set[str]) -> None:
+    """Knob names are the user-facing namespace: they may not shadow a name
+    the class table treats as functional, secret or code-loading, and a
+    secret knob may only target a secret or an otherwise unclassified name."""
+    for knob in ms.user:
+        cls = classes.classify(knob)
+        if cls in ("functional", "secret", "code-loading", "ownership", "container-runtime") or \
+                (cls == "location" and knob != "CUDA_VISIBLE_DEVICES"):
+            raise Refusal(f"model.toml: user knob {knob} is a {cls} environment name; "
+                          "name knobs apart from engine and runtime variables")
+    for name in secrets:
+        cls = classes.classify(name)
+        if cls not in ("secret", "unclassified"):
+            raise Refusal(f"model.toml: a secret knob targets {name}, a {cls} name; "
+                          "secret targets must be secret or otherwise unclassified names")
+
+
 def user_values(ms: ModelSettings, inp: Inputs) -> dict[str, str]:
     """[user] knob values: the .env file, plus (in a container, where the
     .env arrives as the process environment) the ambient knobs."""
@@ -318,6 +365,8 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
     rt = inp.runtime_cfg
     run = inp.runtime
     harness_set = {normalize_arg_name(h) for h in harness_args}
+    secret_names = declared_secrets(ms)
+    check_knob_names(ms, classes, secret_names)
     # runtime layer
     final.put("args.host", rt["host"], "runtime", f"defaults.toml[runtime.{run}]")
     for k, v in rt.get("location", {}).items():
@@ -349,24 +398,23 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
         apply_table(final, table, "overlay", source, layout=inp.layout, runtime=run)
     # user layer
     extra_args = list(inp.extra_args)
-    secret_names: set[str] = set()
     for knob, raw in values.items():
         spec = ms.user.get(knob)
         if spec is None:
             raise Refusal(f".env: {knob} is not a documented setting of this model "
                           f"(known: {', '.join(sorted(ms.user)) or 'none'})")
         if spec.get("target"):
-            _apply_user(final, knob, spec, raw, extra_args, secret_names, variants)
+            _apply_user(final, knob, spec, raw, extra_args, variants)
     # ambient
-    amb = _ambient(final, ms, registry, classes, inp)
+    amb = _ambient(final, ms, registry, classes, inp, secret_names)
     for key, value in amb["layer"].items():
         final.put(key, value, "ambient", "environment")
     # CLI layer
     for key, value in (parse_set(s) for s in inp.sets):
         if key in ms.user:
             if ms.user[key].get("target"):
-                _apply_user(final, key, ms.user[key], str(value), extra_args, secret_names,
-                            variants, layer="cli", source="--set")
+                _apply_user(final, key, ms.user[key], str(value), extra_args, variants,
+                            layer="cli", source="--set")
         elif key == "cards":
             final.put("card_ids", str(value), "cli", "--set")
         elif key.startswith("args."):
@@ -381,7 +429,7 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
             raise Refusal(f"--set {key}: expected env.NAME, args.NAME, cards, tp, pp or a [user] knob")
     _cards_against_lock(final, amb, inp)
     if extra_args:
-        _check_controlled_extra(ms, extra_args, inp.experiment)
+        _check_extra(ms, extra_args, inp.experiment)
         final.put("extra_args", list(extra_args), "user", "EXTRA_ARGS")
     _check_protected(final, ms, inp, settled)
 
@@ -390,7 +438,7 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
         when = rule.get("when", {})
         if when and all(str(final.get(k, "")) == str(v) for k, v in when.items()):
             raise Refusal(f"refused combination {when}: {rule.get('why', '')}".strip())
-    fork_absent = _check_env_names(final, registry, classes, inp.capability)
+    fork_absent = _check_env_names(final, registry, classes, inp.capability, secret_names)
     return _render(final, ms, inp, rt, harness_set, amb, variants, fork_absent,
                    secret_names, classes)
 
@@ -440,9 +488,10 @@ def _check_geometry(final: Final, hw: dict, layout: str) -> None:
 
 
 def _check_env_names(final: Final, registry: Registry, classes: ClassTable,
-                     capability: str) -> list[str]:
-    """Settings env names: functional or secret class; VLLM_* registered.
-    Location names: location class."""
+                     capability: str, secrets: set[str]) -> list[str]:
+    """Settings env names: functional or secret class (declared secret
+    targets: secret or unclassified); VLLM_* registered. Location names:
+    location class."""
     fork_absent: list[str] = []
     for key in list(final.entries):
         source = final.entries[key].source
@@ -466,9 +515,17 @@ def _check_env_names(final: Final, registry: Registry, classes: ClassTable,
                     continue
                 raise Refusal(f"{source}: {problem}")
         cls = classes.classify(name)
+        if name in secrets:
+            continue                    # checked at load: secret or unclassified
         if cls not in ("functional", "secret"):
             raise Refusal(f"{source}: {name} is class {cls}; settings env holds functional switches only")
     return fork_absent
+
+
+def _scalar(name: str, value: Any, kinds: tuple) -> None:
+    if isinstance(value, bool) and bool not in kinds or not isinstance(value, kinds):
+        raise Refusal(f"--{name}: expected a plain {'/'.join(k.__name__ for k in kinds)} value, "
+                      f"got {type(value).__name__}")
 
 
 def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set: set[str],
@@ -487,7 +544,8 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set:
     refs = [ref.group(1)]
     exe = os.path.join(inp.venv, "bin", "vllm")
     argv = [exe, "serve", substitute(model_value, subst, "args.model")]
-    argv_functional: list[str] = []
+    # the served checkpoint's reference (not its directory) is functional
+    argv_functional: list[str] = [model_value]
     harness: list[str] = []
     location_keys: dict[str, Any] = {"args.model": argv[2]}
     tp, pp = final.get("tp", 1), final.get("pp", 1)
@@ -498,9 +556,13 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set:
     for key in ordered:
         name = key[5:]
         value = geometry[key] if key in geometry else final.get(key)
+        if name in LOCATION_ARGS:
+            _scalar(name, value, (str, int))
+        elif name in harness_set:
+            _scalar(name, value, (bool, str, int, float, dict))
         tokens = render_arg(name, substitute(value, subst, key))
         argv += tokens
-        if name in ("host", "port"):
+        if name in LOCATION_ARGS:
             location_keys[key] = value
         elif name in harness_set:
             harness += tokens
@@ -550,8 +612,7 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set:
 
 
 def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[str],
-                secret_names: set[str], variants: list[str], *, layer: str = "user",
-                source: str | None = None) -> None:
+                variants: list[str], *, layer: str = "user", source: str | None = None) -> None:
     source = source or f".env:{knob}"
     only = spec.get("variants")
     if only and not set(only) & set(variants):
@@ -559,7 +620,7 @@ def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[
                       f"(active: {', '.join(variants) or 'none'})")
     choices = spec.get("choices")
     if choices is not None and raw not in [str(c) for c in choices]:
-        raise Refusal(f"{knob}={raw!r}: expected one of {', '.join(map(str, choices))}")
+        raise Refusal(f"{knob}: value not one of {', '.join(map(str, choices))}")
     value: Any = raw
     kind = spec.get("type", "str")
     try:
@@ -568,11 +629,11 @@ def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[
         elif kind == "int":
             value = int(raw)
     except ValueError:
-        raise Refusal(f"{knob}={raw!r}: expected an integer") from None
+        raise Refusal(f"{knob}: expected an integer") from None
     if kind == "bool":
         low = raw.strip().lower()
         if low not in _TRUE + _FALSE[1:]:
-            raise Refusal(f"{knob}={raw!r}: expected 1 or 0")
+            raise Refusal(f"{knob}: expected 1 or 0")
         value = low in _TRUE
     targets = spec["target"] if isinstance(spec["target"], list) else [spec["target"]]
     for target in targets:
@@ -588,25 +649,26 @@ def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[
             set_nested(final, target, value, layer, source)
         elif target.startswith("env."):
             final.put(target, str(raw if kind == "bool" else value), layer, source)
-            if spec.get("secret"):
-                secret_names.add(target[4:])
         else:
             raise Refusal(f"model.toml: user.{knob} target {target!r} is not args.*, env.*, card_ids or extra_args")
 
 
-def _check_controlled_extra(ms: ModelSettings, extra: list[str], experiment: str | None) -> None:
+def _check_extra(ms: ModelSettings, extra: list[str], experiment: str | None) -> None:
+    """Raw extra arguments: long options only; never geometry or the model;
+    fixed and controlled arguments only under --experiment."""
+    fixed_args = {k[5:] for k in ms.fixed if k.startswith("args.")}
     for tok in extra:
-        if tok.startswith("--"):
-            name = normalize_arg_name(tok[2:].split("=", 1)[0])
-            if name in GEOMETRY_ARGS_NAMES or name == "model":
-                raise Refusal(f"extra argument --{name} is set by the launcher; use tp/pp or "
-                              "--checkpoint-path")
-            if name in ms.controlled_args and not experiment:
-                raise Refusal(f"extra argument --{name} is set by the settings; "
-                              "change it with --set under --experiment")
-
-
-GEOMETRY_ARGS_NAMES = tuple(k[5:] for k in GEOMETRY_ARGS)
+        if _SHORT_OPTION.match(tok):
+            raise Refusal(f"extra argument {tok}: short options are not accepted; use the long form")
+        if not tok.startswith("--"):
+            continue
+        name = normalize_arg_name(tok[2:].split("=", 1)[0])
+        if name in GEOMETRY_ARGS_NAMES or name == "model":
+            raise Refusal(f"extra argument --{name} is set by the launcher; use tp/pp or "
+                          "--checkpoint-path")
+        if (name in ms.controlled_args or name in fixed_args) and not experiment:
+            raise Refusal(f"extra argument --{name} is fixed by the settings; "
+                          "change it with --set under --experiment")
 
 
 def _protected(key: str, ms: ModelSettings) -> bool:
@@ -618,6 +680,8 @@ def _protected(key: str, ms: ModelSettings) -> bool:
 def _check_protected(final: Final, ms: ModelSettings, inp: Inputs, settled: dict[str, Any]) -> None:
     """[fixed] keys and controlled arguments change only under --experiment,
     through any channel: a new value, a new key or an unset."""
+    if final.get("args.model") != settled.get("args.model"):
+        raise Refusal("args.model changes only through --checkpoint-path")
     if inp.experiment:
         return
     for key, e in final.entries.items():
@@ -630,13 +694,10 @@ def _check_protected(final: Final, ms: ModelSettings, inp: Inputs, settled: dict
     for key, layer in final.unset.items():
         if layer in LOCKED_LAYERS and _protected(key, ms) and key in settled:
             raise Refusal(f"{key} is fixed for this model; unsetting it needs --experiment")
-    if "args.model" in final.entries and final.entries["args.model"].layer in LOCKED_LAYERS \
-            and final.get("args.model") != settled.get("args.model"):
-        raise Refusal("args.model changes only through --checkpoint-path")
 
 
 def _ambient(final: Final, ms: ModelSettings, registry: Registry, classes: ClassTable,
-             inp: Inputs) -> dict:
+             inp: Inputs, secrets: set[str]) -> dict:
     """Classify the ambient environment and apply the policy."""
     out: dict = {"equal": [], "layer": {}, "dropped": [], "ignored": [], "passed": {},
                  "code": {}, "not_validated": [], "cvd": None}
@@ -663,7 +724,7 @@ def _ambient(final: Final, ms: ModelSettings, registry: Registry, classes: Class
         if name.upper().startswith("VLLM_") and name != name.upper():
             refusals.append(registry.check(name) or f"{name}: not a registered name")
             continue
-        cls = classes.classify(name)
+        cls = "secret" if name in secrets else classes.classify(name)
         if cls == "secret":
             problem = registry.check(name) if name.startswith("VLLM_") else None
             if problem:

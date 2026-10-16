@@ -151,7 +151,8 @@ def verify(manifest: dict, manifest_sha: str, directory: str, stamp_file: str, *
     """Hash every file the stamp does not cover, then publish the stamp.
 
     Returns (state, mismatched files, files hashed). A stop request
-    between or during files raises Interrupted and writes no stamp."""
+    between or during files, or before the stamp is published, raises
+    Interrupted and writes no stamp."""
     old = read_stamp(stamp_file)
     if old is not None and (old.get("manifest_sha256") != manifest_sha
                             or old.get("path") != os.path.realpath(directory)):
@@ -177,6 +178,8 @@ def verify(manifest: dict, manifest_sha: str, directory: str, stamp_file: str, *
     entries = {k: v for k, v in entries.items() if k in manifest["files"]}
     stamp = {"schema": STAMP_SCHEMA, "path": os.path.realpath(directory),
              "manifest_sha256": manifest_sha, "files": entries}
+    if stop and stop[0]:
+        raise Interrupted()
     atomic_write(stamp_file, canonical(stamp))
     return (MISMATCH if bad else VERIFIED), bad, hashed
 

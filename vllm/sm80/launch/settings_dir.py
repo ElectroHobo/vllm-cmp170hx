@@ -44,6 +44,7 @@ SUPPORTED_SCHEMAS = {
     "launch-resolved": {2},
     "tree-exempt": {1},
     "build-inputs": {1},
+    "link-written": {1},
 }
 
 POINTER = "validated"

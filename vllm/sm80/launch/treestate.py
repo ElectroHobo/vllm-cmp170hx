@@ -14,13 +14,16 @@ tracked (natively: by Git; in a Git-free image: by the manifest's
 * exempt: a path in ``data/tree_exempt.toml``;
 * unowned: anything else. An unowned file makes the tree dirty.
 
-The owned set is checked against where it came from: a ``linked`` tree may
-own only its source tree's files (same hashes) and the link step's own
-outputs; a ``built_in_place`` tree must name a retained build record whose
-file list equals its map; a non-null native manifest digest must name the
-native manifest file, which is re-hashed. Two verification contracts: a
-tree with Git checks the stamp against ``HEAD``; a Git-free image tree
-checks it against ``provenance.json``.
+The owned set is checked against where it came from. A ``linked`` tree's
+source manifest must itself be valid (its map hash, its own build record,
+the commit the link recorded), every source file under ``vllm/`` the tree
+does not track must be linked, and the tree may own nothing else but the
+link step's outputs (``data/link_written.toml``). A ``built_in_place`` tree
+must name a retained build record whose file list equals its map. A
+non-null native manifest digest must name the native manifest file, which
+is re-hashed. Two verification contracts: a tree with Git checks the stamp
+against ``HEAD``; a Git-free image tree checks it against
+``provenance.json``.
 
 build-owned/1 fields: schema, source, commit, files, native_manifest_sha256,
 native_manifest_path?, build_owned_sha256, linked_from? (linked),
@@ -44,9 +47,6 @@ STAMP = ".sm80-build.json"
 PROVENANCE = "provenance.json"
 VERSION_FILE = "vllm/_version.py"
 SOURCES = ("built_in_place", "linked", "adopted")
-# what the link step itself writes into a linked tree, beside the links
-LINK_WRITTEN = ("plugins/sm80/build/**", "plugins/sm80/*.egg-info/**", "/*.dist-info/**",
-                "vllm/_version.py", "vllm/_ampere_marlin_C*.so", "vllm/_exl3_C*.so")
 
 _DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
@@ -266,7 +266,10 @@ def tree_state(tree: str, *, image: bool = False, cache: HashCache | None = None
             st.linked_from = manifest.get("linked_from")
             if manifest.get("build_owned_sha256") != st.build_owned_sha256:
                 st.add("metadata_invalid", f"{MANIFEST}: build_owned_sha256 does not match its map")
-            _check_source(st, manifest, files)
+            for problem in _source_problems(tree, manifest):
+                st.add("metadata_invalid", problem)
+            if st.source == "linked":
+                _check_linked(st, manifest, files)
             _check_native_manifest(st, manifest, cache)
     elif image:
         st.add("metadata_invalid", f"{MANIFEST}: missing in an image tree")
@@ -340,23 +343,22 @@ def _check_native_manifest(st: TreeState, manifest: dict, cache: HashCache) -> N
         st.add("metadata_invalid", f"native manifest {path}: sha256 {actual} != {digest}")
 
 
-def _check_source(st: TreeState, manifest: dict, files: dict) -> None:
-    source = manifest["source"]
-    if source == "linked":
-        _check_linked(st, manifest, files)
-    elif source == "built_in_place":
-        rec = manifest.get("build_record")
-        if not isinstance(rec, dict) or not isinstance(rec.get("path"), str):
-            st.add("metadata_invalid", f"{MANIFEST}: built_in_place without a retained build_record")
-            return
-        path = _resolve(st.tree, rec["path"])
-        data = _read_json(path)
-        if data is None or data.get("schema") != "build-record/1":
-            st.add("metadata_invalid", f"build record {rec['path']}: missing or wrong schema")
-        elif sha256_file(path) != rec.get("sha256"):
-            st.add("metadata_invalid", f"build record {rec['path']}: sha256 differs from the manifest")
-        elif data.get("files") != files:
-            st.add("metadata_invalid", "owned map differs from the retained build record")
+def _source_problems(tree: str, manifest: dict) -> list[str]:
+    """Problems of one manifest against its own declared source."""
+    if manifest.get("source") != "built_in_place":
+        return []
+    rec = manifest.get("build_record")
+    if not isinstance(rec, dict) or not isinstance(rec.get("path"), str):
+        return [f"{tree}/{MANIFEST}: built_in_place without a retained build_record"]
+    path = _resolve(tree, rec["path"])
+    data = _read_json(path)
+    if data is None or data.get("schema") != "build-record/1":
+        return [f"build record {rec['path']}: missing or wrong schema"]
+    if sha256_file(path) != rec.get("sha256"):
+        return [f"build record {rec['path']}: sha256 differs from the manifest"]
+    if data.get("files") != manifest.get("files"):
+        return ["owned map differs from the retained build record"]
+    return []
 
 
 def _check_linked(st: TreeState, manifest: dict, files: dict) -> None:
@@ -364,23 +366,43 @@ def _check_linked(st: TreeState, manifest: dict, files: dict) -> None:
     if not isinstance(lf, dict) or not lf.get("tree") or not lf.get("commit"):
         st.add("metadata_invalid", f"{MANIFEST}: linked without linked_from")
         return
-    src_manifest = _read_json(os.path.join(lf["tree"], MANIFEST))
-    if src_manifest is None or src_manifest.get("schema") != "build-owned/1":
-        st.add("metadata_invalid", f"linked_from {lf['tree']}: no build-owned manifest")
-        src_files: dict[str, str] = {}
+    src = lf["tree"]
+    src_manifest = _read_json(os.path.join(src, MANIFEST))
+    src_files: dict[str, str] = {}
+    if src_manifest is None or src_manifest.get("schema") != "build-owned/1" \
+            or src_manifest.get("source") not in ("built_in_place", "adopted") \
+            or not isinstance(src_manifest.get("files"), dict):
+        st.add("metadata_invalid", f"linked_from {src}: no valid source manifest")
     else:
-        src_files = src_manifest.get("files", {})
-        if build_owned_sha256(src_files) != lf.get("build_owned_sha256"):
+        src_files = src_manifest["files"]
+        own = build_owned_sha256(src_files)
+        if src_manifest.get("build_owned_sha256") != own:
+            st.add("metadata_invalid", f"linked_from {src}: source manifest map hash is wrong")
+        if own != lf.get("build_owned_sha256"):
             st.add("metadata_invalid", "linked_from: source manifest changed since the link (re-link)")
-    written = [glob_regex(p) for p in LINK_WRITTEN]
+        if src_manifest.get("commit") != lf["commit"]:
+            st.add("metadata_invalid", "linked_from: commit differs from the source manifest's")
+        for problem in _source_problems(src, src_manifest):
+            st.add("metadata_invalid", f"linked_from {src}: {problem}")
+    written = load_patterns("link_written.toml", "link-written")
     for rel, sha in files.items():
         if rel in src_files:
             if src_files[rel] != sha:
                 st.add("metadata_invalid", f"{rel}: manifest hash differs from the source tree's")
         elif not matches(written, rel):
             st.add("metadata_invalid", f"{rel}: claimed as owned but neither linked nor written by the link step")
+    if src_files and st.has_git:
+        tracked = set(_git(st.tree, "ls-files", "-z").split("\0"))
+        missing = sorted(rel for rel in src_files
+                         if rel.startswith("vllm/") and rel not in tracked and rel not in files)
+        for rel in missing[:50]:
+            st.add("metadata_invalid", f"{rel}: in the source tree but not linked")
     if st.commit and lf["commit"] != st.commit:
-        changed = _git(st.tree, "diff", "--name-only", f"{lf['commit']}..{st.commit}").split("\n")
+        try:
+            changed = _git(st.tree, "diff", "--name-only", f"{lf['commit']}..{st.commit}").split("\n")
+        except Refusal:
+            st.add("metadata_invalid", f"linked_from: artefact commit {lf['commit']} is not in this repository")
+            return
         inputs = load_patterns("build_inputs.toml", "build-inputs")
         hits = [p for p in changed if p and matches(inputs, p)]
         if hits:

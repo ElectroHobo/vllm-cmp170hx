@@ -111,8 +111,10 @@ def _launcher_impl() -> dict:
 
 
 def _requires(ms, tree: str, capability: str, cache: HashCache) -> dict[str, str]:
+    """Hashes of the required files. Patterns are tree-relative (checked at
+    load); a match may be a link (linked trees link their artefacts), whose
+    ownership and content the tree state checks; a dangling one is refused."""
     out: dict[str, str] = {}
-    root = os.path.realpath(tree)
     for ent in ms.requires:
         if capability == "plain-upstream" and ent.get("fork_only"):
             continue
@@ -120,9 +122,13 @@ def _requires(ms, tree: str, capability: str, cache: HashCache) -> dict[str, str
         if not hits:
             raise Refusal(f"required file {ent['path']} is missing in {tree}")
         for h in hits:
-            if not os.path.realpath(h).startswith(root + os.sep):
-                raise Refusal(f"required file {h} resolves outside the engine tree")
-            out[os.path.relpath(h, tree)] = cache.sha256(h)
+            rel = os.path.relpath(h, tree)
+            if rel.startswith(".."):
+                raise Refusal(f"required file {h} is outside the engine tree")
+            try:
+                out[rel] = cache.sha256(h)
+            except OSError as exc:
+                raise Refusal(f"required file {rel} cannot be read: {exc.strerror}") from None
     return out
 
 
@@ -286,6 +292,8 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
         not_validated.append("community layer")
     if any(cp.get("manifest_pins_differ") for cp in cps.values()):
         not_validated.append("checkpoint manifest ≠ pins")
+    if ts.build_owned_sha256 is None or ts.native_manifest_sha256 is None:
+        not_validated.append("no build identity")      # candidates too, receipt or not
     gen = read_generation(sd)           # one generation for every validated read and hash
     ev = None
     if ns.capability == "plain-upstream":
@@ -334,6 +342,7 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
         "argv": res.argv,
         "argv_shell": shlex.join(res.argv),
         "argv_functional": res.argv_functional,
+        "served_checkpoint": res.checkpoint_refs[0],
         "harness": res.harness,
         "location_keys": res.location_keys,
         "child_env": {k: mask_child(k, v) for k, v in sorted(res.child_env.items())},
@@ -392,7 +401,9 @@ def print_text(doc: dict, explain: bool) -> None:
     print("\n".join(out))
 
 
-def _stop_flag() -> list:
+def stop_flag() -> list:
+    """A flag set by SIGTERM/SIGINT; the pre-exec path checks it and never
+    turns a requested stop into a start."""
     stop = [False]
 
     def handler(_sig, _frm):
@@ -402,12 +413,14 @@ def _stop_flag() -> list:
     return stop
 
 
-def preflight_checkpoints(doc: dict, policy: str) -> None:
+def preflight_checkpoints(doc: dict, policy: str, stop: list | None = None) -> None:
     """Before exec: refuse incomplete checkpoints, apply the boot policy, and
     restate VALIDATED from the checkpoints as they are now."""
     mode = doc["_checkpoint_verify"]
-    stop = _stop_flag() if mode == "boot" else None
+    stop = stop if stop is not None else stop_flag()
     for name, (mpath, directory) in doc["_cp_specs"].items():
+        if stop[0]:
+            break
         manifest, msha = checkpoint.load_manifest(mpath)
         problems = checkpoint.completeness(manifest, directory)
         if problems:
@@ -433,6 +446,8 @@ def preflight_checkpoints(doc: dict, policy: str) -> None:
             doc["checkpoint"][name]["files"] = bad
         if doc["_ev"] is not None:
             doc["_ev"].checkpoints[name].update(identity=state, state="complete")
+    if stop[0]:
+        raise Refusal("stopped before start (SIGTERM/SIGINT)")
     if doc["_ev"] is not None:
         doc["validated"] = evaluate(doc["_gen"], doc["_ev"], role=doc["_role"])
 
@@ -441,7 +456,7 @@ def verify_checkpoints(ns, environ) -> int:
     """--verify-checkpoints: stamp exactly the directories a launch would serve."""
     _defaults, rt, home, sd, ms, stamp_dir = _context(ns, environ)
     paths = checkpoint_paths(ns, ms, rt, sd.pins(), home)
-    stop = _stop_flag()
+    stop = stop_flag()
     worst = 0
     report = {}
     for name, spec in ms.checkpoints.items():
@@ -482,6 +497,7 @@ def main(argv: list[str] | None = None, environ: dict[str, str] | None = None) -
     environ = dict(os.environ) if environ is None else environ
     ns = parse_args(argv)
     as_json = ns.print_config and ns.json
+    stop = None if ns.print_config else stop_flag()
     try:
         if ns.verify_checkpoints:
             return verify_checkpoints(ns, environ)
@@ -503,7 +519,7 @@ def main(argv: list[str] | None = None, environ: dict[str, str] | None = None) -
             raise Refusal(f"this launch differs from the expected launch {ns.expect} "
                           f"(env: {', '.join(doc['expected']['env_differs']) or 'none'}; "
                           f"argv equal: {doc['expected']['argv_equal']})")
-        preflight_checkpoints(doc, doc["policy"])
+        preflight_checkpoints(doc, doc["policy"], stop)
     except Refusal as exc:
         return _refuse(exc, False)
     print(banner(doc), file=sys.stderr, flush=True)

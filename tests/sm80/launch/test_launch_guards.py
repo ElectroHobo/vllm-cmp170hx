@@ -118,14 +118,22 @@ def test_secrets_masked_everywhere(w, tmp_path, capsys):
     d = w.resolve(environ=w.env(HF_TOKEN="hf_tok"))
     assert "hf_tok" not in json.dumps(d)
     model = open(os.path.join(w.settings, "model.toml")).read() + \
-        '\n[user.SYNTH_KEY]\ntarget = "env.SYNTH_SECRET"\nsecret = true\n'
+        '\n[user.CREDENTIAL]\ntarget = "env.MY_TOKEN"\nsecret = true\n'
     write(os.path.join(w.settings, "model.toml"), model)
-    env = write(str(tmp_path / "u.env"), "SYNTH_KEY=topsecret\n")
-    d = w.resolve("--env-file", env)
-    assert "topsecret" not in json.dumps(d) and "SYNTH_SECRET" not in d["env_functional"]
-    assert d["functional_sha256"] == w.resolve()["functional_sha256"]
+    base = w.resolve()["functional_sha256"]
+    ov = overlay(tmp_path, '[env]\nMY_TOKEN = "ov-token"\n')
+    env = write(str(tmp_path / "u.env"), "CREDENTIAL=topsecret\n")
+    for extra, environ in ((("--env-file", env), w.env()),
+                           (("--set", "env.MY_TOKEN=cli-token"), w.env()),
+                           (("--overlay", ov), w.env()),
+                           ((), w.env(MY_TOKEN="amb-token"))):
+        d = w.resolve(*extra, environ=environ)
+        text = json.dumps(d)
+        assert not any(t in text for t in ("topsecret", "cli-token", "ov-token", "amb-token"))
+        assert "MY_TOKEN" not in d["env_functional"] and d["functional_sha256"] == base
+        assert d["child_env"]["MY_TOKEN"]["class"] == "secret"
     p = w.run("--env-file", env)
-    assert p.returncode == 0 and read_record(w.venv)[1]["SYNTH_SECRET"] == "topsecret"
+    assert p.returncode == 0 and read_record(w.venv)[1]["MY_TOKEN"] == "topsecret"
 
 
 # -- geometry and protected keys ------------------------------------------------------------
