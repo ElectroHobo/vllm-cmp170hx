@@ -546,3 +546,117 @@ def test_container_locations_match_the_recipes(w):
     d = w.resolve("--runtime", "container", "--tree", w.tree, "--venv", w.venv,
                   environ=w.env(**RECIPE_LOCATIONS))
     assert set(RECIPE_LOCATIONS) <= set(d["ambient_equal"])
+
+
+# -- environment modules: only runtime-only variables may change -----------------------------------
+
+ENVS_BASE = '''\
+import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    VLLM_PORT: int | None = None
+    VLLM_TARGET_DEVICE: str = "cuda"
+
+
+def env_with_choices(name, default, choices):
+    return lambda: os.getenv(name, default)
+
+
+environment_variables: dict = {
+    "VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),
+    "VLLM_API_KEY": lambda: os.getenv("VLLM_API_KEY", ""),
+    "VLLM_USE_V2": lambda: os.getenv("VLLM_USE_V2", ""),
+    "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", ""),
+    "VLLM_TARGET_DEVICE": env_with_choices("VLLM_TARGET_DEVICE", "cuda", ["cuda", "cpu"]),
+}
+'''
+
+
+def env_module_change(tmp_path, after: str, before: str = ENVS_BASE) -> dict:
+    """Artefacts built at a commit whose vllm/envs.py is ``before``; HEAD's is ``after``."""
+    w = World(tmp_path, build=False, extra_files={"vllm/envs.py": before})
+    man = add_build(w.tree)
+    write(os.path.join(w.tree, "vllm", "envs.py"), after)
+    git(w.tree, "commit", "-q", "-am", "envs")
+    write_stamp(w.tree, man)
+    et = w.resolve()["engine_target"]
+    assert man["commit"] != head(w.tree) and not et["dirty"], et["dirty_paths"]
+    return et
+
+
+@pytest.mark.parametrize("after", [
+    # a helper the build variable's getter calls
+    ENVS_BASE.replace("return lambda: os.getenv(name, default)",
+                      "return lambda: os.getenv(name, default).lower()"),
+    # a new import or module-level code
+    ENVS_BASE.replace("import os\n", "import os\nimport sys\n"),
+    # the build entry itself
+    ENVS_BASE.replace('"cuda", ["cuda", "cpu"]', '"cpu", ["cuda", "cpu"]'),
+    # a build variable's annotation
+    ENVS_BASE.replace('VLLM_TARGET_DEVICE: str = "cuda"', 'VLLM_TARGET_DEVICE: str = "cpu"'),
+])
+def test_environment_module_other_code_is_a_build_input(tmp_path, after):
+    et = env_module_change(tmp_path, after)
+    assert et["cross_commit_artifacts"] and et["dirty_paths"]["cross_commit_artifacts"] == ["vllm/envs.py"]
+
+
+@pytest.mark.parametrize("after", [
+    # a runtime variable's default
+    ENVS_BASE.replace('os.getenv("VLLM_PORT", "")', 'os.getenv("VLLM_PORT", "8000")'),
+    # a new runtime variable with its annotation
+    ENVS_BASE.replace('    VLLM_PORT: int | None = None\n',
+                      '    VLLM_PORT: int | None = None\n    VLLM_NEW: bool = False\n')
+             .replace('    "VLLM_PORT":', '    "VLLM_NEW": lambda: os.getenv("VLLM_NEW", ""),\n    "VLLM_PORT":'),
+    # comments and layout
+    "# runtime switches\n" + ENVS_BASE.replace("\n\n\ndef", "\n\n\n# helper\ndef"),
+])
+def test_environment_module_runtime_only_change_is_compatible(tmp_path, after):
+    assert env_module_change(tmp_path, after)["cross_commit_artifacts"] is False
+
+
+@pytest.mark.parametrize("before", [ENVS_BASE + "def broken(:\n",
+                                    ENVS_BASE.replace("import os", "import os  # \udcff")])
+def test_environment_module_unreadable_side_fails_closed(tmp_path, before):
+    raw = before.encode("utf-8", errors="surrogateescape")
+    w = World(tmp_path, build=False)
+    with open(os.path.join(w.tree, "vllm", "envs.py"), "wb") as f:
+        f.write(raw)
+    git(w.tree, "commit", "-q", "-am", "unreadable")
+    man = add_build(w.tree)
+    write(os.path.join(w.tree, "vllm", "envs.py"), ENVS_BASE)
+    git(w.tree, "commit", "-q", "-am", "readable")
+    write_stamp(w.tree, man)
+    et = w.resolve()["engine_target"]
+    assert et["cross_commit_artifacts"] and et["dirty_paths"]["cross_commit_artifacts"] == ["vllm/envs.py"]
+
+
+@pytest.mark.parametrize("field, value", [("build_owned_sha256", "0" * 64), ("build_owned_sha256", None),
+                                          ("native_manifest_sha256", "0" * 64),
+                                          ("native_manifest_sha256", None)])
+def test_empty_map_stamp_hashes_checked(tmp_path, field, value):
+    w = World(tmp_path, build=False)
+    add_build(w.tree, {}, source="adopted")
+    assert "metadata_invalid" not in w.resolve()["engine_target"]["dirty_paths"]
+    stamp = load(os.path.join(w.tree, STAMP))
+    if value is None:
+        stamp.pop(field)
+    else:
+        stamp[field] = value
+    write(os.path.join(w.tree, STAMP), json.dumps(stamp))
+    text = metadata(w)
+    assert (f"no {field}" if value is None else f"{field} differs from the manifest") in text
+
+
+def test_stamp_names_a_null_native_identity(tmp_path):
+    """A manifest without native identity: the stamp still carries the key (null)."""
+    w = World(tmp_path)
+    man = load(os.path.join(w.tree, MANIFEST))
+    man["native_manifest_sha256"] = None
+    man.pop("native_manifest_path")
+    rewrite_manifest(w.tree, man, stamp=True)
+    assert "metadata_invalid" not in w.resolve()["engine_target"]["dirty_paths"]
+    stamp = load(os.path.join(w.tree, STAMP))
+    stamp.pop("native_manifest_sha256")
+    write(os.path.join(w.tree, STAMP), json.dumps(stamp))
+    assert "no native_manifest_sha256" in metadata(w)

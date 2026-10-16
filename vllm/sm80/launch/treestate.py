@@ -138,10 +138,11 @@ def _git(tree: str, *args: str) -> str:
 
 
 def _git_blob(tree: str, commit: str, path: str) -> str:
-    """The text of ``path`` at ``commit``; empty when the path is absent there."""
+    """The text of ``path`` at ``commit``; empty when the path is absent there.
+    Raises UnicodeDecodeError for a file that is not UTF-8."""
     proc = subprocess.run(["git", "-C", tree, "show", f"{commit}:{path}"], capture_output=True,
                           env=_git_env(), check=False)
-    return proc.stdout.decode("utf-8", errors="replace") if proc.returncode == 0 else ""
+    return proc.stdout.decode("utf-8") if proc.returncode == 0 else ""
 
 
 def _read_json(path: str) -> dict | None:
@@ -582,26 +583,52 @@ def _check_link_natives(st: TreeState, manifest: dict, natives: dict[str, str]) 
                + ", ".join(sorted({str(p) for p, _ in diff})[:20]))
 
 
-def _env_entries(text: str, names: set[str]) -> list | None:
-    """(name, value source) of every dict entry keyed by one of ``names``;
-    None when the text does not parse."""
+def _table_target(st: ast.stmt, tables: set[str]) -> bool:
+    """A top-level assignment of a dict literal to one of the variable tables."""
+    if isinstance(st, ast.Assign) and len(st.targets) == 1:
+        target = st.targets[0]
+    elif isinstance(st, ast.AnnAssign):
+        target = st.target
+    else:
+        return False
+    return isinstance(target, ast.Name) and target.id in tables and isinstance(st.value, ast.Dict)
+
+
+def _runtime_key(key: ast.AST | None, names: set[str]) -> bool:
+    return isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value not in names
+
+
+def env_module_reduced(text: str, names: set[str], tables: set[str]) -> str:
+    """ast.dump of an environment module without its runtime-only variables:
+    the entries of the top-level variable tables keyed by a string not in
+    ``names``, and the ``if TYPE_CHECKING:`` annotations of plain names not
+    in ``names``. Everything else (helpers, lookup and registration code,
+    imports, build entries) stays. Raises SyntaxError/ValueError."""
+    module = ast.parse(text)
+    for st in module.body:
+        if _table_target(st, tables):
+            kept = [(k, v) for k, v in zip(st.value.keys, st.value.values) if not _runtime_key(k, names)]
+            st.value.keys, st.value.values = [k for k, _ in kept], [v for _, v in kept]
+        elif isinstance(st, ast.If) and isinstance(st.test, ast.Name) and st.test.id == "TYPE_CHECKING":
+            st.body = [b for b in st.body if not (isinstance(b, ast.AnnAssign) and isinstance(b.target, ast.Name)
+                                                   and b.target.id not in names)]
+    return ast.dump(module)
+
+
+def _env_module_changed(tree: str, a: str, b: str, path: str, names: set[str],
+                        tables: set[str]) -> bool:
+    """Fail closed: a side that does not decode or parse counts as changed."""
     try:
-        module = ast.parse(text)
-    except (SyntaxError, ValueError):
-        return None
-    out = []
-    for node in ast.walk(module):
-        if isinstance(node, ast.Dict):
-            for k, v in zip(node.keys, node.values):
-                if isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value in names:
-                    out.append((k.value, ast.get_source_segment(text, v)))
-    return sorted(out)
+        return env_module_reduced(_git_blob(tree, a, path), names, tables) != \
+            env_module_reduced(_git_blob(tree, b, path), names, tables)
+    except (UnicodeDecodeError, SyntaxError, ValueError):
+        return True
 
 
 def _check_artefact_commit(st: TreeState, art) -> None:
     """Artefacts built at another commit: compatible only when no build input
     changed in between (data/build_inputs.toml: path patterns, and for the
-    environment modules the entries of the build variables)."""
+    environment modules everything but their runtime-only variables)."""
     if not isinstance(art, str) or not HEX40.match(art) or st.commit is None or art == st.commit:
         return
     try:
@@ -611,8 +638,9 @@ def _check_artefact_commit(st: TreeState, art) -> None:
         return
     data = _data("build_inputs.toml", "build-inputs")
     inputs = [glob_regex(p) for p in data.get("patterns", [])]
-    env = data.get("env_entries", {})
+    env = data.get("env_modules", {})
     env_paths, names = set(env.get("paths", [])), set(env.get("names", []))
+    tables = set(env.get("tables", []))
     hits = []
     for p in changed:
         if not p:
@@ -620,9 +648,7 @@ def _check_artefact_commit(st: TreeState, art) -> None:
         if matches(inputs, p):
             hits.append(p)
         elif p in env_paths:
-            old = _env_entries(_git_blob(st.tree, art, p), names)
-            new = _env_entries(_git_blob(st.tree, st.commit, p), names)
-            if old is None or new is None or old != new:
+            if _env_module_changed(st.tree, art, st.commit, p, names, tables):
                 hits.append(p)
     if hits:
         st.cross_commit_artifacts = True
@@ -634,6 +660,9 @@ def _check_stamp(st: TreeState, stamp: dict | None, manifest: dict | None, image
     if stamp is None or stamp.get("schema") != "build-stamp/1":
         st.add("metadata_invalid", f"{STAMP}: missing, unreadable or wrong schema")
         return
+    for key in ("build_owned_sha256", "native_manifest_sha256"):
+        if key not in stamp:
+            st.add("metadata_invalid", f"{STAMP}: no {key}")
     if image:
         if prov is None or stamp.get("commit") != prov.get("engine_commit"):
             st.add("metadata_invalid", f"{STAMP}: commit differs from {PROVENANCE}")
