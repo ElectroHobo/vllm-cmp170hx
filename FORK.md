@@ -159,6 +159,15 @@ An optional native library for the Marlin MoE kernels. vLLM runs without it.
 
 Files added elsewhere, grouped by top-level directory.
 
+#### Repository root
+
+| Path | Lines |
+|---|---:|
+| `CITATION.cff` | 7 |
+| `COMMUNITY_RECIPES.md` | 68 |
+| `NOTICE` | 9 |
+| **3 files** | **84** |
+
 #### `.github/`
 
 | Path | Lines |
@@ -317,6 +326,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_exl3_plugin.py` | 110 |
 | `tests/sm80/test_fork_map.py` | 55 |
 | `tests/sm80/test_glm_pp4_kv_plan.py` | 89 |
+| `tests/sm80/test_glm_pp4_mamba_split.py` | 263 |
 | `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_import_cuda_init.py` | 135 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
@@ -357,15 +367,15 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **137 files** | **48,568** |
+| **138 files** | **48,831** |
 
 #### `tools/`
 
 | Path | Lines |
 |---|---:|
 | `tools/sm80/fork_map.py` | 706 |
-| `tools/sm80/upstream_edit_exceptions.yaml` | 113 |
-| **2 files** | **819** |
+| `tools/sm80/upstream_edit_exceptions.yaml` | 128 |
+| **2 files** | **834** |
 
 ## 2. Patched upstream files
 
@@ -426,7 +436,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/core/kv_cache_manager.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/core/kv_cache_planning.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/core/kv_cache_utils.py` | modified | 13 | 19 | 6 |
-| `vllm/v1/core/sched/scheduler.py` | modified | 404 | 14 | 44 |
+| `vllm/v1/core/sched/scheduler.py` | modified | 429 | 15 | 45 |
 | `vllm/v1/kv_cache_interface.py` | modified | 70 | 1 | 5 |
 | `vllm/v1/outputs.py` | modified | 6 | 0 | 2 |
 | `vllm/v1/worker/gpu/async_utils.py` | modified | 21 | 0 | 6 |
@@ -442,7 +452,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py` | modified | 282 | 0 | 7 |
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **67 files** | | **3,518** | **243** | **479** |
+| **67 files** | | **3,543** | **244** | **480** |
 
 ### Tests, docs and .github
 
@@ -457,7 +467,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `.github/ISSUE_TEMPLATE/700-performance-discussion.yml` | deleted | 0 | 59 | 1 |
 | `.github/ISSUE_TEMPLATE/750-RFC.yml` | deleted | 0 | 52 | 1 |
 | `.github/ISSUE_TEMPLATE/config.yml` | modified | 6 | 2 | 3 |
-| `README.md` | modified | 190 | 87 | 20 |
+| `README.md` | modified | 259 | 77 | 30 |
 | `docs/features/quantization/README.md` | modified | 64 | 0 | 2 |
 | `docs/features/speculative_decoding/README.md` | modified | 3 | 0 | 2 |
 | `tests/models/kimi_k3/test_kda_metadata.py` | modified | 4 | 2 | 2 |
@@ -470,15 +480,15 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_model_runner_v2.py` | modified | 4 | 1 | 4 |
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 9 | 1 | 5 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **22 files** | | **503** | **560** | **68** |
+| **22 files** | | **572** | **550** | **78** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 67 | 3,518 | 243 | 479 |
-| Tests, docs and .github | 22 | 503 | 560 | 68 |
-| All | 89 | 4,021 | 803 | 547 |
+| Product code | 67 | 3,543 | 244 | 480 |
+| Tests, docs and .github | 22 | 572 | 550 | 78 |
+| All | 89 | 4,115 | 794 | 558 |
 
 ## 3. Fork environment variables
 
@@ -592,9 +602,9 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Fork-added product files | 127 |
 | Fork-added product lines | 38,804 |
 | Patched upstream files | 89 |
-| Patched upstream lines | +4,021 / -803 |
+| Patched upstream lines | +4,115 / -794 |
 | Patched upstream product files | 67 |
-| Patched upstream product lines | +3,518 / -243 |
-| Product lines added (new files and patches) | 42,322 |
+| Patched upstream product lines | +3,543 / -244 |
+| Product lines added (new files and patches) | 42,347 |
 | Fork environment variables (flags) | 87 |
 | Unreferenced fork definitions | 0 (0 lines) |

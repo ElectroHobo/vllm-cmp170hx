@@ -111,3 +111,18 @@ exceptions:
   removal: >-
     Delete the notice line in the change that removes the last fork edit of
     this file, so that it no longer differs from upstream.
+- file: vllm/v1/core/sched/scheduler.py
+  hunks: [856437ee3c56, 2a416d3832a2]
+  reason: >-
+    Upstream bug fix taken ahead of upstream (vllm-project/vllm#54076, first
+    part): the align-mode prefill split stops on the Mamba group's own block
+    size instead of cache_config.block_size, which a smaller drafter group
+    pulls below it (GLM-5.3-Flash at PP4). The split is a private scheduler
+    method with no extension point. At zero context the replaced line merges
+    with the fork's adjacent drop_eagle_block hunk into one hunk.
+  owner: GLM-5.3-Flash PP4 serving
+  removal: >-
+    When the upstream base carries #54076 or another fix that splits on the
+    Mamba state block: delete the mamba_state_block_size block in __init__ and
+    restore the single upstream block_size line in _mamba_block_aligned_split;
+    tests/sm80/test_glm_pp4_mamba_split.py must still pass.

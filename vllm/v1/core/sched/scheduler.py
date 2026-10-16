@@ -493,6 +493,25 @@ class Scheduler(SchedulerInterface):
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
         )
+        # The align-mode state grid is the Mamba group's own block size: the
+        # worker writes a chunk's end state into Mamba column
+        # (end - 1) // MambaSpec.block_size. `cache_config.block_size` is the
+        # minimum over prefix-cacheable groups and can be finer (a drafter
+        # group with a smaller block); splitting on it lets a chunk run past a
+        # Mamba boundary, and the block left behind is then hashed as that
+        # boundary's state.
+        mamba_state_block_sizes = {
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
+        assert len(mamba_state_block_sizes) <= 1, (
+            "Mamba align scheduling needs a single Mamba state block size, "
+            f"got {sorted(mamba_state_block_sizes)}"
+        )
+        self.mamba_state_block_size = (
+            next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -553,7 +572,12 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        # Chunk ends are where the worker writes Mamba states, so the stops
+        # follow the Mamba group's grid, not the minimum over all groups.
+        block_size = (
+            getattr(self, "mamba_state_block_size", None)
+            or self.cache_config.block_size
+        )
         drop_eagle_block = getattr(
             self, "mamba_eagle_block_drop", self.use_eagle_block_drop
         )
