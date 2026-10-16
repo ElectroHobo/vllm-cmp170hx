@@ -1,0 +1,98 @@
+schema = "launch-defaults/1"
+
+# Runtime defaults: the lowest settings layer. ${home} is the launching
+# user's home (native) and /cache in a container; ${venv} and ${tree} are
+# the resolved venv and engine tree.
+
+[runtime.native]
+host = "127.0.0.1"
+models_dir = "${home}/models"
+venv = ""                       # required on the command line natively
+cuda_home = "/usr/local/cuda"   # a hardware file may name the box's CUDA
+policy = "strict"
+checkpoint_verify = "stamp"
+stamp_dir = "${home}/.cache/sm80-launch"
+
+[runtime.native.location]
+HOME = "${home}"
+
+[runtime.container]
+host = "0.0.0.0"
+models_dir = "/models"
+venv = "/opt/venv"
+tree = "/opt/vllm-src"
+cuda_home = "/usr/local/cuda"
+policy = "merge"
+checkpoint_verify = "boot"
+stamp_dir = "/cache/sm80-launch"
+hub_dirs = ["/cache/huggingface/hub", "/hf-hub"]
+
+[runtime.container.location]
+HOME = "/cache"
+HF_HOME = "/cache/huggingface"
+XDG_CACHE_HOME = "/cache"
+TRITON_CACHE_DIR = "/cache/triton"
+TORCHINDUCTOR_CACHE_DIR = "/cache/torchinductor"
+VLLM_CACHE_ROOT = "/cache/vllm"
+FLASHINFER_WORKSPACE_BASE = "/cache"
+
+# Names the engine image sets in its own ENV, with the same values; they
+# arrive as ambient values equal to these and are recorded as such.
+[runtime.container.image_env]
+
+# Arguments that only instrument a run; reported, excluded from the
+# functional hash.
+[harness]
+args = ["enable-prompt-tokens-details", "profiler-config"]
+
+# Environment classes. The first row whose names, prefixes or patterns
+# match wins; a name no row matches is unclassified and never reaches the
+# server. "patterns" are fnmatch patterns, case-sensitive.
+[[classes]]
+class = "secret"
+names = ["HF_TOKEN", "VLLM_API_KEY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+         "http_proxy", "https_proxy", "no_proxy"]
+
+[[classes]]
+class = "ownership"
+names = ["SESSION_JOB"]
+prefixes = ["GPU_LOCK_", "GPU_QUEUE_", "GPU_RAM_", "RAM_"]
+
+[[classes]]
+class = "code-loading"
+names = ["PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
+         "PYTHONNOUSERSITE", "VIRTUAL_ENV", "PATH", "CUDA_HOME",
+         "TRITON_PTXAS_PATH", "TRITON_LIBCUDA_PATH"]
+prefixes = ["LD_"]
+
+[[classes]]
+class = "location"
+names = ["HOME", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE",
+         "TRANSFORMERS_CACHE", "XDG_CACHE_HOME", "TRITON_CACHE_DIR",
+         "TORCHINDUCTOR_CACHE_DIR", "VLLM_CACHE_ROOT",
+         "FLASHINFER_WORKSPACE_BASE", "CUDA_VISIBLE_DEVICES"]
+
+[[classes]]
+class = "container-runtime"
+names = ["NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES"]
+prefixes = ["NVIDIA_REQUIRE_"]
+
+[[classes]]
+class = "functional"
+names = ["NVIDIA_TF32_OVERRIDE", "GLIBC_TUNABLES", "MASTER_ADDR",
+         "MASTER_PORT", "WORLD_SIZE", "RANK", "LOCAL_RANK", "CC", "CXX",
+         "MAX_JOBS"]
+prefixes = ["VLLM_", "NCCL_", "PYTORCH_", "TORCH_", "TRITON_", "CUDA_",
+            "CUBLAS_", "CUBLASLT_", "CUDNN_", "FLASHINFER_", "PYTHON",
+            "MALLOC_", "OMP_", "KMP_", "GOMP_", "MKL_", "OPENBLAS_",
+            "TORCHINDUCTOR_", "TORCHDYNAMO_", "HF_", "HUGGINGFACE_",
+            "TRANSFORMERS_", "TOKENIZERS_", "RAY_", "GLOO_", "UCX_"]
+model_prefixes = true           # plus the model's env_prefixes
+
+[[classes]]
+class = "inert"
+names = ["LANG", "TERM", "TZ", "USER", "LOGNAME", "SHELL", "PWD",
+         "DBUS_SESSION_BUS_ADDRESS", "SHLVL", "OLDPWD", "_", "HOSTNAME",
+         "MAIL", "MOTD_SHOWN", "LS_COLORS", "COLORTERM", "INVOCATION_ID",
+         "JOURNAL_STREAM", "SYSTEMD_EXEC_PID"]
+prefixes = ["LC_", "SSH_", "XDG_"]

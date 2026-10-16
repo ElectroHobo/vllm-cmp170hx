@@ -1,0 +1,16 @@
+schema = "tree-exempt/1"
+
+# Paths no runtime reads. Untracked files here are listed by path only and
+# never make a tree dirty. The list grows only by a reviewed change.
+patterns = [
+  ".git/**",
+  "**/__pycache__/**",
+  "*.bak-*",
+  "*.orig",
+  "*.rej",
+  "*.swp",
+  "*.log",
+  "docs/**",
+  "tests/**",
+  "benchmarks/**",
+]

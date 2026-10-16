@@ -1,0 +1,14 @@
+schema = "build-inputs/1"
+
+# Paths whose change makes artefacts built at another commit stale: the
+# wheel-equality set plus the native builder's own inputs.
+patterns = [
+  "csrc/**",
+  "cmake/**",
+  "CMakeLists.txt",
+  "setup.py",
+  "pyproject.toml",
+  "rust/**",
+  "requirements/build*.txt",
+  "vllm/vllm_flash_attn/**",
+]
