@@ -159,3 +159,108 @@ def test_container_drops_ownership(tmp_path):
     w = World(tmp_path)
     d = w.resolve("--runtime", "container", "--tree", w.tree, environ={"RAM_LEASE_TOKEN": "t"})
     assert "RAM_LEASE_TOKEN" in d["dropped"]
+
+
+# -- the model image's ENV --------------------------------------------------------------------
+
+# the config Env of the published model images (identical in both), plus
+# PYTHONDONTWRITEBYTECODE, which the model image sets
+IMAGE_ENV = {
+    "CUDA_HOME": "/usr/local/cuda", "CUDA_VERSION": "13.3.1",
+    "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64",
+    "LIBRARY_PATH": "/usr/local/cuda/lib64/stubs", "NCCL_VERSION": "2.30.7-1", "NVARCH": "x86_64",
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility", "NVIDIA_PRODUCT_NAME": "CUDA",
+    "NVIDIA_REQUIRE_CUDA": "cuda>=13.0", "NVIDIA_VISIBLE_DEVICES": "all",
+    "NV_CUDA_CUDART_DEV_VERSION": "13.3.29-1", "NV_CUDA_CUDART_VERSION": "13.3.29-1",
+    "NV_CUDA_LIB_VERSION": "13.3.1-1",
+    "NV_CUDA_NSIGHT_COMPUTE_DEV_PACKAGE": "cuda-nsight-compute-13-3=13.3.1-1",
+    "NV_CUDA_NSIGHT_COMPUTE_VERSION": "13.3.1-1",
+    "NV_LIBCUBLAS_DEV_PACKAGE": "libcublas-dev-13-3=13.6.0.2-1",
+    "NV_LIBCUBLAS_DEV_PACKAGE_NAME": "libcublas-dev-13-3", "NV_LIBCUBLAS_DEV_VERSION": "13.6.0.2-1",
+    "NV_LIBCUBLAS_PACKAGE": "libcublas-13-3=13.6.0.2-1", "NV_LIBCUBLAS_PACKAGE_NAME": "libcublas-13-3",
+    "NV_LIBCUBLAS_VERSION": "13.6.0.2-1", "NV_LIBCUSPARSE_DEV_VERSION": "12.8.2.51-1",
+    "NV_LIBCUSPARSE_VERSION": "12.8.2.51-1", "NV_LIBNCCL_DEV_PACKAGE": "libnccl-dev=2.30.7-1+cuda13.3",
+    "NV_LIBNCCL_DEV_PACKAGE_NAME": "libnccl-dev", "NV_LIBNCCL_DEV_PACKAGE_VERSION": "2.30.7-1",
+    "NV_LIBNCCL_PACKAGE": "libnccl2=2.30.7-1+cuda13.3", "NV_LIBNCCL_PACKAGE_NAME": "libnccl2",
+    "NV_LIBNCCL_PACKAGE_VERSION": "2.30.7-1", "NV_LIBNPP_DEV_PACKAGE": "libnpp-dev-13-3=13.1.2.81-1",
+    "NV_LIBNPP_DEV_VERSION": "13.1.2.81-1", "NV_LIBNPP_PACKAGE": "libnpp-13-3=13.1.2.81-1",
+    "NV_LIBNPP_VERSION": "13.1.2.81-1", "NV_NVML_DEV_VERSION": "13.3.29-1",
+    "NV_NVTX_VERSION": "13.3.29-1",
+    "PATH": "/opt/venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:"
+            "/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONDONTWRITEBYTECODE": "1", "VIRTUAL_ENV": "/opt/venv",
+}
+# the image names the launcher hands to the server as declared
+IMAGE_TO_SERVER = sorted(set(IMAGE_ENV) - {"PATH", "VIRTUAL_ENV", "NVIDIA_VISIBLE_DEVICES",
+                                           "NVIDIA_DRIVER_CAPABILITIES", "NVIDIA_REQUIRE_CUDA"})
+CHANGED_IN_IMAGE = ["LD_LIBRARY_PATH", "LIBRARY_PATH", "CUDA_VERSION", "NCCL_VERSION",
+                    "NV_LIBNCCL_PACKAGE_VERSION", "NVARCH", "NVIDIA_PRODUCT_NAME",
+                    "PYTHONDONTWRITEBYTECODE"]
+
+
+def _defaults():
+    import main
+    from settings_dir import load_toml
+    return load_toml(os.path.join(os.path.dirname(main.__file__), "defaults.toml"), "launch-defaults")
+
+
+def in_image(w, *extra, environ=None):
+    """A container launch whose environment is the image ENV (the venv the
+    test world provides stands in for the image's)."""
+    env = w.env(**{**IMAGE_ENV, "VIRTUAL_ENV": w.venv}) if environ is None else environ
+    return w.resolve("--runtime", "container", "--tree", w.tree, *extra, environ=env)
+
+
+def test_image_env_is_declared_and_classified():
+    from envclass import ClassTable
+    defaults = _defaults()
+    assert defaults["runtime"]["container"]["image_env"] == IMAGE_ENV
+    table = ClassTable(defaults["classes"], [])
+    assert {n: table.classify(n) for n in IMAGE_ENV if table.classify(n) == "unclassified"} == {}
+
+
+def test_container_with_exactly_the_image_env_adds_no_reason(w):
+    base = in_image(w, environ=w.env(VIRTUAL_ENV=w.venv))
+    d = in_image(w)
+    assert reasons(d) == reasons(base)
+    assert not [r for r in reasons(d) if r.startswith("ambient")], reasons(d)
+    assert not set(IMAGE_ENV) & set(d["dropped"])
+    assert d["functional_sha256"] == base["functional_sha256"]
+    for doc in (d, base):
+        assert {n: doc["child_env"][n]["value"] for n in IMAGE_TO_SERVER} == \
+            {n: IMAGE_ENV[n] for n in IMAGE_TO_SERVER}
+    assert {"LD_LIBRARY_PATH", "LIBRARY_PATH", "CUDA_VERSION", "PYTHONDONTWRITEBYTECODE"} <= \
+        set(d["ambient_equal"])
+    in_image(w, "--policy", "strict")
+
+
+@pytest.mark.parametrize("name", CHANGED_IN_IMAGE)
+def test_container_with_a_changed_image_value_fails_closed(w, name):
+    env = w.env(**{**IMAGE_ENV, name: "/changed", "VIRTUAL_ENV": w.venv})
+    d = in_image(w, environ=env)
+    assert f"ambient {name}" in reasons(d)
+    assert d["child_env"][name]["value"] == "/changed"
+    assert d["validated"]["state"] != "VALIDATED"
+    assert name in w.refused("--runtime", "container", "--tree", w.tree, "--policy", "strict",
+                             environ=env)
+
+
+def test_settings_value_of_an_image_name_wins(w):
+    """A value the launch declares for an image name reaches the server, not the image's."""
+    d = in_image(w, "--set", "env.PYTHONDONTWRITEBYTECODE=0")
+    assert d["child_env"]["PYTHONDONTWRITEBYTECODE"]["value"] == "0"
+    assert d["validated"]["state"] != "VALIDATED"
+
+
+@pytest.mark.parametrize("name, value", [("LD_PRELOAD", "/x.so"), ("FOO_DEBUG", "1"),
+                                         ("HF_TOKEN", "t"), ("VLLM_PORT", "1"), ("HOME", "/root"),
+                                         ("SESSION_JOB", "j")])
+def test_image_env_names_outside_the_image_classes_are_refused(name, value):
+    from envclass import ClassTable
+    from errors import Refusal
+    from resolver import _image_env
+    table = ClassTable(_defaults()["classes"], [])
+    code, values = _image_env(IMAGE_ENV, table)
+    assert code == {n: IMAGE_ENV[n] for n in ("CUDA_HOME", "LD_LIBRARY_PATH", "LIBRARY_PATH", "VIRTUAL_ENV")}
+    with pytest.raises(Refusal, match=name):
+        _image_env({**IMAGE_ENV, name: value}, table)

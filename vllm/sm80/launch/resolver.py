@@ -780,14 +780,29 @@ def _ambient(final: Final, ms: ModelSettings, registry: Registry, classes: Class
         "VIRTUAL_ENV": inp.venv,
         "CUDA_HOME": rt["cuda_home"],
     }
-    if rt.get("ld_library_path"):
-        built_code["LD_LIBRARY_PATH"] = rt["ld_library_path"]
+    image_code, image_values = _image_env(rt.get("image_env", {}) if container else {}, classes)
+    for name, value in image_code.items():
+        built_code.setdefault(name, value)
     out["code"] = dict(built_code)
+    for name, value in image_values.items():
+        if "env." + name not in final.entries:
+            out["passed"][name] = (value, classes.classify(name))
     refusals: list[str] = []
     for name in sorted(inp.ambient):
         value = inp.ambient[name]
         if container and name in ms.user:
             continue  # read as a [user] knob
+        if name in image_values and "env." + name not in final.entries:
+            want = image_values[name]
+            if value == want:
+                out["equal"].append(name)
+            elif strict:
+                refusals.append(f"{name}={value!r} in the environment differs from the image's "
+                                f"{want!r} (strict policy)")
+            else:
+                out["passed"][name] = (value, classes.classify(name))
+                out["not_validated"].append(f"ambient {name}")
+            continue
         if name.upper().startswith("VLLM_") and name != name.upper():
             refusals.append(registry.check(name) or f"{name}: not a registered name")
             continue
@@ -858,3 +873,29 @@ def _ambient(final: Final, ms: ModelSettings, registry: Registry, classes: Class
     if refusals:
         raise Refusal(*refusals)
     return out
+
+
+def _image_env(image: dict, classes: ClassTable) -> tuple[dict[str, str], dict[str, str]]:
+    """The container image's ENV (``[runtime.container.image_env]``, its
+    complete config Env) split into the code-loading values the launcher
+    builds from it (all but PATH, which the launcher builds itself) and the
+    functional or inert values the environment must hold unchanged.
+    Container-runtime names are passed as the runtime sets them; any other
+    class is refused, so every name of the image is classified."""
+    code: dict[str, str] = {}
+    values: dict[str, str] = {}
+    for name, value in image.items():
+        cls = classes.classify(name)
+        if not isinstance(value, str):
+            raise Refusal(f"defaults: image_env {name} is not a string")
+        if always_refused(name):
+            raise Refusal(f"defaults: image_env {name} is refused: it changes what the server loads")
+        if cls == "code-loading":
+            if name != "PATH":
+                code[name] = value
+        elif cls in ("functional", "inert") and not name.startswith("VLLM_"):
+            values[name] = value
+        elif cls != "container-runtime":
+            raise Refusal(f"defaults: image_env {name} is class {cls}; the image ENV holds only "
+                          "code-loading, container-runtime, functional (not VLLM_*) or inert names")
+    return code, values
