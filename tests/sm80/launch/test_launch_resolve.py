@@ -210,7 +210,7 @@ def test_plain_upstream_drops_fork_names(tmp_path):
     d = w.resolve("--capability", "plain-upstream", layout="pp2")
     assert sorted(d["fork_switches_absent"]) == ["VLLM_PP_SPLIT", "VLLM_THIN_GEMM"]
     assert "--block-size" not in d["argv"]
-    assert d["validated"]["state"] is None and d["validated"]["reasons"] == ["reference"]
+    assert d["validated"]["state"] is None and d["validated"]["reasons"] == ["plain upstream"]
     assert d["registry"]["sm80_envs_sha256"] is None
 
 

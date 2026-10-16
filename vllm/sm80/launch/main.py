@@ -317,7 +317,9 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
     gen = read_generation(sd)           # one generation for every validated read and hash
     ev = None
     if ns.capability == "plain-upstream":
-        validated = {"state": None, "reasons": ["reference"], "functional_match": None,
+        # a plain upstream arm is never a validated launch and never a
+        # quality reference: it has no validated state at all
+        validated = {"state": None, "reasons": ["plain upstream"], "functional_match": None,
                      "role": ns.role}
     else:
         ev = Evidence(
