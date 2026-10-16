@@ -599,6 +599,14 @@ def env_module_change(tmp_path, after: str, before: str = ENVS_BASE) -> dict:
     ENVS_BASE.replace('"cuda", ["cuda", "cpu"]', '"cpu", ["cuda", "cpu"]'),
     # a build variable's annotation
     ENVS_BASE.replace('VLLM_TARGET_DEVICE: str = "cuda"', 'VLLM_TARGET_DEVICE: str = "cpu"'),
+    # an eager initializer in a runtime entry runs at import
+    ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
+                      '"VLLM_PORT": (os.environ.setdefault("CMAKE_BUILD_TYPE", "Debug"), '
+                      'lambda: os.getenv("VLLM_PORT", ""))[1],'),
+    # a runtime lambda's default value runs at import
+    ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
+                      '"VLLM_PORT": lambda _=os.environ.setdefault("CMAKE_BUILD_TYPE", "Debug"): '
+                      'os.getenv("VLLM_PORT", ""),'),
 ])
 def test_environment_module_other_code_is_a_build_input(tmp_path, after):
     et = env_module_change(tmp_path, after)
@@ -614,6 +622,10 @@ def test_environment_module_other_code_is_a_build_input(tmp_path, after):
              .replace('    "VLLM_PORT":', '    "VLLM_NEW": lambda: os.getenv("VLLM_NEW", ""),\n    "VLLM_PORT":'),
     # comments and layout
     "# runtime switches\n" + ENVS_BASE.replace("\n\n\ndef", "\n\n\n# helper\ndef"),
+    # a runtime lambda's body
+    ENVS_BASE.replace('os.getenv("VLLM_PORT", "")', 'int(os.getenv("VLLM_PORT", "0")) or None'),
+    # a literal runtime entry
+    ENVS_BASE.replace('    "VLLM_API_KEY":', '    "VLLM_NOTE": "text",\n    "VLLM_API_KEY":'),
 ])
 def test_environment_module_runtime_only_change_is_compatible(tmp_path, after):
     assert env_module_change(tmp_path, after)["cross_commit_artifacts"] is False
@@ -664,3 +676,16 @@ def test_stamp_names_a_null_native_identity(tmp_path):
     stamp.pop("native_manifest_sha256")
     write(os.path.join(w.tree, STAMP), json.dumps(stamp))
     assert "no native_manifest_sha256" in metadata(w)
+
+
+WITH_DEFAULT = ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
+                                 '"VLLM_PORT": lambda d="": os.getenv("VLLM_PORT", d),')
+
+
+@pytest.mark.parametrize("after, cross", [
+    (WITH_DEFAULT.replace('os.getenv("VLLM_PORT", d)', 'os.getenv("VLLM_PORT", d) or None'), False),
+    (WITH_DEFAULT.replace('lambda d=""', 'lambda d="8000"'), True),
+    (ENVS_BASE, True),
+])
+def test_runtime_lambda_defaults_compared_body_erased(tmp_path, after, cross):
+    assert env_module_change(tmp_path, after, before=WITH_DEFAULT)["cross_commit_artifacts"] is cross

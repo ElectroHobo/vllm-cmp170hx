@@ -1,4 +1,4 @@
-schema = "build-inputs/3"
+schema = "build-inputs/4"
 # Paths whose change makes artefacts built at another commit stale: the
 # wheel-equality set, the native builder's own inputs and the build driver
 # modules the wheel build loads (setup.py: tools/build_rust.py).
@@ -16,16 +16,19 @@ patterns = [
 ]
 
 # The environment modules the wheel build loads (setup.py) hold the build
-# variables beside many runtime ones. A change to one of these files counts
-# unless it touches only runtime variables: each side is reduced by
-# removing (1) from every top-level assignment to a name in `tables` whose
-# value is a dict literal, the entries keyed by a string constant not in
-# `names`, and (2) from the body of every top-level `if TYPE_CHECKING:`, the
-# annotated assignments to a plain name not in `names`; the reduced modules
-# are compared as ast.dump() (positions and comments ignored). Everything
-# else (helpers, lookup and registration code, imports, build entries)
-# counts. A missing file reduces from ""; a file that does not parse counts
-# as changed.
+# variables beside many runtime ones, and setup.py imports them. A change to
+# one of these files counts unless it touches only what runtime variables
+# defer: each side is reduced, then compared as ast.dump() (positions and
+# comments ignored). (1) In every top-level assignment to a name in `tables`
+# whose value is a dict literal, an entry keyed by a string constant not in
+# `names` is dropped when its value is a literal (ast.literal_eval accepts
+# it) or a lambda without default values; a lambda with default values
+# keeps its arguments (defaults run at import) and only its body becomes
+# the constant None; any other value stays as it is. (2) From the body of
+# every top-level `if TYPE_CHECKING:`, the annotated assignments to a plain
+# name not in `names` are dropped. Everything else (helpers, lookup and
+# registration code, imports, build entries, eager initializers) counts. A
+# missing file reduces from ""; a file that does not parse counts as changed.
 [env_modules]
 paths = ["vllm/envs.py", "vllm/sm80/envs.py"]
 tables = ["environment_variables", "FORK_ENV_VARS", "RETIRED_ENV_VARS"]

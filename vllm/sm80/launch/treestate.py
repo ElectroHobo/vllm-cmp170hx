@@ -598,16 +598,46 @@ def _runtime_key(key: ast.AST | None, names: set[str]) -> bool:
     return isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value not in names
 
 
+def _literal_value(node: ast.AST) -> bool:
+    try:
+        ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
+    return True
+
+
+def _runtime_entry(key: ast.AST | None, value: ast.AST, names: set[str]) -> ast.AST | None:
+    """A table entry reduced to what runs when the module is imported: None
+    for a runtime variable whose value runs nothing (a literal, or a lambda
+    without default values); a runtime lambda with default values keeps them
+    (they run at import) and loses only its deferred body; anything else,
+    and every build variable, unchanged."""
+    if not _runtime_key(key, names):
+        return value
+    if _literal_value(value):
+        return None
+    if isinstance(value, ast.Lambda):
+        if not value.args.defaults and all(d is None for d in value.args.kw_defaults):
+            return None
+        value.body = ast.Constant(value=None)
+    return value
+
+
 def env_module_reduced(text: str, names: set[str], tables: set[str]) -> str:
-    """ast.dump of an environment module without its runtime-only variables:
-    the entries of the top-level variable tables keyed by a string not in
-    ``names``, and the ``if TYPE_CHECKING:`` annotations of plain names not
-    in ``names``. Everything else (helpers, lookup and registration code,
-    imports, build entries) stays. Raises SyntaxError/ValueError."""
+    """ast.dump of an environment module without what only its runtime
+    variables defer: in the top-level variable tables, the entries keyed by
+    a string not in ``names`` whose value is a literal or a lambda without
+    default values are dropped, and a runtime lambda with default values
+    loses only its body; any other value stays (an eager initializer runs at
+    import). The ``if TYPE_CHECKING:`` annotations of plain names not in
+    ``names`` are dropped (never run). Everything else (helpers, lookup and
+    registration code, imports, build entries) stays. Raises
+    SyntaxError/ValueError."""
     module = ast.parse(text)
     for st in module.body:
         if _table_target(st, tables):
-            kept = [(k, v) for k, v in zip(st.value.keys, st.value.values) if not _runtime_key(k, names)]
+            kept = [(k, _runtime_entry(k, v, names)) for k, v in zip(st.value.keys, st.value.values)]
+            kept = [(k, v) for k, v in kept if v is not None]
             st.value.keys, st.value.values = [k for k, _ in kept], [v for _, v in kept]
         elif isinstance(st, ast.If) and isinstance(st.test, ast.Name) and st.test.id == "TYPE_CHECKING":
             st.body = [b for b in st.body if not (isinstance(b, ast.AnnAssign) and isinstance(b.target, ast.Name)
@@ -628,7 +658,7 @@ def _env_module_changed(tree: str, a: str, b: str, path: str, names: set[str],
 def _check_artefact_commit(st: TreeState, art) -> None:
     """Artefacts built at another commit: compatible only when no build input
     changed in between (data/build_inputs.toml: path patterns, and for the
-    environment modules everything but their runtime-only variables)."""
+    environment modules everything but what their runtime variables defer)."""
     if not isinstance(art, str) or not HEX40.match(art) or st.commit is None or art == st.commit:
         return
     try:
