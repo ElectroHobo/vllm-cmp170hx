@@ -53,12 +53,10 @@ from __future__ import annotations
 
 import ast
 import codecs
-import io
 import json
 import os
 import re
 import subprocess
-import tokenize
 from dataclasses import dataclass, field
 
 from canon import HashCache, canonical_sha256, sha256_file
@@ -76,6 +74,8 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 VERSION_NAMES = frozenset({"__all__", "__version__", "version", "__version_tuple__",
                            "version_tuple", "__commit_id__", "commit_id"})
 _ANNOTATION_NAMES = frozenset({"str", "int", "tuple"})
+# PEP 263 source encoding declaration
+_CODING = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 
 _DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
@@ -140,27 +140,38 @@ def _git(tree: str, *args: str) -> str:
     return proc.stdout
 
 
-def _git_blob(tree: str, commit: str, path: str) -> str:
-    """The Python source text of ``path`` at ``commit`` (``source_text``);
-    empty when the path is absent there."""
+def _git_blob(tree: str, commit: str, path: str) -> bytes:
+    """The bytes of ``path`` at ``commit``; empty when the path is absent there."""
     proc = subprocess.run(["git", "-C", tree, "show", f"{commit}:{path}"], capture_output=True,
                           env=_git_env(), check=False)
-    return source_text(proc.stdout) if proc.returncode == 0 else ""
+    return proc.stdout if proc.returncode == 0 else b""
 
 
-def source_text(raw: bytes) -> str:
-    """Python source as the importer reads it, accepted only in UTF-8: the
-    encoding the importer would use (``tokenize.detect_encoding``: a coding
-    declaration on the first two lines, or a byte order mark) must be plain
-    UTF-8. A declaration naming any other codec (utf-7, unicode-escape,
-    latin-1, ...) would make the importer read different text from what is
-    checked, so it is refused, and so is a UTF-8 byte order mark
-    (``utf-8-sig``), which no generator here writes. Raises SyntaxError or
-    ValueError; UnicodeDecodeError for bytes that are not UTF-8."""
-    encoding = tokenize.detect_encoding(io.BytesIO(raw).readline)[0]
-    if codecs.lookup(encoding).name != "utf-8":
-        raise ValueError(f"source encoding {encoding}, not utf-8")
-    return raw.decode("utf-8")
+def parse_source(raw: bytes) -> ast.Module:
+    """Python source accepted only when there is no doubt it is UTF-8 text,
+    parsed from its bytes so Python decodes it as the importer does. Refused
+    (ValueError): any carriage return (a line ending other readers split
+    differently), a UTF-8 byte order mark, and an encoding declaration on
+    either of the first two lines (split at CR, LF or CRLF) naming a codec
+    other than utf-8 or an unknown one. Bytes that are not UTF-8 anywhere
+    (comments included, which the parser alone does not check) raise
+    UnicodeDecodeError (a ValueError); invalid syntax raises SyntaxError."""
+    raw.decode("utf-8")
+    if b"\r" in raw:
+        raise ValueError("carriage return in the source")
+    if raw.startswith(codecs.BOM_UTF8):
+        raise ValueError("byte order mark in the source")
+    for line in re.split(rb"\r\n|\r|\n", raw)[:2]:
+        m = _CODING.match(line)
+        if m:
+            name = m.group(1).decode("ascii")
+            try:
+                codec = codecs.lookup(name).name
+            except LookupError:
+                codec = None
+            if codec != "utf-8":
+                raise ValueError(f"source encoding {name}, not utf-8")
+    return ast.parse(raw)
 
 
 def _read_json(path: str) -> dict | None:
@@ -520,8 +531,8 @@ def version_file_problem(path: str) -> str | None:
     except OSError:
         return None
     try:
-        module = ast.parse(source_text(raw))
-    except (UnicodeDecodeError, SyntaxError, ValueError) as exc:
+        module = parse_source(raw)
+    except (SyntaxError, ValueError) as exc:
         return f"{VERSION_FILE}: not version metadata ({exc})"
     for stmt in module.body:
         if not _version_statement(stmt):
@@ -641,7 +652,7 @@ def _runtime_entry(key: ast.AST | None, value: ast.AST, names: set[str]) -> ast.
     return value
 
 
-def env_module_reduced(text: str, names: set[str], tables: set[str]) -> str:
+def env_module_reduced(raw: bytes, names: set[str], tables: set[str]) -> str:
     """ast.dump of an environment module without what only its runtime
     variables defer: in the top-level variable tables, the entries keyed by
     a string not in ``names`` whose value is a literal or a lambda without
@@ -650,8 +661,8 @@ def env_module_reduced(text: str, names: set[str], tables: set[str]) -> str:
     import). The ``if TYPE_CHECKING:`` annotations of plain names not in
     ``names`` are dropped (never run). Everything else (helpers, lookup and
     registration code, imports, build entries) stays. Raises
-    SyntaxError/ValueError."""
-    module = ast.parse(text)
+    SyntaxError/ValueError (``parse_source``)."""
+    module = parse_source(raw)
     for st in module.body:
         if _table_target(st, tables):
             kept = [(k, _runtime_entry(k, v, names)) for k, v in zip(st.value.keys, st.value.values)]
@@ -670,7 +681,7 @@ def _env_module_changed(tree: str, a: str, b: str, path: str, names: set[str],
     try:
         return env_module_reduced(_git_blob(tree, a, path), names, tables) != \
             env_module_reduced(_git_blob(tree, b, path), names, tables)
-    except (UnicodeDecodeError, SyntaxError, ValueError):
+    except (SyntaxError, ValueError):
         return True
 
 

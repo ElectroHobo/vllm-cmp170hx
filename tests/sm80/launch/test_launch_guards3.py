@@ -12,6 +12,8 @@ import io
 import json
 import os
 import signal
+import subprocess
+import sys
 from contextlib import redirect_stderr, redirect_stdout
 
 import pytest
@@ -77,6 +79,27 @@ UTF7_PAYLOAD = (b"# coding: utf-7\n# +AAo-import os+AAo-os.environ['VLLM_KERNEL_
 ESCAPE_PAYLOAD = (b"# coding: unicode-escape\n# \\nimport os\\nos.environ['VLLM_KERNEL_X'] = '1'\n"
                   b"__version__ = '0.1.0'\n")
 APPENDED_CODE = VERSION_TEXT.encode() + b"import os\nos.environ['VLLM_KERNEL_X'] = '1'\n"
+# Physical lines ended by a bare CR: a reader splitting at LF sees one line
+# and no declaration; the importer sees the utf-7 declaration on line 2.
+CR_PAYLOAD = (b"\r# coding: utf-7\r# +AAo-import os+AAo-os.environ['VLLM_KERNEL_X'] = '1'\r"
+              b"__version__ = '0.1.0'\r")
+
+
+def test_cr_payload_runs_code_when_imported(tmp_path):
+    """The real importer, in a child interpreter, runs the CR payload."""
+    pkg = tmp_path / "probepkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_bytes(b"")
+    (pkg / "_version.py").write_bytes(CR_PAYLOAD)
+    env = {k: v for k, v in os.environ.items() if k != "VLLM_KERNEL_X"}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", "import os, sys; sys.path.insert(0, sys.argv[1]); "
+         "import probepkg._version as v; print(v.__version__, os.environ.get('VLLM_KERNEL_X'))",
+         str(tmp_path)], capture_output=True, text=True, env=env, check=True)
+    assert out.stdout.split() == ["0.1.0", "1"]
+    from treestate import version_file_problem
+    assert "carriage return" in (version_file_problem(str(pkg / "_version.py")) or "")
 
 
 def test_codec_payloads_run_code_when_imported():
@@ -86,8 +109,8 @@ def test_codec_payloads_run_code_when_imported():
         assert [type(s).__name__ for s in ast.parse(raw.decode("utf-8")).body] == ["Assign"]
 
 
-@pytest.mark.parametrize("payload", [APPENDED_CODE, UTF7_PAYLOAD, ESCAPE_PAYLOAD],
-                         ids=["appended", "utf-7", "unicode-escape"])
+@pytest.mark.parametrize("payload", [APPENDED_CODE, UTF7_PAYLOAD, ESCAPE_PAYLOAD, CR_PAYLOAD],
+                         ids=["appended", "utf-7", "unicode-escape", "cr-lines"])
 @pytest.mark.parametrize("kind", ["built", "linked"])
 def test_version_file_code_breaks_validation(tmp_path, kind, payload):
     if kind == "built":
@@ -170,7 +193,8 @@ __commit_id__ = commit_id = '7032b21f69012064ba2eb04c1cff30ac7e11834a'
 
 @pytest.mark.parametrize("text", [GENERATED, LOCAL, SHORT, VERSION_TEXT, '"""doc"""\n__version__ = None\n',
                                   "# -*- coding: utf-8 -*-\n" + SHORT, "# coding: utf8\n" + SHORT,
-                                  "#!/usr/bin/env python3\n# vim: set fileencoding=UTF-8 :\n" + SHORT])
+                                  "#!/usr/bin/env python3\n# vim: set fileencoding=UTF-8 :\n" + SHORT,
+                                  "# generated\n# by a tool\n# coding: utf-7 is only honoured on lines 1-2\n" + SHORT])
 def test_version_file_formats_accepted(tmp_path, text):
     from treestate import version_file_problem
     p = write(str(tmp_path / "_version.py"), text)
@@ -198,6 +222,10 @@ def test_version_file_formats_accepted(tmp_path, text):
     b"#!/x\n# coding: utf-7\n__version__ = '1'\n",
     b"# coding: no-such-codec\n__version__ = '1'\n",
     b"\xef\xbb\xbf__version__ = '1'\n",          # BOM: refused by policy
+    CR_PAYLOAD,
+    SHORT.replace("\n", "\r\n").encode(),          # CRLF: refused (no carriage return at all)
+    b"__version__ = '1'\r",
+    b"#\r# coding: latin-1\n__version__ = '1'\n",
 ])
 def test_version_file_code_refused(tmp_path, raw):
     from treestate import version_file_problem
@@ -375,6 +403,8 @@ import argparse
 
 
 def add_cli_args(parser):
+    parser.add_argument("--max-model-len", type=int)
+    parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--gpu-memory-utilization", "--device-memory-utilization", type=float)
     parser.add_argument("--enable-lora", action=argparse.BooleanOptionalAction)
     parser.add_argument("--enable-log-requests", action="store_true")
@@ -469,6 +499,41 @@ def test_alias_declared_protection(alias_w, tmp_path, form):
     alias_w.refused("--overlay", ov)
     d = alias_w.resolve("--experiment", "e", "--", f"--{form}", "0.5")
     assert d["argv"][-2:] == [f"--{form}", "0.5"]
+
+
+@pytest.mark.parametrize("decl", [
+    ('"args.gpu-memory-utilization", "tp"', '"args.gpu-memory-util", "tp"'),
+    ('controlled_args = ["max-model-len", "max-num-seqs"]',
+     'controlled_args = ["max-model-len", "max-num-seqs", "gpu-memory-util"]'),
+    ('controlled_args = ["max-model-len", "max-num-seqs"]', 'controlled_args = ["max-model", "max-num-seqs"]'),
+    ('controlled_args = ["max-model-len", "max-num-seqs"]',
+     'controlled_args = ["max-model-len", "max-num-seqs", "no-enable-lora"]'),
+    ('controlled_args = ["max-model-len", "max-num-seqs"]',
+     'controlled_args = ["max-model-len", "max-num-seqs", "not-an-option"]'),
+])
+def test_protected_declarations_full_names_only(aw, tmp_path, decl):
+    """An abbreviated, negative or unknown protected declaration is refused
+    at settings load, whatever the channel the launch would use."""
+    text = model_text(aw)
+    assert text.count(decl[0]) == 1
+    write(os.path.join(aw.settings, "model.toml"), text.replace(*decl))
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=--gpu-memory-utilization=0.5\n")
+    ov = write(str(tmp_path / "ov.toml"), 'schema = "launch-overlay/1"\n[args]\ngpu-memory-utilization = 0.5\n')
+    for args in [(), ("--", "--gpu-memory-utilization", "0.5"), ("--env-file", env),
+                 ("--set", "args.gpu-memory-utilization=0.5"), ("--overlay", ov),
+                 ("--experiment", "e", "--", "--gpu-memory-utilization", "0.5")]:
+        assert "must be full option names" in aw.refused(*args)
+
+
+def test_protected_full_name_declarations(aw, tmp_path):
+    """The full-name baseline resolves; overriding needs --experiment."""
+    text = model_text(aw).replace('controlled_args = ["max-model-len", "max-num-seqs"]',
+                                  'controlled_args = ["max-model-len", "max-num-seqs", "gpu-memory-utilization"]')
+    write(os.path.join(aw.settings, "model.toml"), text)
+    aw.resolve()
+    aw.refused("--", "--gpu-memory-util", "0.5")
+    d = aw.resolve("--experiment", "e", "--", "--gpu-memory-util", "0.5")
+    assert d["argv"][-2:] == ["--gpu-memory-util", "0.5"]
 
 
 def test_unprotected_spellings_allowed_with_aliases(alias_w):
@@ -682,6 +747,11 @@ def env_module_change(tmp_path, after: str, before: str = ENVS_BASE) -> dict:
     # a source codec that turns a comment into code (+AAo- is a newline in utf-7)
     "# coding: utf-7\n# +AAo-import os+AAo-os.environ.update(VLLM_TARGET_DEVICE=+ACI-cpu+ACI-)\n"
     + ENVS_BASE,
+    # the same declaration behind bare-CR line ends
+    "\r# coding: utf-7\r# +AAo-import os+AAo-os.environ.update(VLLM_TARGET_DEVICE=+ACI-cpu+ACI-)\r"
+    + ENVS_BASE,
+    # CRLF line ends: any carriage return counts
+    ENVS_BASE.replace("\n", "\r\n"),
 ])
 def test_environment_module_other_code_is_a_build_input(tmp_path, after):
     et = env_module_change(tmp_path, after)
@@ -703,6 +773,8 @@ def test_environment_module_other_code_is_a_build_input(tmp_path, after):
     ENVS_BASE.replace('    "VLLM_API_KEY":', '    "VLLM_NOTE": "text",\n    "VLLM_API_KEY":'),
     # an explicit UTF-8 declaration
     "# -*- coding: utf-8 -*-\n" + ENVS_BASE,
+    # a comment that looks like a declaration, on line 3
+    "# runtime\n# switches\n# coding: utf-7 (not a declaration here)\n" + ENVS_BASE,
 ])
 def test_environment_module_runtime_only_change_is_compatible(tmp_path, after):
     assert env_module_change(tmp_path, after)["cross_commit_artifacts"] is False

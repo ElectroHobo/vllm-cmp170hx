@@ -374,6 +374,7 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
     harness_set = {normalize_arg_name(h) for h in harness_args}
     secret_names = declared_secrets(ms)
     check_knob_names(ms, classes, secret_names)
+    check_protected_spellings(ms, inp.arg_options)
     # runtime layer
     final.put("args.host", rt["host"], "runtime", f"defaults.toml[runtime.{run}]")
     for k, v in rt.get("location", {}).items():
@@ -688,6 +689,19 @@ def reaches(name: str, guarded: set[str] | frozenset[str], opts: ArgOptions) -> 
         if any(f.startswith(spelled) or f"no-{f}".startswith(spelled) for f in forms):
             return g
     return None
+
+
+def check_protected_spellings(ms: ModelSettings, opts: ArgOptions) -> None:
+    """A fixed or controlled argument is declared by a full option name the
+    engine tree declares (its own name or an alias), so it names exactly one
+    destination; an abbreviation, a --no- form or a name the tree does not
+    declare is refused rather than resolved."""
+    declared = [k[5:].split(".", 1)[0] for k in sorted(ms.fixed) if k.startswith("args.")]
+    declared += sorted(ms.controlled_args)
+    bad = sorted({normalize_arg_name(a) for a in declared} - opts.options)
+    if bad:
+        raise Refusal("model.toml: fixed and controlled arguments must be full option names of "
+                      f"this engine tree; not {', '.join(bad)}")
 
 
 def _protected_args(ms: ModelSettings) -> set[str]:

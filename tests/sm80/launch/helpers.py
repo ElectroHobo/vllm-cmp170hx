@@ -64,6 +64,16 @@ def sm80_envs_py(fork: dict[str, str], retired: dict[str, str]) -> str:
             "RETIRED_ENV_VARS: dict[str, str] = {\n" + rrows + "\n}\n")
 
 
+# The engine options the synthetic model protects, declared as the tree's
+# argument file declares them (the launcher reads option names from it).
+ARG_UTILS = """\
+def add_cli_args(parser):
+    parser.add_argument("--max-model-len", type=int)
+    parser.add_argument("--gpu-memory-utilization", "--device-memory-utilization", type=float)
+    parser.add_argument("--max-num-seqs", type=int)
+"""
+
+
 def make_tree(root: str, *, sm80: bool = True, fork: dict | None = None,
               retired: dict | None = None, upstream: list[str] | None = None,
               extra_files: dict[str, str] | None = None) -> str:
@@ -75,6 +85,7 @@ def make_tree(root: str, *, sm80: bool = True, fork: dict | None = None,
               sm80_envs_py(fork if fork is not None else FORK_VARS,
                            retired if retired is not None else RETIRED))
     write(os.path.join(root, "csrc", "kernel.cu"), "// kernel\n")
+    write(os.path.join(root, "vllm", "engine", "arg_utils.py"), ARG_UTILS)
     write(os.path.join(root, ".gitignore"), "*.so\nbuild/\n")
     for rel, text in (extra_files or {}).items():
         write(os.path.join(root, rel), text)
