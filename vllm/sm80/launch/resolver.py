@@ -674,7 +674,9 @@ def reaches(name: str, guarded: set[str] | frozenset[str], opts: ArgOptions) -> 
     """The guarded argument a spelling sets, if any: by its destination, or
     as an abbreviation argparse expands to a guarded option (or its alias or
     --no- form). A spelling the tree declares exactly is never an
-    abbreviation."""
+    abbreviation. Both sides are compared as destinations: the guarded
+    names are canonicalised the same way as the incoming one."""
+    guarded = {arg_destination(g, opts) for g in guarded}
     dest = arg_destination(name, opts)
     if dest in guarded:
         return dest

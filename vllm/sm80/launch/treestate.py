@@ -52,10 +52,13 @@ tracked? (images).
 from __future__ import annotations
 
 import ast
+import codecs
+import io
 import json
 import os
 import re
 import subprocess
+import tokenize
 from dataclasses import dataclass, field
 
 from canon import HashCache, canonical_sha256, sha256_file
@@ -138,11 +141,26 @@ def _git(tree: str, *args: str) -> str:
 
 
 def _git_blob(tree: str, commit: str, path: str) -> str:
-    """The text of ``path`` at ``commit``; empty when the path is absent there.
-    Raises UnicodeDecodeError for a file that is not UTF-8."""
+    """The Python source text of ``path`` at ``commit`` (``source_text``);
+    empty when the path is absent there."""
     proc = subprocess.run(["git", "-C", tree, "show", f"{commit}:{path}"], capture_output=True,
                           env=_git_env(), check=False)
-    return proc.stdout.decode("utf-8") if proc.returncode == 0 else ""
+    return source_text(proc.stdout) if proc.returncode == 0 else ""
+
+
+def source_text(raw: bytes) -> str:
+    """Python source as the importer reads it, accepted only in UTF-8: the
+    encoding the importer would use (``tokenize.detect_encoding``: a coding
+    declaration on the first two lines, or a byte order mark) must be plain
+    UTF-8. A declaration naming any other codec (utf-7, unicode-escape,
+    latin-1, ...) would make the importer read different text from what is
+    checked, so it is refused, and so is a UTF-8 byte order mark
+    (``utf-8-sig``), which no generator here writes. Raises SyntaxError or
+    ValueError; UnicodeDecodeError for bytes that are not UTF-8."""
+    encoding = tokenize.detect_encoding(io.BytesIO(raw).readline)[0]
+    if codecs.lookup(encoding).name != "utf-8":
+        raise ValueError(f"source encoding {encoding}, not utf-8")
+    return raw.decode("utf-8")
 
 
 def _read_json(path: str) -> dict | None:
@@ -502,9 +520,9 @@ def version_file_problem(path: str) -> str | None:
     except OSError:
         return None
     try:
-        module = ast.parse(raw.decode("utf-8"))
+        module = ast.parse(source_text(raw))
     except (UnicodeDecodeError, SyntaxError, ValueError) as exc:
-        return f"{VERSION_FILE}: not version metadata ({type(exc).__name__})"
+        return f"{VERSION_FILE}: not version metadata ({exc})"
     for stmt in module.body:
         if not _version_statement(stmt):
             return (f"{VERSION_FILE}: not version metadata (line {stmt.lineno}; only literal "
@@ -647,7 +665,8 @@ def env_module_reduced(text: str, names: set[str], tables: set[str]) -> str:
 
 def _env_module_changed(tree: str, a: str, b: str, path: str, names: set[str],
                         tables: set[str]) -> bool:
-    """Fail closed: a side that does not decode or parse counts as changed."""
+    """Fail closed: a side that is not UTF-8 source or does not parse counts
+    as changed."""
     try:
         return env_module_reduced(_git_blob(tree, a, path), names, tables) != \
             env_module_reduced(_git_blob(tree, b, path), names, tables)

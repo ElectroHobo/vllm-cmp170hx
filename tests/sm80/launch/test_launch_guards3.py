@@ -7,6 +7,7 @@ knob names of every classified kind."""
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
@@ -68,8 +69,27 @@ def linked_with_version(tmp_path):
     return w
 
 
+# Version files whose declared source codec hides code in what UTF-8 reads
+# as comments: the importer decodes +AAo- (utf-7) and \\n (unicode-escape)
+# to newlines, so the import and the assignment run.
+UTF7_PAYLOAD = (b"# coding: utf-7\n# +AAo-import os+AAo-os.environ['VLLM_KERNEL_X'] = '1'\n"
+                b"__version__ = '0.1.0'\n")
+ESCAPE_PAYLOAD = (b"# coding: unicode-escape\n# \\nimport os\\nos.environ['VLLM_KERNEL_X'] = '1'\n"
+                  b"__version__ = '0.1.0'\n")
+APPENDED_CODE = VERSION_TEXT.encode() + b"import os\nos.environ['VLLM_KERNEL_X'] = '1'\n"
+
+
+def test_codec_payloads_run_code_when_imported():
+    """The payloads do what the controls below assume, under the importer's decoding."""
+    for raw in (UTF7_PAYLOAD, ESCAPE_PAYLOAD):
+        assert [type(s).__name__ for s in ast.parse(raw).body][0] == "Import"
+        assert [type(s).__name__ for s in ast.parse(raw.decode("utf-8")).body] == ["Assign"]
+
+
+@pytest.mark.parametrize("payload", [APPENDED_CODE, UTF7_PAYLOAD, ESCAPE_PAYLOAD],
+                         ids=["appended", "utf-7", "unicode-escape"])
 @pytest.mark.parametrize("kind", ["built", "linked"])
-def test_version_file_code_breaks_validation(tmp_path, kind):
+def test_version_file_code_breaks_validation(tmp_path, kind, payload):
     if kind == "built":
         w = World(tmp_path)
         assert w.verify() == 0
@@ -79,7 +99,8 @@ def test_version_file_code_breaks_validation(tmp_path, kind):
     before = w.resolve()
     assert before["validated"]["state"] == "VALIDATED"
     vf = os.path.join(w.tree, VERSION_FILE)
-    write(vf, VERSION_TEXT + "import os\nos.environ['VLLM_KERNEL_X'] = '1'\n")
+    with open(vf, "wb") as f:
+        f.write(payload)
     man = load(os.path.join(w.tree, MANIFEST))
     man["files"][VERSION_FILE] = sha256_file(vf)
     if kind == "built":
@@ -147,7 +168,9 @@ __commit_id__ = commit_id = '7032b21f69012064ba2eb04c1cff30ac7e11834a'
 '''
 
 
-@pytest.mark.parametrize("text", [GENERATED, LOCAL, SHORT, VERSION_TEXT, '"""doc"""\n__version__ = None\n'])
+@pytest.mark.parametrize("text", [GENERATED, LOCAL, SHORT, VERSION_TEXT, '"""doc"""\n__version__ = None\n',
+                                  "# -*- coding: utf-8 -*-\n" + SHORT, "# coding: utf8\n" + SHORT,
+                                  "#!/usr/bin/env python3\n# vim: set fileencoding=UTF-8 :\n" + SHORT])
 def test_version_file_formats_accepted(tmp_path, text):
     from treestate import version_file_problem
     p = write(str(tmp_path / "_version.py"), text)
@@ -169,6 +192,12 @@ def test_version_file_formats_accepted(tmp_path, text):
     b"def __getattr__(name):\n    return name\n",
     b"__version__ = '1\n",
     b"\xff\xfe = 1\n",
+    UTF7_PAYLOAD,
+    ESCAPE_PAYLOAD,
+    b"# coding: latin-1\n__version__ = '1'\n",
+    b"#!/x\n# coding: utf-7\n__version__ = '1'\n",
+    b"# coding: no-such-codec\n__version__ = '1'\n",
+    b"\xef\xbb\xbf__version__ = '1'\n",          # BOM: refused by policy
 ])
 def test_version_file_code_refused(tmp_path, raw):
     from treestate import version_file_problem
@@ -408,6 +437,45 @@ def test_launcher_arguments_never_from_outside(aw, args):
     assert "set by the launcher" in aw.refused("--experiment", "e", *args)
 
 
+@pytest.fixture
+def alias_w(tmp_path):
+    """The protected arguments declared under their alias spellings."""
+    w = World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS})
+    text = model_text(w).replace(
+        'fixed = ["args.max-model-len", "args.gpu-memory-utilization",',
+        'fixed = ["args.max-model-len", "args.device-memory-utilization",').replace(
+        'gpu-memory-utilization = { value = 0.9,', 'device-memory-utilization = { value = 0.9,').replace(
+        'controlled_args = ["max-model-len", "max-num-seqs"]',
+        'controlled_args = ["max-model-len", "max-num-seqs", "device-memory-utilization"]')
+    assert "device-memory-utilization = { value = 0.9" in text and "args.device-memory-utilization" in text
+    write(os.path.join(w.settings, "model.toml"), text)
+    assert w.verify() == 0
+    promote(w, ["tp2"])
+    d = w.resolve()
+    assert d["validated"]["state"] == "VALIDATED" and "--device-memory-utilization" in d["argv_functional"]
+    return w
+
+
+ALIAS_FORMS = ["gpu-memory-utilization", "device-memory-utilization", "gpu-memory-util", "device-mem"]
+
+
+@pytest.mark.parametrize("form", ALIAS_FORMS)
+def test_alias_declared_protection(alias_w, tmp_path, form):
+    alias_w.refused("--", f"--{form}", "0.5")
+    env = write(str(tmp_path / "u.env"), f"EXTRA_ARGS=--{form}=0.5\n")
+    alias_w.refused("--env-file", env)
+    alias_w.refused("--set", f"args.{form}=0.5")
+    ov = write(str(tmp_path / "ov.toml"), f'schema = "launch-overlay/1"\n[args]\n{form} = 0.5\n')
+    alias_w.refused("--overlay", ov)
+    d = alias_w.resolve("--experiment", "e", "--", f"--{form}", "0.5")
+    assert d["argv"][-2:] == [f"--{form}", "0.5"]
+
+
+def test_unprotected_spellings_allowed_with_aliases(alias_w):
+    d = alias_w.resolve("--", "--enable-log-requests")
+    assert d["argv"][-1] == "--enable-log-requests"
+
+
 def test_unprotected_spellings_allowed(aw):
     d = aw.resolve("--", "--enable-log-requests", "--max-num-batched-tokens", "8192")
     assert d["argv"][-3:] == ["--enable-log-requests", "--max-num-batched-tokens", "8192"]
@@ -607,6 +675,13 @@ def env_module_change(tmp_path, after: str, before: str = ENVS_BASE) -> dict:
     ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
                       '"VLLM_PORT": lambda _=os.environ.setdefault("CMAKE_BUILD_TYPE", "Debug"): '
                       'os.getenv("VLLM_PORT", ""),'),
+    # the same through os.environ.update, changing the build target the build reads
+    ENVS_BASE.replace('"VLLM_PORT": lambda: os.getenv("VLLM_PORT", ""),',
+                      '"VLLM_PORT": lambda _=os.environ.update(VLLM_TARGET_DEVICE="cpu"): '
+                      'os.getenv("VLLM_PORT", ""),'),
+    # a source codec that turns a comment into code (+AAo- is a newline in utf-7)
+    "# coding: utf-7\n# +AAo-import os+AAo-os.environ.update(VLLM_TARGET_DEVICE=+ACI-cpu+ACI-)\n"
+    + ENVS_BASE,
 ])
 def test_environment_module_other_code_is_a_build_input(tmp_path, after):
     et = env_module_change(tmp_path, after)
@@ -626,6 +701,8 @@ def test_environment_module_other_code_is_a_build_input(tmp_path, after):
     ENVS_BASE.replace('os.getenv("VLLM_PORT", "")', 'int(os.getenv("VLLM_PORT", "0")) or None'),
     # a literal runtime entry
     ENVS_BASE.replace('    "VLLM_API_KEY":', '    "VLLM_NOTE": "text",\n    "VLLM_API_KEY":'),
+    # an explicit UTF-8 declaration
+    "# -*- coding: utf-8 -*-\n" + ENVS_BASE,
 ])
 def test_environment_module_runtime_only_change_is_compatible(tmp_path, after):
     assert env_module_change(tmp_path, after)["cross_commit_artifacts"] is False
