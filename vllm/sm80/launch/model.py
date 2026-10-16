@@ -12,13 +12,18 @@ Fields (schema launch-model/1)::
     fixed = ["args.max-model-len", "tp", "pp", "cards"]
     controlled_args = ["tensor-parallel-size", ...]
     [layouts] allowed = [...], default = "..."
-    [checkpoint.<name>] repo_key, revision_key, dir, index?, weights?, required, manifest
-    [args] / [env] / [location]        # values: plain or { value = ..., why = "..." }
+    [checkpoint.<name>] repo_key, revision_key, dir, container_dir?, index?,
+                        weights?, required, manifest
+    [args] / [env]                     # values: plain or { value = ..., why = "..." }
+    [location]                         # plain, or { native = "...", container = "..." }
     [[refuse]] when = { "env.X" = "0", ... }, why = "..."
     [requires] files = [ { path = "vllm/_x*.so", fork_only = true } ]
-    [user.<KNOB>] target = "args.port" | "env.X" | "card_ids" | "extra_args",
-                  variant = "<name>", choices = [...], divide_by = N, type = "int",
-                  secret = true
+    [user.<KNOB>]
+        target = "args.a[.b]" | "env.X" | "card_ids" | "extra_args" | [several]
+        type = "str" | "int" | "bool"      divide_by = N      choices = [...]
+        secret = true                       variants = ["v"]  # only with one of these
+        variant = "v"                       # 1/0 selects variant v
+        variant = { a = "va", b = "" }      # the value picks a variant ("" none)
 """
 
 from __future__ import annotations
@@ -50,6 +55,24 @@ class ModelSettings:
     baseline: dict = field(default_factory=dict)
 
 
+def _check_knob(knob: str, spec) -> None:
+    where = f"settings:model.toml: user.{knob}"
+    if not _KNOB.match(knob):
+        raise Refusal(f"settings:model.toml: user knob {knob!r} is not an env-style name")
+    if not isinstance(spec, dict) or not (spec.get("target") or spec.get("variant")):
+        raise Refusal(f"{where} needs target or variant")
+    target = spec.get("target")
+    if target is not None and not (isinstance(target, str) or (
+            isinstance(target, list) and target and all(isinstance(t, str) for t in target))):
+        raise Refusal(f"{where}: target is a key or a list of keys")
+    variant = spec.get("variant")
+    if variant is not None and not (isinstance(variant, str) or (
+            isinstance(variant, dict) and all(isinstance(v, str) for v in variant.values()))):
+        raise Refusal(f"{where}: variant is a name or a value-to-variant table")
+    if spec.get("type", "str") not in ("str", "int", "bool"):
+        raise Refusal(f"{where}: type is str, int or bool")
+
+
 def load_model_settings(sd: SettingsDir) -> ModelSettings:
     d = sd.toml("model.toml", "launch-model")
     for key in ("model", "hardware"):
@@ -69,10 +92,7 @@ def load_model_settings(sd: SettingsDir) -> ModelSettings:
                 raise Refusal(f"settings:model.toml: checkpoint.{name}.{key} is required")
     user = d.get("user", {})
     for knob, spec in user.items():
-        if not _KNOB.match(knob):
-            raise Refusal(f"settings:model.toml: user knob {knob!r} is not an env-style name")
-        if not isinstance(spec, dict) or not (spec.get("target") or spec.get("variant")):
-            raise Refusal(f"settings:model.toml: user.{knob} needs target or variant")
+        _check_knob(knob, spec)
     requires = []
     for ent in d.get("requires", {}).get("files", []):
         if isinstance(ent, str):

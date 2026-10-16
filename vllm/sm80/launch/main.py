@@ -148,6 +148,27 @@ def _variant_files(sd: SettingsDir, extra_sd: SettingsDir | None, community: lis
     return out
 
 
+def _checkpoint_paths(ns, ms, rt: dict, pins: dict, home: str) -> dict[str, str]:
+    """Where each checkpoint is: --checkpoint-path, else <models_dir>/<dir>
+    (``container_dir`` in a container), else in a container the HF-cache
+    snapshot of the pinned revision."""
+    models_dir = substitute(ns.models_dir or rt["models_dir"], {"home": home}, "models_dir")
+    overrides = dict(x.split("=", 1) for x in ns.checkpoint_path if "=" in x)
+    out: dict[str, str] = {}
+    for name, spec in ms.checkpoints.items():
+        if name in overrides:
+            out[name] = os.path.abspath(overrides[name])
+            continue
+        container = ns.runtime == "container"
+        direct = os.path.join(models_dir, spec.get("container_dir", spec["dir"]) if container else spec["dir"])
+        if container and not os.path.isdir(direct):
+            snap = _hub_snapshot(rt.get("hub_dirs", []), pins.get(spec["repo_key"], ""),
+                                 pins.get(spec["revision_key"], ""))
+            direct = snap or direct
+        out[name] = direct
+    return out
+
+
 def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
     """Everything except exec: the launch-resolved/2 document plus private
     fields (prefixed with '_') used to exec."""
@@ -201,22 +222,8 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
     classes = ClassTable(defaults["classes"], ms.env_prefixes)
     harness_args = list(defaults.get("harness", {}).get("args", []))
 
-    # checkpoint locations
     pins = sd.pins()
-    models_dir = substitute(ns.models_dir or rt["models_dir"], {"home": home}, "models_dir")
-    overrides = dict(x.split("=", 1) for x in ns.checkpoint_path if "=" in x)
-    cp_paths: dict[str, str] = {}
-    for name, spec in ms.checkpoints.items():
-        if name in overrides:
-            cp_paths[name] = os.path.abspath(overrides[name])
-            continue
-        direct = os.path.join(models_dir, spec["dir"])
-        if ns.runtime == "container" and not os.path.isdir(direct):
-            snap = _hub_snapshot(rt.get("hub_dirs", []), pins.get(spec["repo_key"], ""),
-                                 pins.get(spec["revision_key"], ""))
-            direct = snap or direct
-        cp_paths[name] = direct
-
+    cp_paths = _checkpoint_paths(ns, ms, rt, pins, home)
     inp = Inputs(
         runtime=ns.runtime, runtime_cfg=rt, layout=layout, variants=list(ns.variant),
         overlays=overlays, community=community, env_file=env_file, ambient=dict(environ),
@@ -395,10 +402,9 @@ def main(argv: list[str] | None = None, environ: dict[str, str] | None = None) -
     try:
         if ns.verify_checkpoints:
             home = _home(ns.runtime, environ)
-            args = ["verify", "--settings", ns.settings, "--stamp-dir",
-                    ns.stamp_dir or os.path.join(home if ns.runtime == "native" else "/cache",
-                                                 ".cache" if ns.runtime == "native" else "",
-                                                 "sm80-launch")]
+            stamp_dir = ns.stamp_dir or (os.path.join(home, ".cache", "sm80-launch")
+                                         if ns.runtime == "native" else "/cache/sm80-launch")
+            args = ["verify", "--settings", ns.settings, "--stamp-dir", stamp_dir]
             if ns.models_dir:
                 args += ["--models-dir", ns.models_dir]
             return checkpoint.main(args)

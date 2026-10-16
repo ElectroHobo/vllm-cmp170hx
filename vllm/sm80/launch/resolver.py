@@ -33,6 +33,7 @@ from registry import Registry
 from settings_dir import check_arg_spellings, normalize_arg_name
 
 LOCKED_LAYERS = ("overlay", "user", "ambient", "cli")   # [fixed] needs --experiment
+RUNTIMES = ("native", "container")
 _SUBST = re.compile(r"\$\{([^}]*)\}")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOP_KEYS = ("tp", "pp", "cards", "card_ids")
@@ -100,8 +101,11 @@ def _env_value(v: Any, where: str) -> str:
 
 
 def apply_table(final: Final, table: dict, layer: str, source: str, *,
-                layout: str | None = None) -> None:
-    """Apply one settings table (layout, variant, overlay, hardware, model)."""
+                layout: str | None = None, runtime: str | None = None) -> None:
+    """Apply one settings table (layout, variant, overlay, hardware, model).
+
+    A [location] value may be ``{ native = "...", container = "..." }``:
+    only the current runtime's entry applies (none if it is missing)."""
     for key in _TOP_KEYS:
         if key in table:
             v = table[key]
@@ -128,6 +132,12 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
             if not _ENV_NAME.match(k):
                 raise Refusal(f"{source}: {k!r} is not an environment name")
             val, why = split_value(v, source)
+            if section == "location" and isinstance(val, dict):
+                if not set(val) <= set(RUNTIMES):
+                    raise Refusal(f"{source}: location {k} keys must be native/container")
+                if runtime not in val:
+                    continue
+                val = val[runtime]
             final.put(prefix + k, _env_value(val, f"{source}:{k}"), layer, source, why)
     for key in table.get("unset", []):
         if not isinstance(key, str):
@@ -138,7 +148,7 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
     if layout is not None:
         sub = table.get("layout", {}).get(layout)
         if sub:
-            apply_table(final, sub, layer, f"{source}[layout.{layout}]")
+            apply_table(final, sub, layer, f"{source}[layout.{layout}]", runtime=runtime)
 
 
 def substitute(value: Any, subst: dict[str, str], where: str) -> Any:
@@ -252,17 +262,29 @@ def user_values(ms: ModelSettings, inp: Inputs) -> dict[str, str]:
     return values
 
 
-def selected_variants(ms: ModelSettings, inp: Inputs) -> list[str]:
+def _knob_variant(knob: str, spec: dict, raw: str) -> str | None:
+    """The variant a knob value selects (None: none)."""
+    sel = spec["variant"]
+    if isinstance(sel, dict):
+        if raw not in sel:
+            raise Refusal(f"{knob}={raw!r}: expected one of {', '.join(sel)}")
+        return sel[raw] or None
+    v = raw.strip().lower()
+    if v in _TRUE:
+        return sel
+    if v in _FALSE:
+        return None
+    raise Refusal(f"{knob}={raw!r}: expected 1 or 0")
+
+
+def selected_variants(ms: ModelSettings, inp: Inputs, values: dict[str, str] | None = None) -> list[str]:
     variants = list(inp.variants)
-    values = user_values(ms, inp)
+    values = user_values(ms, inp) if values is None else values
     for knob, spec in ms.user.items():
         if spec.get("variant") and knob in values:
-            v = values[knob].strip().lower()
-            if v in _TRUE:
-                if spec["variant"] not in variants:
-                    variants.append(spec["variant"])
-            elif v not in _FALSE:
-                raise Refusal(f"{knob}={values[knob]!r}: expected 1 or 0")
+            name = _knob_variant(knob, spec, values[knob])
+            if name and name not in variants:
+                variants.append(name)
     if inp.capability == "plain-upstream" and "plain-upstream" not in variants:
         variants.append("plain-upstream")
     return variants
@@ -274,35 +296,36 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
     final = Final()
     not_validated: list[str] = []
     rt = inp.runtime_cfg
+    run = inp.runtime
     harness_args = list(harness_args)
     # runtime layer
-    final.put("args.host", rt["host"], "runtime", f"defaults.toml[runtime.{inp.runtime}]")
+    final.put("args.host", rt["host"], "runtime", f"defaults.toml[runtime.{run}]")
     for k, v in rt.get("location", {}).items():
-        final.put("loc." + k, str(v), "runtime", f"defaults.toml[runtime.{inp.runtime}.location]")
+        final.put("loc." + k, str(v), "runtime", f"defaults.toml[runtime.{run}.location]")
     # model, hardware, layout
     apply_table(final, {k: ms.data[k] for k in ("args", "env", "location") if k in ms.data},
-                "model", "model.toml")
+                "model", "model.toml", runtime=run)
     hw = files["hardware"]
     apply_table(final, {k: hw[k] for k in ("env", "location") if k in hw}, "hardware",
-                f"hardware/{ms.hardware}.toml")
-    apply_table(final, files["layout"], "layout", f"layouts/{inp.layout}.toml")
+                f"hardware/{ms.hardware}.toml", runtime=run)
+    apply_table(final, files["layout"], "layout", f"layouts/{inp.layout}.toml", runtime=run)
     # variants (user knobs that select a variant are read first)
     values = user_values(ms, inp)
-    variants = selected_variants(ms, inp)
+    variants = selected_variants(ms, inp, values)
     for v in variants:
         table = files.get(f"variant:{v}")
         if table is None:
             raise Refusal(f"variant {v!r} has no variants/{v}.toml")
-        apply_table(final, table, "variant", f"variants/{v}.toml", layout=inp.layout)
+        apply_table(final, table, "variant", f"variants/{v}.toml", layout=inp.layout, runtime=run)
     # what the settings themselves fixed; later layers may not change it
     settled = {k: e.value for k, e in final.entries.items() if _fixed(k, ms)}
     # overlays, then the community settings directory (same level)
     for source, table in inp.overlays:
         if table.get("class") == "harness":
             harness_args += [normalize_arg_name(k) for k in table.get("args", {})]
-        apply_table(final, table, "overlay", source, layout=inp.layout)
+        apply_table(final, table, "overlay", source, layout=inp.layout, runtime=run)
     for source, table in inp.community:
-        apply_table(final, table, "overlay", source, layout=inp.layout)
+        apply_table(final, table, "overlay", source, layout=inp.layout, runtime=run)
     # user layer
     extra_args = list(inp.extra_args)
     secret_names: set[str] = set()
@@ -311,9 +334,8 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
         if spec is None:
             raise Refusal(f".env: {knob} is not a documented setting of this model "
                           f"(known: {', '.join(sorted(ms.user)) or 'none'})")
-        if spec.get("variant") and not spec.get("target"):
-            continue
-        _apply_user(final, knob, spec, raw, extra_args, secret_names)
+        if spec.get("target"):
+            _apply_user(final, knob, spec, raw, extra_args, secret_names, variants)
     sets = [parse_set(s) for s in inp.sets]
     _check_fixed(final, ms, inp, sets, settled)
     # ambient
@@ -323,7 +345,9 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
     # CLI layer
     for key, value in sets:
         if key in ms.user:
-            _apply_user(final, key, ms.user[key], str(value), extra_args, secret_names,
+            if not ms.user[key].get("target"):
+                raise Refusal(f"--set {key}: selects a variant; use --variant")
+            _apply_user(final, key, ms.user[key], str(value), extra_args, secret_names, variants,
                         layer="cli", source="--set")
         elif key == "cards":
             final.put("card_ids", str(value), "cli", "--set")
@@ -465,32 +489,44 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_args
 
 
 def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[str],
-                secret_names: set[str], *, layer: str = "user", source: str | None = None) -> None:
+                secret_names: set[str], variants: list[str], *, layer: str = "user",
+                source: str | None = None) -> None:
     source = source or f".env:{knob}"
+    only = spec.get("variants")
+    if only and not set(only) & set(variants):
+        raise Refusal(f"{knob} applies only with variant {' or '.join(only)} "
+                      f"(active: {', '.join(variants) or 'none'})")
     choices = spec.get("choices")
     if choices is not None and raw not in [str(c) for c in choices]:
         raise Refusal(f"{knob}={raw!r}: expected one of {', '.join(map(str, choices))}")
-    target = spec["target"]
     value: Any = raw
+    kind = spec.get("type", "str")
     try:
         if spec.get("divide_by"):
             value = int(raw) // int(spec["divide_by"])
-        elif spec.get("type") == "int":
+        elif kind == "int":
             value = int(raw)
     except ValueError:
         raise Refusal(f"{knob}={raw!r}: expected an integer") from None
-    if target == "extra_args":
-        extra_args.extend(shlex.split(raw))
-    elif target == "card_ids":
-        final.put("card_ids", raw, layer, source)
-    elif target.startswith("args."):
-        set_nested(final, target, value, layer, source)
-    elif target.startswith("env."):
-        final.put(target, str(value), layer, source)
-        if spec.get("secret"):
-            secret_names.add(target[4:])
-    else:
-        raise Refusal(f"model.toml: user.{knob} target {target!r} is not args.*, env.*, card_ids or extra_args")
+    if kind == "bool":
+        low = raw.strip().lower()
+        if low not in _TRUE + _FALSE[1:]:
+            raise Refusal(f"{knob}={raw!r}: expected 1 or 0")
+        value = low in _TRUE
+    targets = spec["target"] if isinstance(spec["target"], list) else [spec["target"]]
+    for target in targets:
+        if target == "extra_args":
+            extra_args.extend(shlex.split(raw))
+        elif target == "card_ids":
+            final.put("card_ids", raw, layer, source)
+        elif target.startswith("args."):
+            set_nested(final, target, value, layer, source)
+        elif target.startswith("env."):
+            final.put(target, str(raw if kind == "bool" else value), layer, source)
+            if spec.get("secret"):
+                secret_names.add(target[4:])
+        else:
+            raise Refusal(f"model.toml: user.{knob} target {target!r} is not args.*, env.*, card_ids or extra_args")
 
 
 def _check_controlled(ms: ModelSettings, extra: list[str], experiment: str | None) -> None:
@@ -519,9 +555,15 @@ def _check_fixed(final: Final, ms: ModelSettings, inp: Inputs, sets: list,
         if e.layer in LOCKED_LAYERS and key in settled and settled[key] != e.value:
             raise Refusal(f"{key} is fixed for this model ({e.source}); it changes only under --experiment")
     for key, value in sets:
-        k = "card_ids" if key == "cards" else ms.user.get(key, {}).get("target", key)
-        if _fixed(k, ms) and str(final.get(k)) != str(value):
-            raise Refusal(f"{k} is fixed for this model (--set); it changes only under --experiment")
+        targets = [key]
+        if key == "cards":
+            targets = ["card_ids"]
+        elif key in ms.user and ms.user[key].get("target"):
+            t = ms.user[key]["target"]
+            targets = t if isinstance(t, list) else [t]
+        for k in targets:
+            if _fixed(k, ms) and str(final.get(k)) != str(value):
+                raise Refusal(f"{k} is fixed for this model (--set); it changes only under --experiment")
 
 
 def _ambient(final: Final, ms: ModelSettings, registry: Registry, classes: ClassTable,
