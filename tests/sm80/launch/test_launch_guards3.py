@@ -297,6 +297,49 @@ def test_linked_written_natives_match_native_manifest(tmp_path):
     assert "link-written natives without a native manifest" in metadata(w)
 
 
+@pytest.mark.parametrize("image", [False, True], ids=["native", "image"])
+def test_built_natives_match_native_manifest(tmp_path, image):
+    """A built_in_place map's fork natives are exactly the artefacts of the
+    native manifest it names, with the same hashes (the linked rule), in a
+    Git checkout and in a Git-free image tree."""
+    from helpers import BUILD
+    from test_launch_guards import image_tree
+    from treestate import tree_state
+    rel = "vllm/_ampere_marlin_C.abi3.so"
+    w = World(tmp_path / "w", build=False)
+    man = add_build(w.tree, dict(BUILD, **{rel: "marlin"}))
+    sha, nm = man["files"][rel], man["native_manifest_path"]
+    runs = iter(range(10))
+
+    def problems(artefacts):
+        if artefacts is None:
+            man["native_manifest_sha256"] = None
+            man.pop("native_manifest_path", None)
+        else:
+            write(nm, json.dumps(artefacts))
+            man["native_manifest_sha256"], man["native_manifest_path"] = sha256_file(nm), nm
+        rewrite_manifest(w.tree, man, stamp=True)
+        tree = image_tree(w, tmp_path / f"image{next(runs)}") if image else w.tree
+        st = tree_state(tree, image=image)
+        assert set(st.dirty_paths) <= {"metadata_invalid"}, st.dirty_paths
+        return " | ".join(st.dirty_paths.get("metadata_invalid", []))
+
+    assert problems({"artefacts": {rel: {"sha256": sha}}}) == ""
+    assert "artefacts differ from the built natives at " + rel in problems({"artefacts": {rel: {"sha256": "0" * 64}}})
+    extra = "vllm/_exl3_C.abi3.so"
+    assert "artefacts differ from the built natives at " + extra in problems(
+        {"artefacts": {rel: {"sha256": sha}, extra: {"sha256": "1" * 64}}})
+    assert "artefacts differ" in problems({"artefacts": {}})
+    assert "no artefacts table" in problems({"natives": "natives-1"})
+    assert "built natives without a native manifest" in problems(None)
+
+
+def test_built_tree_without_natives_keeps_any_native_manifest(w):
+    """No fork natives in the map: the named native manifest is only re-hashed."""
+    assert "artefacts" not in load(load(os.path.join(w.tree, MANIFEST))["native_manifest_path"])
+    assert metadata(w) == ""
+
+
 def _no_hex_commit(m):
     m["commit"] = "abc"
 

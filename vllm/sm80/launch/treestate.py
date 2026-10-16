@@ -26,7 +26,10 @@ The manifest rules are those of the shared provenance verifier
   (``native_manifest_path``), which is re-hashed; a path without a digest
   is invalid;
 * ``built_in_place`` names a retained build record whose file list equals
-  the map;
+  the map, and the fork natives in its map (``*.so`` entries matching
+  ``data/link_written.toml``), when there are any, are exactly the
+  artefacts of the native manifest it names, with the same hashes (the
+  rule linked natives follow, below);
 * ``vllm/_version.py``, which ``build_owned_sha256`` leaves out because its
   text names the checkout, holds version metadata only (literal
   assignments to the version names); anything else in it is invalid;
@@ -441,6 +444,7 @@ def manifest_problems(manifest: dict | None, tree: str, exempt_rx: list[re.Patte
         problems.append("adopted without its adopted block")
     if manifest.get("source") == "built_in_place":
         problems += _build_record_problems(manifest, tree)
+        problems += _built_native_problems(manifest, tree)
     if VERSION_FILE in files:
         problem = version_file_problem(os.path.join(tree, VERSION_FILE))
         if problem:
@@ -478,6 +482,17 @@ def _build_record_problems(manifest: dict, tree: str) -> list[str]:
     if data["files"] != manifest["files"]:
         return [f"build record {rec['path']}: files differ from the owned map"]
     return []
+
+
+def _built_native_problems(manifest: dict, tree: str) -> list[str]:
+    """Fork natives a build wrote into the tree are owned only through the
+    native manifest that names them: exactly its artefacts, same hashes.
+    Without such natives the native manifest is only re-hashed."""
+    written = load_patterns("link_written.toml", "link-written")
+    natives = {rel: sha for rel, sha in manifest["files"].items() if _is_native(rel, written)}
+    if not natives:
+        return []
+    return _native_set_problems(manifest, tree, natives, "built natives")
 
 
 def _literal(node: ast.AST) -> bool:
@@ -576,7 +591,8 @@ def _check_linked(st: TreeState, manifest: dict, exempt_rx: list[re.Pattern],
     written = load_patterns("link_written.toml", "link-written")
     natives = {rel: sha for rel, sha in files.items() if rel not in src_files and _is_native(rel, written)}
     if natives:
-        _check_link_natives(st, manifest, natives)
+        for problem in _native_set_problems(manifest, st.tree, natives, "link-written natives"):
+            st.add("metadata_invalid", f"{MANIFEST}: {problem}")
     elif manifest.get("native_manifest_sha256") != srcm.get("native_manifest_sha256"):
         st.add("metadata_invalid", f"{MANIFEST}: native_manifest_sha256 differs from the source tree's")
     for rel, sha in files.items():
@@ -593,23 +609,23 @@ def _check_linked(st: TreeState, manifest: dict, exempt_rx: list[re.Pattern],
             st.add("metadata_invalid", f"{rel}: in the source tree but not linked")
 
 
-def _check_link_natives(st: TreeState, manifest: dict, natives: dict[str, str]) -> None:
-    """Natives the link step installed are exactly the artefacts of the native
-    manifest the tree names (whose digest is checked with the manifest)."""
+def _native_set_problems(manifest: dict, tree: str, natives: dict[str, str], what: str) -> list[str]:
+    """``natives`` (fork natives of the owned map) are exactly the artefacts
+    of the native manifest the manifest names, with the same sha256 (its
+    digest is checked with the manifest)."""
     npath = manifest.get("native_manifest_path")
     if manifest.get("native_manifest_sha256") is None or not isinstance(npath, str):
-        st.add("metadata_invalid", f"{MANIFEST}: link-written natives without a native manifest")
-        return
-    data = _read_json(_resolve(st.tree, npath))
+        return [f"{what} without a native manifest"]
+    data = _read_json(_resolve(tree, npath))
     arts = data.get("artefacts") if data else None
     if not isinstance(arts, dict) or not all(isinstance(e, dict) for e in arts.values()):
-        st.add("metadata_invalid", f"native manifest {npath}: no artefacts table")
-        return
+        return [f"native manifest {npath}: no artefacts table"]
     recorded = {rel: e.get("sha256") for rel, e in arts.items()}
-    if recorded != natives:
-        diff = sorted(set(recorded.items()) ^ set(natives.items()))
-        st.add("metadata_invalid", f"native manifest {npath}: artefacts differ from the linked natives at "
-               + ", ".join(sorted({str(p) for p, _ in diff})[:20]))
+    if recorded == natives:
+        return []
+    differ = sorted(rel for rel in set(recorded) | set(natives)
+                    if rel not in recorded or rel not in natives or recorded[rel] != natives[rel])
+    return [f"native manifest {npath}: artefacts differ from the {what} at " + ", ".join(differ[:20])]
 
 
 def _table_target(st: ast.stmt, tables: set[str]) -> bool:
