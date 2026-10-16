@@ -665,6 +665,34 @@ def test_pseudo_field_override_removes_inherited_option(tmp_path, kind):
     assert "must be full option names" in w.refused()
 
 
+def test_kw_only_sentinel_keeps_inherited_option(tmp_path):
+    """A KW_ONLY sentinel annotation is no field: a subclass annotating an
+    inherited field's name with it neither removes nor redeclares that field
+    (dataclasses.fields keeps it), so its option stays."""
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Base:
+        trust_request_chat_templ: bool = False
+
+    @dataclasses.dataclass
+    class Sub(Base):
+        trust_request_chat_templ: dataclasses.KW_ONLY
+        response_role: str = "assistant"
+
+    assert [f.name for f in dataclasses.fields(Sub)] == ["trust_request_chat_templ", "response_role"]
+    for annotation in ("KW_ONLY", "dataclasses.KW_ONLY"):
+        source = FRONTEND_ARGS.replace("from typing import ClassVar",
+                                       "import dataclasses\nfrom dataclasses import KW_ONLY\nfrom typing import ClassVar") \
+            .replace("    trust_request_chat_template: bool = False\n",
+                     "    trust_request_chat_template: bool = False\n    trust_request_chat_templ: bool = False\n") \
+            .replace('    response_role: str = "assistant"\n',
+                     f'    trust_request_chat_templ: {annotation}\n    response_role: str = "assistant"\n')
+        from registry import read_arg_options
+        opts = read_arg_options(frontend_world(tmp_path / annotation, source).tree).options
+        assert {"trust-request-chat-templ", "trust-request-chat-template", "response-role"} <= opts
+
+
 def test_field_redeclared_below_a_pseudo_field_is_an_option(tmp_path):
     source = FRONTEND_ARGS.replace("    trust_request_chat_template: bool = False\n",
                                    "    trust_request_chat_template: ClassVar[bool] = False\n") \

@@ -196,7 +196,8 @@ def _generates(cls: ast.ClassDef) -> bool:
     return False
 
 
-_PSEUDO_FIELDS = ("ClassVar", "InitVar", "KW_ONLY")
+_PSEUDO_FIELDS = ("ClassVar", "InitVar")
+_KW_ONLY = "KW_ONLY"
 _DATACLASS_DECORATORS = ("dataclass", "config")
 
 
@@ -219,8 +220,10 @@ def _generated_options(module: ast.Module) -> set[str]:
 
     The fields follow dataclass semantics: the class's bases are walked from
     the root down and each class-level annotated name replaces an inherited
-    one, so a nearer ClassVar, InitVar or KW_ONLY declaration removes an
-    inherited field of the same name. Only shapes this reads exactly are
+    one, so a nearer ClassVar or InitVar declaration removes an inherited
+    field of the same name. A KW_ONLY sentinel annotation is no field at
+    all: it neither declares a name nor removes an inherited field of the
+    same name. Only shapes this reads exactly are
     accepted; anything else (a base defined elsewhere, several bases, a
     class in the chain that is not a dataclass, a string annotation) is a
     refusal, so the inventory is never wrong without saying so."""
@@ -269,7 +272,10 @@ def _generated_options(module: ast.Module) -> set[str]:
                     if isinstance(st.annotation, ast.Constant):
                         raise Refusal(f"argument class {c.name}: string annotation of "
                                       f"{st.target.id} cannot be read statically")
-                    fields[st.target.id] = _type_name(st.annotation) not in _PSEUDO_FIELDS
+                    kind = _type_name(st.annotation)
+                    if kind == _KW_ONLY:
+                        continue
+                    fields[st.target.id] = kind not in _PSEUDO_FIELDS
         out |= {f.replace("_", "-") for f, real in fields.items() if real}
     return out
 
