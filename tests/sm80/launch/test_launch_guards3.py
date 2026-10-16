@@ -536,6 +536,96 @@ def test_protected_full_name_declarations(aw, tmp_path):
     assert d["argv"][-2:] == ["--gpu-memory-util", "0.5"]
 
 
+# The frontend registration pattern of the engine: option names generated
+# at run time from the dataclass fields of the installed frontend class.
+FRONTEND_ARGS = '''\
+from dataclasses import dataclass
+from typing import ClassVar
+
+
+@dataclass
+class BaseFrontendArgs:
+    chat_template: str | None = None
+    trust_request_chat_template: bool = False
+    registry: ClassVar[dict] = {}
+
+    @classmethod
+    def add_cli_args(cls, parser):
+        from vllm.engine.arg_utils import get_kwargs
+        group = parser.add_argument_group(title="Frontend")
+        for key, value in get_kwargs(cls).items():
+            extra_flags = value.pop("flags", [])
+            group.add_argument(*extra_flags, f"--{key.replace('_', '-')}", **value)
+        return parser
+
+
+@dataclass
+class FrontendArgs(BaseFrontendArgs):
+    response_role: str = "assistant"
+
+
+@dataclass
+class UnusedArgs(BaseFrontendArgs):
+    never_installed: int = 0
+
+
+def make_arg_parser(parser):
+    parser.add_argument("--headless", action="store_true")
+    parser = FrontendArgs.add_cli_args(parser)
+    return parser
+'''
+
+
+@pytest.fixture
+def fw(tmp_path):
+    w = World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS,
+                                     "vllm/entrypoints/launchers/cli_args.py": FRONTEND_ARGS})
+    assert w.verify() == 0
+    return w
+
+
+def test_generated_frontend_options_read(fw):
+    from registry import read_arg_options
+    opts = read_arg_options(fw.tree)
+    assert {"chat-template", "trust-request-chat-template", "response-role", "headless", "help"} <= opts.options
+    assert "registry" not in opts.options and "never-installed" not in opts.options
+
+
+@pytest.mark.parametrize("decl, key, value, override", [
+    ('fixed = ["args.trust-request-chat-template", ', "trust-request-chat-template", "false",
+     ("--trust-request-chat-template",)),
+    ('controlled_args = ["chat-template", ', "chat-template", '"t.jinja"',
+     ("--chat-template", "other.jinja")),
+])
+def test_generated_names_protected(fw, tmp_path, decl, key, value, override):
+    """A protected argument whose option the engine generates from a dataclass
+    field: the baseline resolves and is VALIDATED, overrides through every
+    channel are refused, --experiment unlocks them."""
+    text = model_text(fw)
+    anchor = 'fixed = [' if decl.startswith("fixed") else 'controlled_args = ['
+    text = text.replace(anchor, decl, 1).replace("trust-remote-code = true\n",
+                                                 f"trust-remote-code = true\n{key} = {value}\n")
+    write(os.path.join(fw.settings, "model.toml"), text)
+    promote(fw, ["tp2"])
+    d = fw.resolve()
+    assert d["validated"]["state"] == "VALIDATED" and f"args.{key}" in d["resolved"]
+    assert "fixed by the settings" in fw.refused("--", *override)
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=" + " ".join(override) + "\n")
+    fw.refused("--env-file", env)
+    fw.refused("--set", f"args.{key}=" + ("true" if key.startswith("trust") else '"other.jinja"'))
+    ov = write(str(tmp_path / "ov.toml"), f'schema = "launch-overlay/1"\n[args]\n{key} = "x"\n')
+    fw.refused("--overlay", ov)
+    d = fw.resolve("--experiment", "e", "--", *override)
+    assert d["argv"][-len(override):] == list(override) and d["validated"]["state"] != "VALIDATED"
+
+
+@pytest.mark.parametrize("name", ["never-installed", "registry", "chat-templ"])
+def test_generated_inventory_still_fails_closed(fw, name):
+    text = model_text(fw).replace('controlled_args = [', f'controlled_args = ["{name}", ', 1)
+    write(os.path.join(fw.settings, "model.toml"), text)
+    assert "must be full option names" in fw.refused()
+
+
 def test_unprotected_spellings_allowed_with_aliases(alias_w):
     d = alias_w.resolve("--", "--enable-log-requests")
     assert d["argv"][-1] == "--enable-log-requests"

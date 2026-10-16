@@ -8,9 +8,13 @@ tree, ``<tree>/vllm/sm80/envs.py``. Never imports ``vllm`` (its package
 import pulls in torch) and never uses the launcher's own commit's tables:
 the names, retired-name texts and code defaults always come from the tree
 that will run. The long option spellings come the same way from the files
-that declare the server's arguments (``ARG_SOURCES``): every literal
-``--name`` passed to ``add_argument``, and the aliases of a call that names
-several.
+that declare the server's arguments (``ARG_SOURCES``), by the two ways the
+engine registers them: every literal ``--name`` passed to ``add_argument``
+(with the aliases of a call that names several), and the options a
+frontend class generates from its dataclass fields (see
+``_generated_options``). The negative ``--no-X`` forms of boolean options
+are not listed; a ``no-`` spelling the tree does not declare is read as
+the flag it negates.
 """
 
 from __future__ import annotations
@@ -160,12 +164,14 @@ class ArgOptions:
 
 
 def read_arg_options(tree: str) -> ArgOptions:
-    out = ArgOptions()
+    out = ArgOptions(options={"help"})          # argparse's own
     for rel in ARG_SOURCES:
         path = os.path.join(tree, rel)
         if not os.path.isfile(path):
             continue
-        for node in ast.walk(_parse(path)):
+        module = _parse(path)
+        out.options |= _generated_options(module)
+        for node in ast.walk(module):
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "add_argument"):
                 continue
@@ -175,6 +181,65 @@ def read_arg_options(tree: str) -> ArgOptions:
             out.options |= set(names)
             for alias in names[1:]:
                 out.aliases[alias] = names[0]
+    return out
+
+
+def _generates(cls: ast.ClassDef) -> bool:
+    """The class's own add_cli_args registers an option whose name is built
+    at run time (``f"--{key.replace('_', '-')}"`` over ``get_kwargs(cls)``)."""
+    for fn in cls.body:
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == "add_cli_args":
+            return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == "add_argument"
+                       and any(isinstance(a, ast.JoinedStr) for a in n.args)
+                       for n in ast.walk(fn))
+    return False
+
+
+def _class_var(annotation: ast.AST) -> bool:
+    node = annotation.value if isinstance(annotation, ast.Subscript) else annotation
+    name = node.attr if isinstance(node, ast.Attribute) else getattr(node, "id", "")
+    return name in ("ClassVar", "InitVar")
+
+
+def _generated_options(module: ast.Module) -> set[str]:
+    """Options of the frontend classes the module installs on a parser
+    (``Cls.add_cli_args(parser)``) whose add_cli_args, own or inherited
+    from a base class of the same module, generates option names: one
+    ``--field-name`` per dataclass field of the class and its same-module
+    bases (class-level annotated names, ClassVar and InitVar excluded), as
+    ``dataclasses.fields`` and ``key.replace('_', '-')`` give them."""
+    classes = {c.name: c for c in module.body if isinstance(c, ast.ClassDef)}
+
+    def chain(name: str) -> list[ast.ClassDef]:
+        out, todo = [], [name]
+        while todo:
+            c = classes.get(todo.pop(0))
+            if c is not None and c not in out:
+                out.append(c)
+                todo += [b.id for b in c.bases if isinstance(b, ast.Name)]
+        return out
+
+    def generating(name: str) -> bool:
+        for c in chain(name):               # nearest add_cli_args decides
+            if any(isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == "add_cli_args"
+                   for fn in c.body):
+                return _generates(c)
+        return False
+
+    installed = {n.func.value.id for n in ast.walk(module)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "add_cli_args" and isinstance(n.func.value, ast.Name)
+                 and n.func.value.id in classes}
+    out: set[str] = set()
+    for name in installed:
+        if not generating(name):
+            continue
+        for c in chain(name):
+            for st in c.body:
+                if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) \
+                        and not _class_var(st.annotation):
+                    out.add(st.target.id.replace("_", "-"))
     return out
 
 
