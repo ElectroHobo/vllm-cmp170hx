@@ -301,14 +301,18 @@ def test_environment_module_build_entries(tmp_path, entry, cross):
         assert et["dirty_paths"]["cross_commit_artifacts"] == ["vllm/envs.py"]
 
 
-def test_built_tree_cross_commit_input(tmp_path):
-    w = World(tmp_path)
-    man = load(os.path.join(w.tree, MANIFEST))
-    write(os.path.join(w.tree, "csrc", "kernel.cu"), "// changed\n")
-    git(w.tree, "commit", "-q", "-am", "kernel")
+@pytest.mark.parametrize("rel", ["csrc/kernel.cu", "requirements/build/cuda.txt", "requirements/build.txt"])
+def test_built_tree_cross_commit_input(tmp_path, rel):
+    w = World(tmp_path, build=False, extra_files={rel: "v1\n"})
+    git(w.tree, "add", "-f", rel)           # the fixture ignores build/ directories
+    git(w.tree, "commit", "-q", "--allow-empty", "-m", "tracked input")
+    man = add_build(w.tree)
+    write(os.path.join(w.tree, rel), "v2\n")
+    git(w.tree, "commit", "-q", "-am", "input")
     write_stamp(w.tree, man)
     et = w.resolve()["engine_target"]
     assert et["cross_commit_artifacts"] and not et["dirty"]
+    assert et["dirty_paths"]["cross_commit_artifacts"] == [rel]
 
 
 # -- secret knobs set environment names only -------------------------------------------------------

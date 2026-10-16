@@ -10,6 +10,7 @@ patterns = [
   "pyproject.toml",
   "rust/**",
   "requirements/build*.txt",
+  "requirements/build/**",
   "vllm/vllm_flash_attn/**",
   "tools/build_rust.py",
 ]
