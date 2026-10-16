@@ -21,7 +21,6 @@ import glob
 import json
 import os
 import shlex
-import signal
 import subprocess
 import sys
 
@@ -30,11 +29,12 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import checkpoint  # noqa: E402
+from checkpoint import StopFlag  # noqa: E402
 from canon import HashCache, atomic_write, canonical_sha256, sha256_file  # noqa: E402
 from envclass import ClassTable  # noqa: E402
 from errors import EXIT_CHECKPOINT_ABSENT, EXIT_CHECKPOINT_INCOMPLETE, EXIT_CHECKPOINT_MISMATCH, Refusal  # noqa: E402
 from model import load_model_settings  # noqa: E402
-from registry import has_sm80_plugin, read_registry  # noqa: E402
+from registry import has_sm80_plugin, read_arg_options, read_registry  # noqa: E402
 from resolver import Inputs, resolve, substitute  # noqa: E402
 from settings_dir import SettingsDir, load_toml, parse_env_lines, tree_sha256  # noqa: E402
 from treestate import tree_state  # noqa: E402
@@ -253,7 +253,7 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
         overlays=overlays, community=community, env_file=env_file, ambient=dict(environ),
         sets=list(ns.sets), extra_args=list(ns.extra_args), policy=policy,
         experiment=ns.experiment, capability=ns.capability, tree=tree, venv=venv,
-        home=home, checkpoint_paths=cp_paths)
+        home=home, checkpoint_paths=cp_paths, arg_options=read_arg_options(tree))
     res = resolve(ms, files, registry, classes, harness_args, inp)
 
     # a community layer is NOT VALIDATED unless it changes nothing functional
@@ -401,23 +401,12 @@ def print_text(doc: dict, explain: bool) -> None:
     print("\n".join(out))
 
 
-def stop_flag() -> list:
-    """A flag set by SIGTERM/SIGINT; the pre-exec path checks it and never
-    turns a requested stop into a start."""
-    stop = [False]
-
-    def handler(_sig, _frm):
-        stop[0] = True
-    signal.signal(signal.SIGTERM, handler)
-    signal.signal(signal.SIGINT, handler)
-    return stop
-
-
 def preflight_checkpoints(doc: dict, policy: str, stop: list | None = None) -> None:
     """Before exec: refuse incomplete checkpoints, apply the boot policy, and
-    restate VALIDATED from the checkpoints as they are now."""
+    restate VALIDATED from the checkpoints as they are now. ``stop`` is the
+    command's StopFlag; a requested stop is never turned into a start."""
     mode = doc["_checkpoint_verify"]
-    stop = stop if stop is not None else stop_flag()
+    stop = stop if stop is not None else [False]
     for name, (mpath, directory) in doc["_cp_specs"].items():
         if stop[0]:
             break
@@ -452,14 +441,16 @@ def preflight_checkpoints(doc: dict, policy: str, stop: list | None = None) -> N
         doc["validated"] = evaluate(doc["_gen"], doc["_ev"], role=doc["_role"])
 
 
-def verify_checkpoints(ns, environ) -> int:
-    """--verify-checkpoints: stamp exactly the directories a launch would serve."""
+def verify_checkpoints(ns, environ, stop: list) -> int:
+    """--verify-checkpoints: stamp exactly the directories a launch would serve.
+    ``stop`` is the command's StopFlag, installed before anything is read."""
     _defaults, rt, home, sd, ms, stamp_dir = _context(ns, environ)
     paths = checkpoint_paths(ns, ms, rt, sd.pins(), home)
-    stop = stop_flag()
     worst = 0
     report = {}
     for name, spec in ms.checkpoints.items():
+        if stop[0]:
+            raise Refusal("stopped (SIGTERM/SIGINT); no stamp written")
         manifest, msha = checkpoint.load_manifest(sd.path(spec["manifest"]))
         directory = paths[name]
         if not os.path.isdir(directory):
@@ -480,6 +471,8 @@ def verify_checkpoints(ns, environ) -> int:
         if bad:
             report[name]["files"] = bad
             worst = max(worst, EXIT_CHECKPOINT_MISMATCH)
+    if stop[0]:
+        raise Refusal("stopped (SIGTERM/SIGINT)")
     print(json.dumps(report, indent=1, sort_keys=True))
     return worst
 
@@ -497,10 +490,21 @@ def main(argv: list[str] | None = None, environ: dict[str, str] | None = None) -
     environ = dict(os.environ) if environ is None else environ
     ns = parse_args(argv)
     as_json = ns.print_config and ns.json
-    stop = None if ns.print_config else stop_flag()
+    # one stop flag for the whole command: installed before anything is read,
+    # released only after the last check before exec
+    stop = None if ns.print_config else StopFlag()
+    try:
+        return _main(ns, environ, as_json, stop)
+    finally:
+        if stop is not None:
+            stop.release()
+
+
+def _main(ns: argparse.Namespace, environ: dict[str, str], as_json: bool,
+          stop: StopFlag | None) -> int:
     try:
         if ns.verify_checkpoints:
-            return verify_checkpoints(ns, environ)
+            return verify_checkpoints(ns, environ, stop)
         doc = build(ns, environ)
     except Refusal as exc:
         return _refuse(exc, as_json)
@@ -520,6 +524,12 @@ def main(argv: list[str] | None = None, environ: dict[str, str] | None = None) -
                           f"(env: {', '.join(doc['expected']['env_differs']) or 'none'}; "
                           f"argv equal: {doc['expected']['argv_equal']})")
         preflight_checkpoints(doc, doc["policy"], stop)
+        # from here SIGTERM/SIGINT act as they would without the launcher (a
+        # blocked banner write cannot swallow them); a stop that arrived
+        # before is refused here
+        stop.release()
+        if stop[0]:
+            raise Refusal("stopped before start (SIGTERM/SIGINT)")
     except Refusal as exc:
         return _refuse(exc, False)
     print(banner(doc), file=sys.stderr, flush=True)

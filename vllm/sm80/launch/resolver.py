@@ -18,12 +18,15 @@ the parallel-size arguments are derived from it); ``args.model`` is always
 a checkpoint reference, and the reference (not its directory) is part of
 the functional argv; [fixed] keys and controlled arguments change only
 under --experiment, whatever the channel (overlay, .env, ambient, --set,
-extra arguments, unset); only the launcher's own instrumentation list and
-the host/port location are excluded from the functional hash, and their
-values must be plain scalars; no argument value may carry an option token;
-every child environment name is classified by the closed class table
-whichever table supplied it; secret targets are fixed by the model's
-declarations before any input is read.
+extra arguments, unset) and whatever the spelling: arguments are compared
+by the engine argument they set (an alias, the --no-X form, a dotted
+option or an abbreviation of a protected one sets that one); only the
+launcher's own instrumentation list and the host/port location are
+excluded from the functional hash, and their values must be plain scalars;
+no argument value may carry an option token; every child environment name
+is classified by the closed class table whichever table supplied it;
+secret targets are fixed by the model's declarations before any input is
+read.
 """
 
 from __future__ import annotations
@@ -41,13 +44,16 @@ from canon import canonical_sha256
 from envclass import ClassTable, always_refused
 from errors import Refusal
 from model import ModelSettings
-from registry import Registry
+from registry import ArgOptions, Registry
 from settings_dir import check_arg_spellings, normalize_arg_name, normalize_key
 
 LOCKED_LAYERS = ("overlay", "user", "ambient", "cli")   # [fixed] needs --experiment
 RUNTIMES = ("native", "container")
 GEOMETRY_ARGS = ("args.tensor-parallel-size", "args.pipeline-parallel-size")
 GEOMETRY_ARGS_NAMES = tuple(k[5:] for k in GEOMETRY_ARGS)
+# what only the launcher sets: geometry (tp/pp), the served checkpoint and
+# no argument file (--config would load arguments past every check)
+LAUNCHER_ARGS = frozenset(GEOMETRY_ARGS_NAMES + ("model", "config"))
 LOCATION_ARGS = ("host", "port")
 _SUBST = re.compile(r"\$\{([^}]*)\}")
 _CHECKPOINT_REF = re.compile(r"^\$\{checkpoint\.([A-Za-z0-9_-]+)\.path\}$")
@@ -262,6 +268,7 @@ class Inputs:
     venv: str
     home: str
     checkpoint_paths: dict[str, str]
+    arg_options: ArgOptions = field(default_factory=ArgOptions)
 
 
 @dataclass
@@ -297,13 +304,13 @@ def declared_secrets(ms: ModelSettings) -> set[str]:
 
 
 def check_knob_names(ms: ModelSettings, classes: ClassTable, secrets: set[str]) -> None:
-    """Knob names are the user-facing namespace: they may not shadow a name
-    the class table treats as functional, secret or code-loading, and a
-    secret knob may only target a secret or an otherwise unclassified name."""
+    """Knob names are the user-facing namespace: they may not shadow any name
+    the class table classifies (a runtime sets inert names such as TERM
+    itself), CUDA_VISIBLE_DEVICES excepted; a secret knob may only target a
+    secret or an otherwise unclassified name."""
     for knob in ms.user:
         cls = classes.classify(knob)
-        if cls in ("functional", "secret", "code-loading", "ownership", "container-runtime") or \
-                (cls == "location" and knob != "CUDA_VISIBLE_DEVICES"):
+        if cls != "unclassified" and knob != "CUDA_VISIBLE_DEVICES":
             raise Refusal(f"model.toml: user knob {knob} is a {cls} environment name; "
                           "name knobs apart from engine and runtime variables")
     for name in secrets:
@@ -429,7 +436,7 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
             raise Refusal(f"--set {key}: expected env.NAME, args.NAME, cards, tp, pp or a [user] knob")
     _cards_against_lock(final, amb, inp)
     if extra_args:
-        _check_extra(ms, extra_args, inp.experiment)
+        _check_extra(ms, extra_args, inp.experiment, inp.arg_options)
         final.put("extra_args", list(extra_args), "user", "EXTRA_ARGS")
     _check_protected(final, ms, inp, settled)
 
@@ -653,46 +660,90 @@ def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[
             raise Refusal(f"model.toml: user.{knob} target {target!r} is not args.*, env.*, card_ids or extra_args")
 
 
-def _check_extra(ms: ModelSettings, extra: list[str], experiment: str | None) -> None:
-    """Raw extra arguments: long options only; never geometry or the model;
-    fixed and controlled arguments only under --experiment."""
-    fixed_args = {k[5:] for k in ms.fixed if k.startswith("args.")}
+def arg_destination(name: str, opts: ArgOptions) -> str:
+    """The engine argument a spelling sets: a dotted option (a.b) sets its
+    parent a, an alias its first name, --no-X the flag X."""
+    head = normalize_arg_name(name).split(".", 1)[0]
+    head = opts.aliases.get(head, head)
+    if head.startswith("no-") and head not in opts.options:
+        head = opts.aliases.get(head[3:], head[3:])
+    return head
+
+
+def reaches(name: str, guarded: set[str] | frozenset[str], opts: ArgOptions) -> str | None:
+    """The guarded argument a spelling sets, if any: by its destination, or
+    as an abbreviation argparse expands to a guarded option (or its alias or
+    --no- form). A spelling the tree declares exactly is never an
+    abbreviation."""
+    dest = arg_destination(name, opts)
+    if dest in guarded:
+        return dest
+    spelled = normalize_arg_name(name).split(".", 1)[0]
+    if not spelled or spelled in opts.options:
+        return None
+    for g in sorted(guarded):
+        forms = {g} | {a for a, c in opts.aliases.items() if c == g}
+        if any(f.startswith(spelled) or f"no-{f}".startswith(spelled) for f in forms):
+            return g
+    return None
+
+
+def _protected_args(ms: ModelSettings) -> set[str]:
+    return {k[5:].split(".", 1)[0] for k in ms.fixed if k.startswith("args.")} | set(ms.controlled_args)
+
+
+def _check_extra(ms: ModelSettings, extra: list[str], experiment: str | None,
+                 opts: ArgOptions) -> None:
+    """Raw extra arguments: long options only; never what the launcher sets
+    (geometry, the model, an argument file); fixed and controlled arguments
+    only under --experiment, by the argument each spelling sets."""
+    protected = _protected_args(ms)
     for tok in extra:
         if _SHORT_OPTION.match(tok):
             raise Refusal(f"extra argument {tok}: short options are not accepted; use the long form")
         if not tok.startswith("--"):
             continue
-        name = normalize_arg_name(tok[2:].split("=", 1)[0])
-        if name in GEOMETRY_ARGS_NAMES or name == "model":
-            raise Refusal(f"extra argument --{name} is set by the launcher; use tp/pp or "
-                          "--checkpoint-path")
-        if (name in ms.controlled_args or name in fixed_args) and not experiment:
-            raise Refusal(f"extra argument --{name} is fixed by the settings; "
+        name = tok[2:].split("=", 1)[0]
+        hit = reaches(name, LAUNCHER_ARGS, opts)
+        if hit:
+            raise Refusal(f"extra argument --{name} sets --{hit}, which is set by the launcher; use "
+                          "tp/pp, --checkpoint-path and the settings")
+        hit = reaches(name, protected, opts)
+        if hit and not experiment:
+            raise Refusal(f"extra argument --{name} sets --{hit}, which is fixed by the settings; "
                           "change it with --set under --experiment")
 
 
-def _protected(key: str, ms: ModelSettings) -> bool:
+def _protected(key: str, ms: ModelSettings, opts: ArgOptions) -> bool:
     if key in ms.fixed:
         return True
-    return key.startswith("args.") and key[5:] in ms.controlled_args
+    return key.startswith("args.") and reaches(key[5:], _protected_args(ms), opts) is not None
 
 
 def _check_protected(final: Final, ms: ModelSettings, inp: Inputs, settled: dict[str, Any]) -> None:
     """[fixed] keys and controlled arguments change only under --experiment,
-    through any channel: a new value, a new key or an unset."""
+    through any channel: a new value, a new key or an unset, under any
+    spelling of the argument."""
     if final.get("args.model") != settled.get("args.model"):
         raise Refusal("args.model changes only through --checkpoint-path")
+    opts = inp.arg_options
+    for key in final.entries:
+        if key.startswith("args.") and key != "args.model":
+            hit = reaches(key[5:], LAUNCHER_ARGS, opts)
+            if hit:
+                raise Refusal(f"{key} sets --{hit}, which is set by the launcher; use tp/pp, "
+                              "--checkpoint-path and the settings")
     if inp.experiment:
         return
     for key, e in final.entries.items():
-        if e.layer in LOCKED_LAYERS and _protected(key, ms):
+        if e.layer in LOCKED_LAYERS and _protected(key, ms, opts):
             if key == "card_ids" and e.layer == "ambient":
                 continue  # the lock's cards, checked against the settings above
             if key not in settled or settled[key] != e.value:
                 raise Refusal(f"{key} is fixed for this model ({e.source}); "
                               "it changes only under --experiment")
     for key, layer in final.unset.items():
-        if layer in LOCKED_LAYERS and _protected(key, ms) and key in settled:
+        if layer in LOCKED_LAYERS and _protected(key, ms, opts) and key in settled:
             raise Refusal(f"{key} is fixed for this model; unsetting it needs --experiment")
 
 

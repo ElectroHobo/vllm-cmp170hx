@@ -1,7 +1,7 @@
-schema = "build-inputs/1"
-
+schema = "build-inputs/2"
 # Paths whose change makes artefacts built at another commit stale: the
-# wheel-equality set plus the native builder's own inputs.
+# wheel-equality set, the native builder's own inputs and the build driver
+# modules the wheel build loads (setup.py: tools/build_rust.py).
 patterns = [
   "csrc/**",
   "cmake/**",
@@ -11,4 +11,29 @@ patterns = [
   "rust/**",
   "requirements/build*.txt",
   "vllm/vllm_flash_attn/**",
+  "tools/build_rust.py",
+]
+
+# The environment modules the wheel build loads (setup.py) define mostly
+# runtime variables and a few build ones. A change to one of these files
+# makes artefacts stale only when the entries of the build variables
+# differ: for each file, the (name, source text of the value) pairs of every
+# dict entry whose key is one of these names, compared as sorted lists
+# between the two commits (a missing file has none; an unparseable file
+# counts as changed).
+[env_entries]
+paths = ["vllm/envs.py", "vllm/sm80/envs.py"]
+names = [
+  "CMAKE_BUILD_TYPE",
+  "MAX_JOBS",
+  "NVCC_THREADS",
+  "VERBOSE",
+  "VLLM_AMPERE_MARLIN_BUILD",
+  "VLLM_DOCKER_BUILD_CONTEXT",
+  "VLLM_MAIN_CUDA_VERSION",
+  "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX",
+  "VLLM_SKIP_VERSION_SUFFIX",
+  "VLLM_TARGET_DEVICE",
+  "VLLM_USE_PRECOMPILED",
+  "VLLM_USE_PRECOMPILED_RUST",
 ]

@@ -39,6 +39,7 @@ from errors import Refusal
 from settings_dir import SettingsDir, normalize_key
 
 _KNOB = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_ENV_TARGET = re.compile(r"^env\.[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass
@@ -75,6 +76,17 @@ def _check_knob(knob: str, spec) -> None:
         raise Refusal(f"{where}: variant is a name or a value-to-variant table")
     if spec.get("type", "str") not in ("str", "int", "bool"):
         raise Refusal(f"{where}: type is str, int or bool")
+    secret = spec.get("secret", False)
+    if not isinstance(secret, bool):
+        raise Refusal(f"{where}: secret is true or false")
+    if secret:
+        # a secret value is masked and kept out of the identity only as an
+        # environment value; anywhere else it would be printed and hashed
+        targets = [target] if isinstance(target, str) else list(target or [])
+        bad = [t for t in targets if not _ENV_TARGET.match(t)]
+        if variant is not None or not targets or bad:
+            raise Refusal(f"{where}: a secret knob may only target environment names (env.NAME)"
+                          + (f"; not {', '.join(bad)}" if bad else ""))
 
 
 def _inside(path: str) -> bool:

@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The environment-variable registry of the engine tree being launched.
+"""The environment-variable registry and the argument spellings of the
+engine tree being launched.
 
 Read statically (by AST) from ``<tree>/vllm/envs.py`` and, for an sm80
 tree, ``<tree>/vllm/sm80/envs.py``. Never imports ``vllm`` (its package
 import pulls in torch) and never uses the launcher's own commit's tables:
 the names, retired-name texts and code defaults always come from the tree
-that will run.
+that will run. The long option spellings come the same way from the files
+that declare the server's arguments (``ARG_SOURCES``): every literal
+``--name`` passed to ``add_argument``, and the aliases of a call that names
+several.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from canon import sha256_file
 from errors import Refusal
 
 CAPABILITIES = ("sm80", "plain-upstream")
+ARG_SOURCES = ("vllm/engine/arg_utils.py", "vllm/entrypoints/launchers/cli_args.py")
 
 
 @dataclass
@@ -144,6 +149,33 @@ def read_registry(tree: str, capability: str) -> Registry:
         retired=retired, defaults=defaults, envs_sha256=sha256_file(envs),
         sm80_envs_sha256=sm80_sha,
     )
+
+
+@dataclass
+class ArgOptions:
+    """Long option names (without ``--``) and alias → first name (argparse
+    takes an argument's destination from its first long name)."""
+    options: set[str] = field(default_factory=set)
+    aliases: dict[str, str] = field(default_factory=dict)
+
+
+def read_arg_options(tree: str) -> ArgOptions:
+    out = ArgOptions()
+    for rel in ARG_SOURCES:
+        path = os.path.join(tree, rel)
+        if not os.path.isfile(path):
+            continue
+        for node in ast.walk(_parse(path)):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_argument"):
+                continue
+            names = [a.value[2:] for a in node.args
+                     if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                     and a.value.startswith("--")]
+            out.options |= set(names)
+            for alias in names[1:]:
+                out.aliases[alias] = names[0]
+    return out
 
 
 def has_sm80_plugin(tree: str) -> bool:

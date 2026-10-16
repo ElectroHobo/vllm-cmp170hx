@@ -234,6 +234,30 @@ def status(manifest: dict, manifest_sha: str, directory: str, stamp_dir: str) ->
 
 # -- command line --------------------------------------------------------------
 
+class StopFlag(list):
+    """``[requested]``, set by SIGTERM/SIGINT while installed. One flag lives
+    for a whole command, so a stop is never forgotten; ``release`` gives
+    both signals back the dispositions they had before, after which a
+    signal acts as it would without the flag."""
+
+    SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+    def __init__(self) -> None:
+        super().__init__([False])
+        self._old = {}
+        for sig in self.SIGNALS:
+            old = signal.signal(sig, self._set)
+            self._old[sig] = signal.SIG_DFL if old is None else old
+
+    def _set(self, _sig, _frm) -> None:
+        self[0] = True
+
+    def release(self) -> None:
+        old, self._old = self._old, {}
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
 def _settings(path: str):
     from model import load_model_settings
     from settings_dir import SettingsDir
@@ -242,6 +266,14 @@ def _settings(path: str):
 
 
 def _cli_verify(args) -> int:
+    stop = StopFlag()
+    try:
+        return _cli_verify_all(args, stop)
+    finally:
+        stop.release()
+
+
+def _cli_verify_all(args, stop: StopFlag) -> int:
     sd, ms = _settings(args.settings)
     names = [args.checkpoint] if args.checkpoint else sorted(ms.checkpoints)
     if args.path and len(names) != 1:
@@ -249,12 +281,6 @@ def _cli_verify(args) -> int:
     home = os.path.expanduser("~")
     stamp_dir = args.stamp_dir or os.path.join(home, ".cache", "sm80-launch")
     models_dir = args.models_dir or os.path.join(home, "models")
-    stop = [False]
-
-    def _stop(_sig, _frm):
-        stop[0] = True
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
     worst = 0
     report = {}
     for name in names:

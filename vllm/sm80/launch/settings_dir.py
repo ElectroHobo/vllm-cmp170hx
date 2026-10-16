@@ -43,7 +43,7 @@ SUPPORTED_SCHEMAS = {
     "validation-receipt": {1},
     "launch-resolved": {2},
     "tree-exempt": {1},
-    "build-inputs": {1},
+    "build-inputs": {2},
     "link-written": {1},
 }
 

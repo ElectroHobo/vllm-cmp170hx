@@ -13,7 +13,8 @@ import threading
 import pytest
 
 from canon import canonical_sha256
-from helpers import BUILD, World, add_build, git, head, promote, publish, read_record, write
+from helpers import (BUILD, VERSION_TEXT, World, add_build, git, head, promote, publish, read_record,
+                     write, write_stamp)
 from treestate import MANIFEST, STAMP, build_owned_sha256
 
 
@@ -168,7 +169,8 @@ def linked_world(tmp_path, *, change_build_input: bool):
     git(w.tree, "add", rel)
     git(w.tree, "commit", "-q", "-m", "next")
     os.symlink(os.path.join(src, "vllm/_C.abi3.so"), os.path.join(w.tree, "vllm/_C.abi3.so"))
-    write(os.path.join(w.tree, "vllm/_version.py"), "v = 2\n")
+    write(os.path.join(w.tree, "vllm/_version.py"),
+          VERSION_TEXT.replace("g0123456", "g" + head(w.tree)[:9]))
     from canon import sha256_file
     owned = {"vllm/_C.abi3.so": src_man["files"]["vllm/_C.abi3.so"],
              "vllm/_version.py": sha256_file(os.path.join(w.tree, "vllm/_version.py"))}
@@ -178,6 +180,7 @@ def linked_world(tmp_path, *, change_build_input: bool):
            "build_owned_sha256": build_owned_sha256(owned),
            "linked_from": {"tree": src, "commit": a, "build_owned_sha256": src_man["build_owned_sha256"]}}
     write(os.path.join(w.tree, MANIFEST), json.dumps(man))
+    write_stamp(w.tree, man)
     pins = open(os.path.join(w.settings, "pins.env")).read()
     write(os.path.join(w.settings, "pins.env"), pins.replace(pins.split("ENGINE_COMMIT=")[1].split("\n")[0], head(w.tree)))
     assert w.verify() == 0

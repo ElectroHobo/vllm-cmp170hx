@@ -14,7 +14,8 @@ import signal
 
 import pytest
 
-from helpers import CHECKPOINT_FILES, World, add_build, git, head, make_checkpoint, promote, write
+from helpers import (CHECKPOINT_FILES, World, add_build, git, head, make_checkpoint, promote, write,
+                     write_stamp)
 from treestate import MANIFEST, STAMP, build_owned_sha256
 
 
@@ -121,6 +122,7 @@ def linked(tmp_path):
            "build_owned_sha256": build_owned_sha256(owned),
            "linked_from": {"tree": src, "commit": head(src), "build_owned_sha256": src_man["build_owned_sha256"]}}
     write(os.path.join(w.tree, MANIFEST), json.dumps(man))
+    write_stamp(w.tree, man)
     assert w.verify() == 0
     return w, src, man, src_man
 
@@ -149,14 +151,14 @@ def test_linked_source_map_hash_wrong(tmp_path):
     w, src, _, src_man = linked(tmp_path)
     src_man["build_owned_sha256"] = "0" * 64
     write(os.path.join(src, MANIFEST), json.dumps(src_man))
-    assert "map hash is wrong" in metadata(w)
+    assert "build_owned_sha256 does not match its map" in metadata(w)
 
 
 def test_linked_commit_disagrees(tmp_path):
     w, _, man, _ = linked(tmp_path)
     man["linked_from"]["commit"] = "1" * 40
     write(os.path.join(w.tree, MANIFEST), json.dumps(man))
-    assert "commit differs" in metadata(w)
+    assert "source manifest changed since the link" in metadata(w)
 
 
 def test_linked_missing_source_entry(tmp_path):
@@ -236,11 +238,12 @@ def test_knob_names_apart_from_variables(w, knob):
 @pytest.mark.parametrize("mode", ["stamp", "boot"])
 def test_stop_before_exec(w, mode):
     import main
+    from checkpoint import StopFlag
     from errors import Refusal
     doc = main.build(main.parse_args(w.base_args("--checkpoint-verify", mode)), w.env())
     old = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
     try:
-        flag = main.stop_flag()
+        flag = StopFlag()
         os.kill(os.getpid(), signal.SIGTERM)
         with pytest.raises(Refusal, match="stopped before start"):
             main.preflight_checkpoints(doc, "strict", flag)
