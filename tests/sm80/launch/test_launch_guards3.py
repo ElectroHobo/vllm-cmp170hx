@@ -334,10 +334,36 @@ def test_built_natives_match_native_manifest(tmp_path, image):
     assert "built natives without a native manifest" in problems(None)
 
 
-def test_built_tree_without_natives_keeps_any_native_manifest(w):
-    """No fork natives in the map: the named native manifest is only re-hashed."""
-    assert "artefacts" not in load(load(os.path.join(w.tree, MANIFEST))["native_manifest_path"])
-    assert metadata(w) == ""
+@pytest.mark.parametrize("image", [False, True], ids=["native", "image"])
+def test_built_tree_without_natives_names_no_artefact(tmp_path, image):
+    """No fork natives in a built_in_place map: a native manifest it names
+    lists no artefact (an empty set is clean, naming none is clean)."""
+    from test_launch_guards import image_tree
+    from treestate import tree_state
+    w = World(tmp_path / "w")
+    man = load(os.path.join(w.tree, MANIFEST))
+    nm = man["native_manifest_path"]
+    runs = iter(range(10))
+
+    def problems(content):
+        if content is None:
+            man["native_manifest_sha256"] = None
+            man.pop("native_manifest_path", None)
+        else:
+            write(nm, json.dumps(content))
+            man["native_manifest_sha256"], man["native_manifest_path"] = sha256_file(nm), nm
+        rewrite_manifest(w.tree, man, stamp=True)
+        tree = image_tree(w, tmp_path / f"image{next(runs)}") if image else w.tree
+        st = tree_state(tree, image=image)
+        assert set(st.dirty_paths) <= {"metadata_invalid"}, st.dirty_paths
+        return " | ".join(st.dirty_paths.get("metadata_invalid", []))
+
+    assert problems({"artefacts": {}}) == ""
+    extra = "vllm/_exl3_C.abi3.so"
+    assert "artefacts differ from the built natives at " + extra in problems(
+        {"artefacts": {extra: {"sha256": "1" * 64}}})
+    assert "no artefacts table" in problems({"natives": "natives-1"})
+    assert problems(None) == ""
 
 
 def _no_hex_commit(m):

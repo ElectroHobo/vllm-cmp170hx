@@ -26,10 +26,11 @@ The manifest rules are those of the shared provenance verifier
   (``native_manifest_path``), which is re-hashed; a path without a digest
   is invalid;
 * ``built_in_place`` names a retained build record whose file list equals
-  the map, and the fork natives in its map (``*.so`` entries matching
-  ``data/link_written.toml``), when there are any, are exactly the
-  artefacts of the native manifest it names, with the same hashes (the
-  rule linked natives follow, below);
+  the map; the fork natives in its map (``*.so`` entries matching
+  ``data/link_written.toml``) need a native manifest, and a native
+  manifest it names lists exactly those natives as its artefacts, with
+  the same hashes, none when the map holds none (the rule linked natives
+  follow, below);
 * ``vllm/_version.py``, which ``build_owned_sha256`` leaves out because its
   text names the checkout, holds version metadata only (literal
   assignments to the version names); anything else in it is invalid;
@@ -486,11 +487,13 @@ def _build_record_problems(manifest: dict, tree: str) -> list[str]:
 
 def _built_native_problems(manifest: dict, tree: str) -> list[str]:
     """Fork natives a build wrote into the tree are owned only through the
-    native manifest that names them: exactly its artefacts, same hashes.
-    Without such natives the native manifest is only re-hashed."""
+    native manifest that names them: exactly its artefacts, same hashes. A
+    native manifest named without such natives must list no artefact."""
     written = load_patterns("link_written.toml", "link-written")
     natives = {rel: sha for rel, sha in manifest["files"].items() if _is_native(rel, written)}
-    if not natives:
+    named = manifest.get("native_manifest_sha256") is not None \
+        and isinstance(manifest.get("native_manifest_path"), str)
+    if not natives and not named:
         return []
     return _native_set_problems(manifest, tree, natives, "built natives")
 

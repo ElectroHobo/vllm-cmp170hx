@@ -112,7 +112,8 @@ def add_build(tree: str, files: dict[str, str] | None = None, *, source: str = "
         write(os.path.join(tree, rel), text)
     owned = {rel: sha256_file(os.path.join(tree, rel)) for rel in files}
     side = os.path.join(os.path.dirname(tree), "build-" + os.path.basename(tree))
-    native = write(os.path.join(side, "native-manifest.json"), json.dumps({"natives": natives}))
+    native = write(os.path.join(side, "native-manifest.json"),
+                   json.dumps({"artefacts": {}, "natives": natives}))
     man = {"schema": "build-owned/1", "source": source, "commit": commit or head(tree),
            "files": owned, "native_manifest_sha256": sha256_file(native),
            "native_manifest_path": native, "build_owned_sha256": build_owned_sha256(owned)}
