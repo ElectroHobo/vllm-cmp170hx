@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fixtures for the launcher tests: fake engine trees, a stub server and a
-synthetic three-layout model. Stdlib only; nothing here imports vllm."""
+"""Fixtures for the launcher tests: fake engine trees with build provenance,
+a stub server and a synthetic three-layout model. Stdlib only; nothing here
+imports vllm."""
 
 from __future__ import annotations
 
@@ -29,6 +30,8 @@ FORK_VARS = {"VLLM_THIN_GEMM": "0", "VLLM_FAST_PATH": "0", "VLLM_PP_SPLIT": "",
              "VLLM_KERNEL_X": "0", "VLLM_MOE_SKIP_PADDING": "1",
              "VLLM_MOE_MASK_PADDING": "0", "VLLM_PLACEMENT": "ssd"}
 RETIRED = {"VLLM_OLD_THIN_GEMM": "renamed to VLLM_THIN_GEMM"}
+BUILD = {"vllm/_C.abi3.so": "native-lib", "vllm/third_party/kern/compaction.py": "x = 1\n",
+         "vllm/_version.py": "v = 1\n"}
 
 
 def git(tree: str, *args: str) -> str:
@@ -80,6 +83,36 @@ def head(tree: str) -> str:
     return git(tree, "rev-parse", "HEAD").strip()
 
 
+def add_build(tree: str, files: dict[str, str] | None = None, *, source: str = "built_in_place",
+              natives: str = "natives-1", stamp: bool = True, record: bool = True,
+              commit: str | None = None) -> dict:
+    """Build artefacts plus their provenance: owned files, a native manifest
+    and a retained build record (both outside the tree), the build-owned
+    manifest and the build stamp."""
+    from canon import sha256_file
+    from treestate import MANIFEST, STAMP, build_owned_sha256
+    files = BUILD if files is None else files
+    for rel, text in files.items():
+        write(os.path.join(tree, rel), text)
+    owned = {rel: sha256_file(os.path.join(tree, rel)) for rel in files}
+    side = os.path.join(os.path.dirname(tree), "build-" + os.path.basename(tree))
+    native = write(os.path.join(side, "native-manifest.json"), json.dumps({"natives": natives}))
+    man = {"schema": "build-owned/1", "source": source, "commit": commit or head(tree),
+           "files": owned, "native_manifest_sha256": sha256_file(native),
+           "native_manifest_path": native, "build_owned_sha256": build_owned_sha256(owned)}
+    if record and source == "built_in_place":
+        rec = write(os.path.join(side, "build-record.json"),
+                    json.dumps({"schema": "build-record/1", "files": owned}))
+        man["build_record"] = {"path": rec, "sha256": sha256_file(rec)}
+    write(os.path.join(tree, MANIFEST), json.dumps(man))
+    if stamp:
+        write(os.path.join(tree, STAMP), json.dumps(
+            {"schema": "build-stamp/1", "commit": head(tree),
+             "native_manifest_sha256": man["native_manifest_sha256"],
+             "build_owned_sha256": man["build_owned_sha256"]}))
+    return man
+
+
 STUB = """#!{python} -I
 import os
 import sys
@@ -127,7 +160,7 @@ hardware = "two-card"
 env_prefixes = ["SYNTH_"]
 arg_order = ["served-model-name", "tensor-parallel-size", "pipeline-parallel-size", "max-model-len"]
 fixed = ["args.max-model-len", "args.gpu-memory-utilization", "tp", "pp", "cards"]
-controlled_args = ["tensor-parallel-size", "pipeline-parallel-size", "max-model-len"]
+controlled_args = ["max-model-len", "max-num-seqs"]
 baseline = { release = "0.1.0", gate_record = "gate-synth", engine_commit = "" }
 
 [layouts]
@@ -147,6 +180,7 @@ model = "${checkpoint.target.path}"
 served-model-name = "synth-dense"
 max-model-len = { value = 32768, why = "Long enough for the documented workloads; fits KV on two cards." }
 gpu-memory-utilization = { value = 0.9, why = "Leaves room for the sampler's temporary buffers." }
+max-num-seqs = 8
 port = 8123
 trust-remote-code = true
 
@@ -188,7 +222,7 @@ HARDWARE_TOML = """\
 schema = "launch-hardware/1"
 card = "test-card"
 sm = 80
-count = 2
+count = 4
 memory_gib = 8
 power_limit_w = 180
 p2p = "auto"
@@ -261,11 +295,13 @@ def make_settings(root: str, *, commit: str = "0" * 40, checkpoint_dir: str | No
 
 
 class World:
-    """One tmp directory with a tree, a venv, a checkpoint and settings."""
+    """One tmp directory with a built tree, a venv, a checkpoint and settings."""
 
-    def __init__(self, tmp, **tree_kw) -> None:
+    def __init__(self, tmp, *, build: bool = True, **tree_kw) -> None:
         self.tmp = str(tmp)
         self.tree = make_tree(os.path.join(self.tmp, "tree"), **tree_kw)
+        if build:
+            add_build(self.tree)
         self.venv = make_venv(os.path.join(self.tmp, "venv"))
         self.models = os.path.join(self.tmp, "models")
         self.cp = make_checkpoint(os.path.join(self.models, "synth-dense-1b"))
@@ -319,8 +355,8 @@ class World:
             env=environ if environ is not None else self.env(), capture_output=True, text=True)
 
 
-# -- a minimal promote, mirroring the receipt format (the real writer is the
-# -- release tooling; this one exists only to give the reader its inputs) --
+# -- a minimal publisher, mirroring the receipt format (the release
+# -- publisher is the real writer; this one only gives the reader inputs) --
 
 def promote(world: World, layouts: list[str], *, generation: str | None = None,
             docs: dict | None = None, gate: str = "gate-synth-1") -> dict:
@@ -364,10 +400,16 @@ def promote(world: World, layouts: list[str], *, generation: str | None = None,
         "checkpoints": {n: {"repo": c["repo"], "revision": c["revision"],
                             "manifest_sha256": c["manifest_sha256"]}
                         for n, c in any_doc["checkpoint"].items()},
-        "promoted_at": "2026-01-01T00:00:00Z", "user_yes": "test", "tools_commit": "0" * 40,
+        "promoted_at": "2026-01-01T00:00:00Z", "user_yes": "test", "promoter_commit": "0" * 40,
     }
     files["receipt.json"] = json.dumps(receipt, indent=1, sort_keys=True).encode() + b"\n"
-    pointer = os.path.join(world.settings, "validated")
+    publish(world.settings, files, generation)
+    return receipt
+
+
+def publish(settings: str, files: dict[str, bytes], generation: str | None,
+            pause_before_rename=None) -> None:
+    pointer = os.path.join(settings, "validated")
     if generation is None:
         if os.path.islink(pointer):
             os.unlink(pointer)
@@ -375,15 +417,16 @@ def promote(world: World, layouts: list[str], *, generation: str | None = None,
         os.makedirs(pointer)
         target = pointer
     else:
-        target = os.path.join(world.settings, "validated.d", generation)
+        target = os.path.join(settings, "validated.d", generation)
         os.makedirs(target)
     for name, raw in files.items():
         with open(os.path.join(target, name), "wb") as f:
             f.write(raw)
     if generation is not None:
-        tmp = os.path.join(world.settings, "validated.new")
+        tmp = os.path.join(settings, "validated.new")
         os.symlink(os.path.join("validated.d", generation), tmp)
+        if pause_before_rename is not None:
+            pause_before_rename()
         if os.path.isdir(pointer) and not os.path.islink(pointer):
             shutil.rmtree(pointer)
         os.replace(tmp, pointer)
-    return receipt

@@ -17,8 +17,8 @@ Layout::
 
 Every file carries ``schema = "<name>/<major>"``; an unknown name or major
 is refused. Non-finite floats, a newline or NUL inside a string, one key
-spelled two ways, and any symlink other than the ``validated`` pointer are
-refused.
+spelled two ways, and any symlink other than the ``validated`` pointer (and
+the publisher's transient ``validated.new``) are refused.
 """
 
 from __future__ import annotations
@@ -45,6 +45,10 @@ SUPPORTED_SCHEMAS = {
     "tree-exempt": {1},
     "build-inputs": {1},
 }
+
+POINTER = "validated"
+STAGING = "validated.new"          # a publisher's pointer before its rename
+GENERATIONS = "validated.d"
 
 _PIN_KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -84,6 +88,14 @@ def check_strings(obj: Any, where: str, path: str = "") -> None:
 
 def normalize_arg_name(name: str) -> str:
     return name.replace("_", "-")
+
+
+def normalize_key(key: str) -> str:
+    """args.max_model_len → args.max-model-len; other keys unchanged."""
+    if key.startswith("args."):
+        head, _, rest = key[5:].partition(".")
+        return "args." + normalize_arg_name(head) + (f".{rest}" if rest else "")
+    return key
 
 
 def check_arg_spellings(table: dict, where: str) -> None:
@@ -153,19 +165,19 @@ class SettingsDir:
     # -- structure ---------------------------------------------------------
     def _check_symlinks(self) -> None:
         root_real = os.path.realpath(self.root)
+        gens = os.path.join(root_real, GENERATIONS) + os.sep
         for dirpath, dirnames, filenames in os.walk(self.root):
             rel_dir = os.path.relpath(dirpath, self.root)
             for name in list(dirnames) + filenames:
                 full = os.path.join(dirpath, name)
                 rel = os.path.normpath(os.path.join(rel_dir, name))
                 if os.path.islink(full):
-                    if rel == "validated" and not self.community:
+                    if rel in (POINTER, STAGING) and not self.community:
                         target = os.path.realpath(full)
-                        gens = os.path.join(root_real, "validated.d") + os.sep
-                        if not target.startswith(gens) or not os.path.isdir(target):
+                        if not target.startswith(gens) or (rel == POINTER and not os.path.isdir(target)):
                             raise Refusal(
-                                f"settings: 'validated' must point to a generation "
-                                f"directory under validated.d/, not {os.readlink(full)!r}")
+                                f"settings: {rel!r} must point to a generation "
+                                f"directory under {GENERATIONS}/, not {os.readlink(full)!r}")
                         continue
                     raise Refusal(f"settings: symlink {rel} is not allowed")
                 real = os.path.realpath(full)
@@ -196,30 +208,28 @@ class SettingsDir:
             return parse_env_lines(f.read(), "settings:pins.env")
 
     # -- hashing -----------------------------------------------------------
-    def file_hashes(self) -> dict[str, str]:
-        """sha256 of every settings file; validated/ by resolved content;
-        validated.d/ excluded. Used for the settings tree hash."""
+    def file_hashes(self, validated: dict[str, bytes]) -> dict[str, str]:
+        """sha256 of every settings file. ``validated/`` contributes the
+        given generation snapshot (name → bytes), so one launch hashes the
+        same generation it read; ``validated.d/`` and ``validated.new`` are
+        never part of the settings."""
         out: dict[str, str] = {}
         for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False):
             rel_dir = os.path.relpath(dirpath, self.root)
             if rel_dir == ".":
-                dirnames[:] = [d for d in dirnames if d != "validated.d"]
+                dirnames[:] = [d for d in dirnames if d not in (GENERATIONS, STAGING, POINTER)]
+                filenames = [f for f in filenames if f not in (STAGING, POINTER)]
             for name in filenames:
                 full = os.path.join(dirpath, name)
                 rel = os.path.normpath(os.path.join(rel_dir, name))
                 with open(full, "rb") as f:
                     out[rel] = sha256_bytes(f.read())
-            for d in list(dirnames):
-                full = os.path.join(dirpath, d)
-                if os.path.islink(full) and os.path.normpath(os.path.join(rel_dir, d)) == "validated":
-                    for name in sorted(os.listdir(full)):
-                        fp = os.path.join(full, name)
-                        if os.path.isfile(fp) and not name.startswith("."):
-                            with open(fp, "rb") as f:
-                                out[f"validated/{name}"] = sha256_bytes(f.read())
+        for name, raw in validated.items():
+            out[f"{POINTER}/{name}"] = sha256_bytes(raw)
         return dict(sorted(out.items()))
 
-    def tree_sha256(self) -> str:
-        """sha256 of the sorted ``path\\0sha256\\n`` list."""
-        lines = "".join(f"{p}\0{h}\n" for p, h in self.file_hashes().items())
-        return sha256_bytes(lines.encode("utf-8"))
+
+def tree_sha256(file_hashes: dict[str, str]) -> str:
+    """sha256 of the sorted ``path\\0sha256\\n`` list."""
+    lines = "".join(f"{p}\0{h}\n" for p, h in sorted(file_hashes.items()))
+    return sha256_bytes(lines.encode("utf-8"))

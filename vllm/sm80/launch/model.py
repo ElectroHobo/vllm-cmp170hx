@@ -10,7 +10,7 @@ Fields (schema launch-model/1)::
     arg_order = ["served-model-name", ...]   # argv order; other args follow
     baseline = { release = "...", gate_record = "...", bundle = "...", engine_commit = "..." }
     fixed = ["args.max-model-len", "tp", "pp", "cards"]
-    controlled_args = ["tensor-parallel-size", ...]
+    controlled_args = ["max-num-seqs", ...]
     [layouts] allowed = [...], default = "..."
     [checkpoint.<name>] repo_key, revision_key, dir, container_dir?, index?,
                         weights?, required, manifest
@@ -24,15 +24,19 @@ Fields (schema launch-model/1)::
         secret = true                       variants = ["v"]  # only with one of these
         variant = "v"                       # 1/0 selects variant v
         variant = { a = "va", b = "" }      # the value picks a variant ("" none)
+
+``args.model`` is always a checkpoint reference (``${checkpoint.<name>.path}``)
+and geometry is ``tp``/``pp`` only; requires paths stay inside the tree.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
 from errors import Refusal
-from settings_dir import SettingsDir
+from settings_dir import SettingsDir, normalize_key
 
 _KNOB = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -73,6 +77,10 @@ def _check_knob(knob: str, spec) -> None:
         raise Refusal(f"{where}: type is str, int or bool")
 
 
+def _inside(path: str) -> bool:
+    return not os.path.isabs(path) and ".." not in path.split("/")
+
+
 def load_model_settings(sd: SettingsDir) -> ModelSettings:
     d = sd.toml("model.toml", "launch-model")
     for key in ("model", "hardware"):
@@ -90,6 +98,8 @@ def load_model_settings(sd: SettingsDir) -> ModelSettings:
         for key in ("dir", "manifest", "repo_key", "revision_key"):
             if not isinstance(spec.get(key), str):
                 raise Refusal(f"settings:model.toml: checkpoint.{name}.{key} is required")
+        if not _inside(spec["manifest"]):
+            raise Refusal(f"settings:model.toml: checkpoint.{name}.manifest leaves the settings")
     user = d.get("user", {})
     for knob, spec in user.items():
         _check_knob(knob, spec)
@@ -99,6 +109,8 @@ def load_model_settings(sd: SettingsDir) -> ModelSettings:
             ent = {"path": ent}
         if not isinstance(ent, dict) or not isinstance(ent.get("path"), str):
             raise Refusal("settings:model.toml: requires.files entries need a path")
+        if not _inside(ent["path"]):
+            raise Refusal(f"settings:model.toml: requires path {ent['path']!r} leaves the engine tree")
         requires.append(ent)
     return ModelSettings(
         data=d,
@@ -109,7 +121,7 @@ def load_model_settings(sd: SettingsDir) -> ModelSettings:
         allowed_layouts=allowed,
         default_layout=default,
         checkpoints=cps,
-        fixed=set(d.get("fixed", [])),
+        fixed={normalize_key(k) for k in d.get("fixed", [])},
         controlled_args={a.lstrip("-").replace("_", "-") for a in d.get("controlled_args", [])},
         refuse=list(d.get("refuse", [])),
         requires=requires,

@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The validated statement: is this launch the one a release gate passed?
 
-Inputs come only from the settings directory (``validated/<layout>.json``
-and ``validated/receipt.json`` of one generation), the target tree, the
-checkpoints and the environment; nothing is read from any release state.
+Inputs come only from the settings directory (one generation of
+``validated/``), the target tree, the checkpoints and the environment;
+nothing is read from any release state.
 
 The validated layout file (schema validated-launch/1)::
 
@@ -17,15 +17,18 @@ The receipt (schema validation-receipt/1)::
     {"schema", "model",
      "layouts": {L: {"validated_sha256", "functional_sha256", "gate_record",
                      "verdict_revision", "gate_revision", "requires"}},
-     "pins": {ENGINE_COMMIT, TARGET_REPO, TARGET_REVISION, ...},
+     "pins": {every pins.env key except ENGINE_IMAGE},
      "engines": [{"commit", "role", "native_manifest_sha256",
                   "build_owned_sha256", "engine_equivalence"?}],
      "checkpoints": {name: {"repo", "revision", "manifest_sha256"}},
-     "promoted_at", "user_yes", "tools_commit"}
+     "promoted_at", "user_yes", "promoter_commit"}
+
+Missing identity never equals missing identity: a receipt or a tree
+without a build or native identity is NOT VALIDATED.
 
 Roles: ``final`` settings must carry a receipt (a missing one is refused,
 never read as a candidate); ``candidate`` settings must not; ``any`` reports
-what it finds.
+what it finds. Every receipt-independent check runs in every role.
 """
 
 from __future__ import annotations
@@ -38,58 +41,66 @@ from dataclasses import dataclass, field
 
 from canon import canonical_sha256, sha256_bytes
 from errors import Refusal
-from settings_dir import SettingsDir, check_schema
+from settings_dir import GENERATIONS, POINTER, SettingsDir, check_schema
 
 ROLES = ("any", "candidate", "final")
 RECEIPT = "receipt.json"
+REQUIRED_PINS = ("ENGINE_COMMIT", "TARGET_REPO", "TARGET_REVISION")
+_HEX64 = set("0123456789abcdef")
 
 
 @dataclass
 class Generation:
+    """Every file of one ``validated`` generation, read under one lock."""
     directory: str | None
-    receipt: bytes | None
-    layout_file: bytes | None
+    files: dict[str, bytes] = field(default_factory=dict)
+
+    @property
+    def receipt(self) -> bytes | None:
+        return self.files.get(RECEIPT)
+
+    def layout(self, name: str) -> bytes | None:
+        return self.files.get(f"{name}.json")
 
 
-def read_generation(sd: SettingsDir, layout: str,
-                    between: Callable[[], None] | None = None) -> Generation:
-    """Read the receipt and the layout file from one generation.
+def read_generation(sd: SettingsDir, between: Callable[[], None] | None = None) -> Generation:
+    """Read every file of the current generation.
 
-    In the lab ``validated`` is a symlink to ``validated.d/<gen>/``; the
+    In the lab ``validated`` is a symlink to ``validated.d/<gen>/``: the
     reader holds a shared flock on ``validated.d/.lock`` from resolving the
-    pointer to its last read, and closes it before returning, so the server
-    never inherits it. ``between`` runs between the two reads (tests)."""
-    pointer = sd.path("validated")
-    gens = sd.path("validated.d")
+    pointer to its last read and closes it before returning, so the server
+    never inherits it. ``between`` runs after the first file (tests)."""
+    pointer = sd.path(POINTER)
+    gens = sd.path(GENERATIONS)
     fd = None
     if os.path.isdir(gens):
         lock = os.path.join(gens, ".lock")
         try:
             fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
         except OSError:
-            fd = os.open(lock, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                fd = os.open(lock, os.O_RDONLY | os.O_CLOEXEC)
+            except OSError as exc:
+                raise Refusal(f"cannot open {lock} for the reader lock: {exc.strerror}") from None
         fcntl.flock(fd, fcntl.LOCK_SH)
     try:
         if not os.path.isdir(pointer):
-            return Generation(None, None, None)
+            return Generation(None)
         directory = os.path.realpath(pointer)
-        receipt = _read(os.path.join(directory, RECEIPT))
-        if between is not None:
-            between()
-        layout_file = _read(os.path.join(directory, f"{layout}.json"))
-        return Generation(directory, receipt, layout_file)
+        files: dict[str, bytes] = {}
+        for i, name in enumerate(sorted(os.listdir(directory))):
+            full = os.path.join(directory, name)
+            if name.startswith(".") or not os.path.isfile(full):
+                continue
+            with open(full, "rb") as f:
+                files[name] = f.read()
+            if i == 0 and between is not None:
+                between()
+        return Generation(directory, files)
     finally:
         if fd is not None:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
-
-
-def _read(path: str) -> bytes | None:
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
 
 
 def _json(raw: bytes, schema: str, where: str) -> dict:
@@ -101,6 +112,39 @@ def _json(raw: bytes, schema: str, where: str) -> dict:
         raise Refusal(f"{where}: not an object")
     check_schema(data, schema, where)
     return data
+
+
+def _sha(v) -> bool:
+    return isinstance(v, str) and len(v) == 64 and set(v) <= _HEX64
+
+
+def receipt_problems(r: dict, pins: dict[str, str]) -> list[str]:
+    """Structural problems of a receipt; any one makes the launch NOT VALIDATED."""
+    out = []
+    if not isinstance(r.get("layouts"), dict) or not r["layouts"]:
+        out.append("receipt has no layouts")
+    rp = r.get("pins")
+    if not isinstance(rp, dict):
+        out.append("receipt has no pins")
+    else:
+        for k in set(REQUIRED_PINS) | (set(pins) - {"ENGINE_IMAGE"}):
+            if not isinstance(rp.get(k), str) or not rp[k]:
+                out.append(f"receipt pins lack {k}")
+    engines = r.get("engines")
+    if not isinstance(engines, list) or not engines:
+        out.append("receipt has no engines")
+    else:
+        for e in engines:
+            if not isinstance(e, dict) or not isinstance(e.get("commit"), str) \
+                    or e.get("role") not in ("validated", "carrier") \
+                    or not _sha(e.get("build_owned_sha256")) or not _sha(e.get("native_manifest_sha256")):
+                out.append("receipt engine entry lacks commit, role or build identity")
+                break
+    cps = r.get("checkpoints")
+    if not isinstance(cps, dict) or any(
+            not isinstance(c, dict) or not _sha(c.get("manifest_sha256")) for c in cps.values()):
+        out.append("receipt checkpoints malformed")
+    return ["receipt malformed: " + p for p in out]
 
 
 @dataclass
@@ -126,36 +170,35 @@ def evaluate(gen: Generation, ev: Evidence, *, role: str = "any") -> dict:
     reasons: list[str] = []
     out: dict = {"state": "NOT_VALIDATED", "reasons": reasons, "functional_match": False,
                  "role": role, "generation": gen.directory and os.path.basename(gen.directory)}
-    pin = ev.pins.get("ENGINE_COMMIT")
-    # checked in every mode, with or without a receipt
-    if not pin:
-        reasons.append("no engine pin")
-    elif ev.tree_commit != pin:
-        reasons.append("tree ≠ pin")
     if gen.receipt is None:
         if role == "final":
             raise Refusal("final settings carry no receipt (validated/receipt.json); "
                           "a final launch is never treated as a candidate")
-        reasons.insert(0, "no receipt")
+        reasons.append("no receipt")
         out["receipt"] = None
-        _common(ev, reasons)
+        _independent(ev, reasons, None)
+        out["reasons"] = list(dict.fromkeys(reasons))
         return out
     if role == "candidate":
         raise Refusal("candidate settings must not carry a receipt (validated/ must be empty)")
     receipt = _json(gen.receipt, "validation-receipt", "validated/receipt.json")
     out["receipt_sha256"] = sha256_bytes(gen.receipt)
-    entry = receipt.get("layouts", {}).get(ev.layout)
+    reasons += receipt_problems(receipt, ev.pins)
+    layouts = receipt.get("layouts") if isinstance(receipt.get("layouts"), dict) else {}
+    entry = layouts.get(ev.layout)
+    raw = gen.layout(ev.layout)
     # 1. validated file ↔ receipt ↔ this launch
-    if gen.layout_file is None or entry is None:
+    if raw is None or not isinstance(entry, dict):
         reasons.append(f"layout {ev.layout} not validated")
     else:
-        vfile = _json(gen.layout_file, "validated-launch", f"validated/{ev.layout}.json")
+        vfile = _json(raw, "validated-launch", f"validated/{ev.layout}.json")
         own = canonical_sha256({"argv": vfile.get("argv_functional"), "env": vfile.get("env_functional")})
         c1 = True
-        if sha256_bytes(gen.layout_file) != entry.get("validated_sha256"):
+        if sha256_bytes(raw) != entry.get("validated_sha256"):
             reasons.append("validated file ≠ receipt")
             c1 = False
-        if vfile.get("functional_sha256") != entry.get("functional_sha256") \
+        if not _sha(vfile.get("functional_sha256")) \
+                or vfile.get("functional_sha256") != entry.get("functional_sha256") \
                 or own != vfile.get("functional_sha256"):
             reasons.append("receipt ≠ validated file")
             c1 = False
@@ -165,48 +208,55 @@ def evaluate(gen: Generation, ev: Evidence, *, role: str = "any") -> dict:
         out["functional_match"] = c1
         out["gate_record"] = vfile.get("gate_record") or entry.get("gate_record")
         out["engine_commit"] = vfile.get("engine_commit")
-        if vfile.get("requires", {}) != ev.requires:
+        if vfile.get("requires") != ev.requires:
             reasons.append("requires ≠ validated")
     # 2. engine and pins bound to the receipt
-    rpins = receipt.get("pins", {})
-    if any(ev.pins.get(k) != v for k, v in rpins.items()):
+    rpins = receipt.get("pins") if isinstance(receipt.get("pins"), dict) else {}
+    if any(ev.pins.get(k) != v for k, v in rpins.items()) or \
+            any(k not in rpins for k in ev.pins if k != "ENGINE_IMAGE"):
         reasons.append("pin ≠ receipt")
-    engines = {e.get("commit"): e for e in receipt.get("engines", []) if isinstance(e, dict)}
+    engines = {e.get("commit"): e for e in receipt.get("engines") or [] if isinstance(e, dict)}
+    pin = ev.pins.get("ENGINE_COMMIT")
     if pin not in engines or ev.tree_commit not in engines:
         reasons.append("engine not in receipt")
-    # 3. tree clean and its build identity equal to its engines entry
-    if ev.tree_dirty:
-        reasons.append("dirty tree")
-    if ev.adopted:
-        reasons.append("adopted tree")
+    # 3. build identity equal to the engines entry (missing never equals missing)
     eng = engines.get(ev.tree_commit)
     if eng is not None:
-        if eng.get("build_owned_sha256") != ev.build_owned_sha256:
+        if ev.build_owned_sha256 is None or eng.get("build_owned_sha256") != ev.build_owned_sha256:
             reasons.append("cross-commit artefacts" if ev.cross_commit_artifacts else "build ≠ receipt")
-        if eng.get("native_manifest_sha256") != ev.native_manifest_sha256:
+        if ev.native_manifest_sha256 is None or eng.get("native_manifest_sha256") != ev.native_manifest_sha256:
             reasons.append("natives ≠ receipt")
-    elif ev.cross_commit_artifacts:
-        reasons.append("cross-commit artefacts")
     # 4a. checkpoints bound to the receipt
-    rcps = receipt.get("checkpoints", {})
+    rcps = receipt.get("checkpoints") if isinstance(receipt.get("checkpoints"), dict) else {}
     for name, cp in ev.checkpoints.items():
         r = rcps.get(name)
-        if r is None or r.get("manifest_sha256") != cp.get("manifest_sha256") \
+        if not isinstance(r, dict) or r.get("manifest_sha256") != cp.get("manifest_sha256") \
                 or r.get("repo") != cp.get("repo") or r.get("revision") != cp.get("revision"):
             reasons.append("checkpoint ≠ receipt")
             break
     if set(rcps) - set(ev.checkpoints):
         reasons.append("checkpoint ≠ receipt")
-    _common(ev, reasons)
+    _independent(ev, reasons, eng)
     out["reasons"] = list(dict.fromkeys(reasons))
     if not out["reasons"]:
         out["state"] = "VALIDATED"
     return out
 
 
-def _common(ev: Evidence, reasons: list[str]) -> None:
-    """4b and 5, which do not need the receipt."""
-    for name, cp in ev.checkpoints.items():
+def _independent(ev: Evidence, reasons: list[str], eng: dict | None) -> None:
+    """Checks that need no receipt: they run for candidates too."""
+    pin = ev.pins.get("ENGINE_COMMIT")
+    if not pin:
+        reasons.append("no engine pin")
+    elif ev.tree_commit != pin:
+        reasons.append("tree ≠ pin")
+    if ev.tree_dirty:
+        reasons.append("dirty tree")
+    if ev.adopted:
+        reasons.append("adopted tree")
+    if ev.cross_commit_artifacts and eng is None:
+        reasons.append("cross-commit artefacts")
+    for cp in ev.checkpoints.values():
         if cp.get("state") in ("not present", "incomplete"):
             reasons.append("checkpoint not present")
         elif cp.get("identity") != "verified":

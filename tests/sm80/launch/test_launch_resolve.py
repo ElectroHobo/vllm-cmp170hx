@@ -90,19 +90,37 @@ def test_user_knobs(w, tmp_path):
 
 # -- precedence ------------------------------------------------------------------
 
-def test_precedence_each_layer(w, tmp_path):
-    key = "VLLM_FAST_PATH"
-    ov = write(str(tmp_path / "ov.toml"), f'schema = "launch-overlay/1"\n[env]\n{key} = "3"\n')
-    layers = [((), "1", "layout"),
-              (("--variant", "x"), "2", "variant"),
-              (("--variant", "x", "--overlay", ov), "3", "overlay"),
-              (("--variant", "x", "--overlay", ov, "--set", f"env.{key}=5"), "5", "cli")]
-    write(os.path.join(w.settings, "variants", "x.toml"), f'schema = "launch-variant/1"\n[env]\n{key} = "2"\n')
-    for extra, value, layer in layers:
-        d = w.resolve(*extra)
-        assert d["child_env"][key]["value"] == value
+def test_precedence_every_layer(w, tmp_path):
+    """One key at every layer; each layer removed from the top in turn."""
+    key = "VLLM_PLACEMENT"
+    model = open(os.path.join(w.settings, "model.toml")).read().replace(
+        'CUDA_DEVICE_ORDER = "PCI_BUS_ID"\n', f'CUDA_DEVICE_ORDER = "PCI_BUS_ID"\n{key} = "m"\n', 1)
+    model = model.replace('choices = ["ssd", "ram", "device"]\n', "")
+    write(os.path.join(w.settings, "model.toml"), model)
+    hw = os.path.join(w.settings, "hardware", "two-card.toml")
+    write(hw, open(hw).read() + f'\n[env]\n{key} = "h"\n')
+    lay = os.path.join(w.settings, "layouts", "tp2.toml")
+    write(lay, open(lay).read() + f'{key} = "l"\n')
+    write(os.path.join(w.settings, "variants", "x.toml"), f'schema = "launch-variant/1"\n[env]\n{key} = "v"\n')
+    ov = write(str(tmp_path / "ov.toml"), f'schema = "launch-overlay/1"\n[env]\n{key} = "o"\n')
+    env = write(str(tmp_path / "u.env"), "PLACEMENT=u\n")
+    full = ["--policy", "merge", "--variant", "x", "--overlay", ov, "--env-file", env,
+            "--set", f"env.{key}=c"]
+    cases = [(full, w.env(**{key: "a"}), "c", "cli"),
+             (full[:-2], w.env(**{key: "a"}), "a", "ambient"),
+             (full[:-2], w.env(), "u", "user"),
+             (full[:-4], w.env(), "o", "overlay"),
+             (full[:-6], w.env(), "v", "variant"),
+             (full[:-8], w.env(), "l", "layout")]
+    for extra, environ, value, layer in cases:
+        d = w.resolve(*extra, environ=environ)
+        assert d["child_env"][key]["value"] == value, layer
         assert d["resolved"][f"env.{key}"]["layer"] == layer
         assert d["env_functional"][key] == value
+    write(lay, open(lay).read().replace(f'{key} = "l"\n', ""))
+    assert w.resolve()["resolved"][f"env.{key}"]["layer"] == "hardware"
+    write(hw, open(hw).read().replace(f'{key} = "h"\n', ""))
+    assert w.resolve()["resolved"][f"env.{key}"]["layer"] == "model"
 
 
 def test_ambient_vs_cli_conflict_reaches_child(w):
@@ -153,12 +171,12 @@ def test_unknown_env_file_key(w, tmp_path):
 
 
 def test_layout_cards_exceed_hardware(w):
-    write(os.path.join(w.settings, "layouts", "tp4.toml"),
-          'schema = "launch-layout/1"\ntp = 4\npp = 1\ncards = 4\n')
+    write(os.path.join(w.settings, "layouts", "tp8.toml"),
+          'schema = "launch-layout/1"\ntp = 8\npp = 1\ncards = 8\n')
     model = open(os.path.join(w.settings, "model.toml")).read().replace(
-        'allowed = ["tp1", "tp2", "pp2"]', 'allowed = ["tp1", "tp2", "pp2", "tp4"]')
+        'allowed = ["tp1", "tp2", "pp2"]', 'allowed = ["tp1", "tp2", "pp2", "tp8"]')
     write(os.path.join(w.settings, "model.toml"), model)
-    assert "hardware has 2" in w.refused(layout="tp4")
+    assert "hardware has 4" in w.refused(layout="tp8")
 
 
 def test_card_count_not_tp_times_pp(w):
@@ -223,14 +241,3 @@ def test_cli_change_breaks_functional_match(w):
     d = w.resolve("--set", "env.VLLM_FAST_PATH=0")
     assert d["validated"]["functional_match"] is False
     assert "functional ≠ validated" in d["validated"]["reasons"]
-
-
-def test_harness_overlay_excluded(w, tmp_path):
-    assert w.verify() == 0
-    promote(w, ["tp2"])
-    ov = write(str(tmp_path / "h.toml"),
-               'schema = "launch-overlay/1"\nclass = "harness"\n[args]\nenable-prompt-tokens-details = true\n')
-    d = w.resolve("--overlay", ov)
-    assert d["harness"] == ["--enable-prompt-tokens-details"]
-    assert "--enable-prompt-tokens-details" in d["argv"]
-    assert d["validated"]["state"] == "VALIDATED"

@@ -12,6 +12,15 @@ Precedence, lowest first::
 Every key of the final object records its value, layer, source file and
 ``why``. argv, the child environment, the printed configuration and
 ``functional_sha256`` are all derived from that object and nothing else.
+
+Guards on the object: geometry has one representation (``tp``/``pp``;
+the parallel-size arguments are derived from it); ``args.model`` is always
+a checkpoint reference (relocation goes through the verified checkpoint
+path); [fixed] keys and controlled arguments change only under
+--experiment, whatever the channel (overlay, .env, ambient, --set, unset);
+only the launcher's own instrumentation list is excluded from the
+functional hash; every child environment name is classified by the closed
+class table whichever table supplied it.
 """
 
 from __future__ import annotations
@@ -30,11 +39,13 @@ from envclass import ClassTable, always_refused
 from errors import Refusal
 from model import ModelSettings
 from registry import Registry
-from settings_dir import check_arg_spellings, normalize_arg_name
+from settings_dir import check_arg_spellings, normalize_arg_name, normalize_key
 
 LOCKED_LAYERS = ("overlay", "user", "ambient", "cli")   # [fixed] needs --experiment
 RUNTIMES = ("native", "container")
+GEOMETRY_ARGS = ("args.tensor-parallel-size", "args.pipeline-parallel-size")
 _SUBST = re.compile(r"\$\{([^}]*)\}")
+_CHECKPOINT_REF = re.compile(r"^\$\{checkpoint\.([A-Za-z0-9_-]+)\.path\}$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOP_KEYS = ("tp", "pp", "cards", "card_ids")
 _TRUE = ("1", "true", "yes", "on")
@@ -114,14 +125,12 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
             elif isinstance(v, bool) or not isinstance(v, int) or v < 1:
                 raise Refusal(f"{source}: {key} must be a positive integer")
             final.put(key, v, layer, source)
-    if "tp" in table:
-        final.put("args.tensor-parallel-size", table["tp"], layer, source)
-    if "pp" in table:
-        final.put("args.pipeline-parallel-size", table["pp"], layer, source)
     args = table.get("args", {})
     check_arg_spellings(args, source)
     for k, v in args.items():
         key = "args." + normalize_arg_name(k)
+        if key in GEOMETRY_ARGS:
+            raise Refusal(f"{source}: set tp/pp, not --{key[5:]}")
         sub_whys: dict[str, str] = {}
         val, why = split_value(v, source, sub_whys)
         final.put(key, val, layer, source, why)
@@ -142,8 +151,9 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
     for key in table.get("unset", []):
         if not isinstance(key, str):
             raise Refusal(f"{source}: unset entries are key strings")
-        if key.startswith("args."):
-            key = "args." + normalize_arg_name(key[5:])
+        key = normalize_key(key)
+        if key in GEOMETRY_ARGS or key in ("tp", "pp", "cards"):
+            raise Refusal(f"{source}: geometry cannot be unset")
         final.drop(key, layer)
     if layout is not None:
         sub = table.get("layout", {}).get(layout)
@@ -184,6 +194,8 @@ def parse_set(item: str) -> tuple[str, Any]:
     key, sep, raw = item.partition("=")
     if not sep or not key:
         raise Refusal(f"--set {item!r}: expected KEY=VALUE")
+    if key.startswith("args."):
+        key = normalize_key(key)
     if not key.startswith("args.") and key not in ("tp", "pp"):
         return key, raw
     try:
@@ -196,6 +208,8 @@ def set_nested(final: Final, target: str, value: Any, layer: str, source: str) -
     """args.a.b = value: set key b inside the table argument a."""
     parts = target.split(".")
     key = "args." + normalize_arg_name(parts[1])
+    if key in GEOMETRY_ARGS:
+        raise Refusal(f"{source}: set tp/pp, not --{key[5:]}")
     if len(parts) == 2:
         final.put(key, value, layer, source)
         return
@@ -249,6 +263,7 @@ class Resolved:
     functional_sha256: str
     exe: str
     secret_names: set[str]
+    checkpoint_refs: list[str]
 
 
 def user_values(ms: ModelSettings, inp: Inputs) -> dict[str, str]:
@@ -277,12 +292,18 @@ def _knob_variant(knob: str, spec: dict, raw: str) -> str | None:
     raise Refusal(f"{knob}={raw!r}: expected 1 or 0")
 
 
-def selected_variants(ms: ModelSettings, inp: Inputs, values: dict[str, str] | None = None) -> list[str]:
+def selected_variants(ms: ModelSettings, inp: Inputs, values: dict[str, str]) -> list[str]:
+    """--variant names, then the variants [user] selector knobs pick; a
+    selector given with --set overrides the same knob from the .env."""
     variants = list(inp.variants)
-    values = user_values(ms, inp) if values is None else values
+    chosen = dict(values)
+    for item in inp.sets:
+        key, _, raw = item.partition("=")
+        if key in ms.user and ms.user[key].get("variant"):
+            chosen[key] = raw
     for knob, spec in ms.user.items():
-        if spec.get("variant") and knob in values:
-            name = _knob_variant(knob, spec, values[knob])
+        if spec.get("variant") and knob in chosen:
+            name = _knob_variant(knob, spec, chosen[knob])
             if name and name not in variants:
                 variants.append(name)
     if inp.capability == "plain-upstream" and "plain-upstream" not in variants:
@@ -294,10 +315,9 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
             classes: ClassTable, harness_args: list[str], inp: Inputs) -> Resolved:
     """files: 'hardware', 'layout', 'variant:<name>' → parsed tables."""
     final = Final()
-    not_validated: list[str] = []
     rt = inp.runtime_cfg
     run = inp.runtime
-    harness_args = list(harness_args)
+    harness_set = {normalize_arg_name(h) for h in harness_args}
     # runtime layer
     final.put("args.host", rt["host"], "runtime", f"defaults.toml[runtime.{run}]")
     for k, v in rt.get("location", {}).items():
@@ -317,12 +337,13 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
         if table is None:
             raise Refusal(f"variant {v!r} has no variants/{v}.toml")
         apply_table(final, table, "variant", f"variants/{v}.toml", layout=inp.layout, runtime=run)
-    # what the settings themselves fixed; later layers may not change it
-    settled = {k: e.value for k, e in final.entries.items() if _fixed(k, ms)}
+    # what the settings themselves decided; later layers may change protected keys only
+    # under --experiment
+    settled = {k: e.value for k, e in final.entries.items()}
     # overlays, then the community settings directory (same level)
     for source, table in inp.overlays:
         if table.get("class") == "harness":
-            harness_args += [normalize_arg_name(k) for k in table.get("args", {})]
+            _check_harness_overlay(source, table, harness_set)
         apply_table(final, table, "overlay", source, layout=inp.layout, runtime=run)
     for source, table in inp.community:
         apply_table(final, table, "overlay", source, layout=inp.layout, runtime=run)
@@ -336,19 +357,16 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
                           f"(known: {', '.join(sorted(ms.user)) or 'none'})")
         if spec.get("target"):
             _apply_user(final, knob, spec, raw, extra_args, secret_names, variants)
-    sets = [parse_set(s) for s in inp.sets]
-    _check_fixed(final, ms, inp, sets, settled)
     # ambient
     amb = _ambient(final, ms, registry, classes, inp)
     for key, value in amb["layer"].items():
         final.put(key, value, "ambient", "environment")
     # CLI layer
-    for key, value in sets:
+    for key, value in (parse_set(s) for s in inp.sets):
         if key in ms.user:
-            if not ms.user[key].get("target"):
-                raise Refusal(f"--set {key}: selects a variant; use --variant")
-            _apply_user(final, key, ms.user[key], str(value), extra_args, secret_names, variants,
-                        layer="cli", source="--set")
+            if ms.user[key].get("target"):
+                _apply_user(final, key, ms.user[key], str(value), extra_args, secret_names,
+                            variants, layer="cli", source="--set")
         elif key == "cards":
             final.put("card_ids", str(value), "cli", "--set")
         elif key.startswith("args."):
@@ -361,9 +379,11 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
             apply_table(final, {key: value}, "cli", "--set")
         else:
             raise Refusal(f"--set {key}: expected env.NAME, args.NAME, cards, tp, pp or a [user] knob")
+    _cards_against_lock(final, amb, inp)
     if extra_args:
-        _check_controlled(ms, extra_args, inp.experiment)
+        _check_controlled_extra(ms, extra_args, inp.experiment)
         final.put("extra_args", list(extra_args), "user", "EXTRA_ARGS")
+    _check_protected(final, ms, inp, settled)
 
     _check_geometry(final, hw, inp.layout)
     for rule in ms.refuse:
@@ -371,8 +391,34 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
         if when and all(str(final.get(k, "")) == str(v) for k, v in when.items()):
             raise Refusal(f"refused combination {when}: {rule.get('why', '')}".strip())
     fork_absent = _check_env_names(final, registry, classes, inp.capability)
-    return _render(final, ms, inp, rt, harness_args, amb, variants, fork_absent,
-                   secret_names, not_validated, classes)
+    return _render(final, ms, inp, rt, harness_set, amb, variants, fork_absent,
+                   secret_names, classes)
+
+
+def _check_harness_overlay(source: str, table: dict, harness_set: set[str]) -> None:
+    """A harness overlay may only add the launcher's instrumentation arguments."""
+    extra = set(table) - {"schema", "class", "args"}
+    bad = [k for k in table.get("args", {}) if normalize_arg_name(k) not in harness_set]
+    if extra or bad:
+        raise Refusal(f"{source}: a harness overlay may set only {', '.join(sorted(harness_set))}"
+                      f" (found {', '.join(sorted(extra) + bad)})")
+
+
+def _cards_against_lock(final: Final, amb: dict, inp: Inputs) -> None:
+    """Ambient CUDA_VISIBLE_DEVICES (the lock's cards) against the final cards."""
+    lock = amb["cvd"]
+    if lock is None:
+        return
+    want = final.get("card_ids")
+    if want is None:
+        final.put("card_ids", lock, "ambient", "environment")
+    elif str(want) == lock:
+        amb["equal"].append("CUDA_VISIBLE_DEVICES")
+    elif inp.policy == "strict":
+        raise Refusal(f"CUDA_VISIBLE_DEVICES={lock!r} (the cards this process holds) differs from "
+                      f"the resolved cards {want!r}")
+    elif final.entries["card_ids"].layer != "cli":
+        final.put("card_ids", lock, "ambient", "environment")
 
 
 def _check_geometry(final: Final, hw: dict, layout: str) -> None:
@@ -395,13 +441,21 @@ def _check_geometry(final: Final, hw: dict, layout: str) -> None:
 
 def _check_env_names(final: Final, registry: Registry, classes: ClassTable,
                      capability: str) -> list[str]:
-    """Settings env names: functional or secret class; VLLM_* registered."""
+    """Settings env names: functional or secret class; VLLM_* registered.
+    Location names: location class."""
     fork_absent: list[str] = []
     for key in list(final.entries):
+        source = final.entries[key].source
+        if key.startswith("loc."):
+            name = key[4:]
+            cls = classes.classify(name)
+            if cls != "location" or name == "CUDA_VISIBLE_DEVICES":
+                raise Refusal(f"{source}: {name} is class {cls}; [location] holds cache and "
+                              "home locations only (cards are set with card_ids)")
+            continue
         if not key.startswith("env."):
             continue
         name = key[4:]
-        source = final.entries[key].source
         if name.upper().startswith("VLLM_"):
             problem = registry.check(name)
             if problem:
@@ -417,28 +471,33 @@ def _check_env_names(final: Final, registry: Registry, classes: ClassTable,
     return fork_absent
 
 
-def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_args: list[str],
+def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set: set[str],
             amb: dict, variants: list[str], fork_absent: list[str], secret_names: set[str],
-            not_validated: list[str], classes: ClassTable) -> Resolved:
+            classes: ClassTable) -> Resolved:
     subst = {"home": inp.home, "venv": inp.venv, "tree": inp.tree,
              "models_dir": substitute(rt["models_dir"], {"home": inp.home}, "runtime")}
     for name, path in inp.checkpoint_paths.items():
         subst[f"checkpoint.{name}.path"] = path
     model_value = final.get("args.model")
-    if model_value is None:
-        raise Refusal("model.toml: args.model (the served checkpoint) is not set")
+    ref = _CHECKPOINT_REF.match(model_value) if isinstance(model_value, str) else None
+    if ref is None or ref.group(1) not in inp.checkpoint_paths:
+        raise Refusal(f"args.model must be a checkpoint reference such as ${{checkpoint.target.path}} "
+                      f"(got {model_value!r}); serve another directory with "
+                      "--checkpoint-path NAME=DIR, which is checked against the manifest")
+    refs = [ref.group(1)]
     exe = os.path.join(inp.venv, "bin", "vllm")
     argv = [exe, "serve", substitute(model_value, subst, "args.model")]
     argv_functional: list[str] = []
     harness: list[str] = []
     location_keys: dict[str, Any] = {"args.model": argv[2]}
-    harness_set = {normalize_arg_name(h) for h in harness_args}
-    ordered = [f"args.{k}" for k in ms.arg_order if k != "model" and f"args.{k}" in final.entries]
-    ordered += [k for k in final.entries
-                if k.startswith("args.") and k != "args.model" and k not in ordered]
+    tp, pp = final.get("tp", 1), final.get("pp", 1)
+    geometry = {"args.tensor-parallel-size": tp, "args.pipeline-parallel-size": pp}
+    keys = [k for k in final.entries if k.startswith("args.") and k != "args.model"] + list(geometry)
+    ordered = [f"args.{k}" for k in ms.arg_order if k != "model" and f"args.{k}" in keys]
+    ordered += [k for k in keys if k not in ordered]
     for key in ordered:
         name = key[5:]
-        value = final.get(key)
+        value = geometry[key] if key in geometry else final.get(key)
         tokens = render_arg(name, substitute(value, subst, key))
         argv += tokens
         if name in ("host", "port"):
@@ -457,10 +516,12 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_args
     for key, e in final.entries.items():
         if key.startswith("env."):
             name = key[4:]
-            cls = classes.classify(name)
+            cls = "secret" if name in secret_names else classes.classify(name)
             child[name] = {"value": substitute(e.value, subst, key), "class": cls}
             if cls == "functional":
                 env_functional[name] = e.value
+            elif cls == "secret":
+                secret_names.add(name)
         elif key.startswith("loc."):
             name = key[4:]
             child[name] = {"value": substitute(e.value, subst, key), "class": "location"}
@@ -473,9 +534,8 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_args
         child[name] = {"value": value, "class": "code-loading"}
     for name, (value, cls) in amb["passed"].items():
         child.setdefault(name, {"value": value, "class": cls})
-    for name in secret_names:
-        if name in child:
-            child[name]["class"] = "secret"
+        if cls == "secret":
+            secret_names.add(name)
     functional_sha256 = canonical_sha256({"argv": argv_functional, "env": env_functional})
     return Resolved(
         final=final, variants=variants, argv=argv, argv_functional=argv_functional,
@@ -483,8 +543,9 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_args
         env_functional=env_functional, ambient_equal=amb["equal"],
         ambient_layer=sorted(amb["layer"]), dropped=amb["dropped"],
         ignored=amb["ignored"], fork_absent=fork_absent,
-        not_validated=not_validated + amb["not_validated"],
+        not_validated=list(amb["not_validated"]),
         functional_sha256=functional_sha256, exe=exe, secret_names=secret_names,
+        checkpoint_refs=refs,
     )
 
 
@@ -515,10 +576,14 @@ def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[
         value = low in _TRUE
     targets = spec["target"] if isinstance(spec["target"], list) else [spec["target"]]
     for target in targets:
+        target = normalize_key(target)
         if target == "extra_args":
             extra_args.extend(shlex.split(raw))
         elif target == "card_ids":
             final.put("card_ids", raw, layer, source)
+        elif target == "args.model":
+            raise Refusal(f"model.toml: user.{knob} may not target args.model; "
+                          "checkpoints move with --checkpoint-path")
         elif target.startswith("args."):
             set_nested(final, target, value, layer, source)
         elif target.startswith("env."):
@@ -529,59 +594,66 @@ def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[
             raise Refusal(f"model.toml: user.{knob} target {target!r} is not args.*, env.*, card_ids or extra_args")
 
 
-def _check_controlled(ms: ModelSettings, extra: list[str], experiment: str | None) -> None:
+def _check_controlled_extra(ms: ModelSettings, extra: list[str], experiment: str | None) -> None:
     for tok in extra:
         if tok.startswith("--"):
             name = normalize_arg_name(tok[2:].split("=", 1)[0])
+            if name in GEOMETRY_ARGS_NAMES or name == "model":
+                raise Refusal(f"extra argument --{name} is set by the launcher; use tp/pp or "
+                              "--checkpoint-path")
             if name in ms.controlled_args and not experiment:
                 raise Refusal(f"extra argument --{name} is set by the settings; "
                               "change it with --set under --experiment")
 
 
-def _fixed(key: str, ms: ModelSettings) -> bool:
-    if key.startswith("args."):
-        key = "args." + normalize_arg_name(key[5:])
-    return key in ms.fixed
+GEOMETRY_ARGS_NAMES = tuple(k[5:] for k in GEOMETRY_ARGS)
 
 
-def _check_fixed(final: Final, ms: ModelSettings, inp: Inputs, sets: list,
-                 settled: dict[str, Any]) -> None:
-    """A [fixed] key the settings set may be changed by an overlay, the
-    community directory, the user .env or the CLI only under --experiment.
-    Repeating the same value is no change."""
+def _protected(key: str, ms: ModelSettings) -> bool:
+    if key in ms.fixed:
+        return True
+    return key.startswith("args.") and key[5:] in ms.controlled_args
+
+
+def _check_protected(final: Final, ms: ModelSettings, inp: Inputs, settled: dict[str, Any]) -> None:
+    """[fixed] keys and controlled arguments change only under --experiment,
+    through any channel: a new value, a new key or an unset."""
     if inp.experiment:
         return
     for key, e in final.entries.items():
-        if e.layer in LOCKED_LAYERS and key in settled and settled[key] != e.value:
-            raise Refusal(f"{key} is fixed for this model ({e.source}); it changes only under --experiment")
-    for key, value in sets:
-        targets = [key]
-        if key == "cards":
-            targets = ["card_ids"]
-        elif key in ms.user and ms.user[key].get("target"):
-            t = ms.user[key]["target"]
-            targets = t if isinstance(t, list) else [t]
-        for k in targets:
-            if _fixed(k, ms) and str(final.get(k)) != str(value):
-                raise Refusal(f"{k} is fixed for this model (--set); it changes only under --experiment")
+        if e.layer in LOCKED_LAYERS and _protected(key, ms):
+            if key == "card_ids" and e.layer == "ambient":
+                continue  # the lock's cards, checked against the settings above
+            if key not in settled or settled[key] != e.value:
+                raise Refusal(f"{key} is fixed for this model ({e.source}); "
+                              "it changes only under --experiment")
+    for key, layer in final.unset.items():
+        if layer in LOCKED_LAYERS and _protected(key, ms) and key in settled:
+            raise Refusal(f"{key} is fixed for this model; unsetting it needs --experiment")
+    if "args.model" in final.entries and final.entries["args.model"].layer in LOCKED_LAYERS \
+            and final.get("args.model") != settled.get("args.model"):
+        raise Refusal("args.model changes only through --checkpoint-path")
 
 
 def _ambient(final: Final, ms: ModelSettings, registry: Registry, classes: ClassTable,
              inp: Inputs) -> dict:
     """Classify the ambient environment and apply the policy."""
     out: dict = {"equal": [], "layer": {}, "dropped": [], "ignored": [], "passed": {},
-                 "code": {}, "not_validated": []}
+                 "code": {}, "not_validated": [], "cvd": None}
     strict = inp.policy == "strict"
     container = inp.runtime == "container"
+    rt = inp.runtime_cfg
     built_code = {
-        "PATH": ":".join([os.path.join(inp.venv, "bin"),
-                          os.path.join(inp.runtime_cfg["cuda_home"], "bin"),
+        "PATH": ":".join([os.path.join(inp.venv, "bin"), os.path.join(rt["cuda_home"], "bin"),
                           "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
                           "/sbin", "/bin"]),
         "PYTHONPATH": inp.tree,
         "PYTHONNOUSERSITE": "1",
-        "CUDA_HOME": inp.runtime_cfg["cuda_home"],
+        "VIRTUAL_ENV": inp.venv,
+        "CUDA_HOME": rt["cuda_home"],
     }
+    if rt.get("ld_library_path"):
+        built_code["LD_LIBRARY_PATH"] = rt["ld_library_path"]
     out["code"] = dict(built_code)
     refusals: list[str] = []
     for name in sorted(inp.ambient):
@@ -620,16 +692,14 @@ def _ambient(final: Final, ms: ModelSettings, registry: Registry, classes: Class
                 out["not_validated"].append(f"ambient {name}")
         elif cls == "location":
             if name == "CUDA_VISIBLE_DEVICES":
-                want = final.get("card_ids")
-                if want is None:
-                    final.put("card_ids", value, "ambient", "environment")
-                elif str(want) == value:
-                    out["equal"].append(name)
-                elif strict:
-                    refusals.append(f"CUDA_VISIBLE_DEVICES={value!r} differs from the resolved cards {want!r}")
-                else:
-                    final.put("card_ids", value, "ambient", "environment")
-            elif final.get("loc." + name) == value:
+                out["cvd"] = value       # checked against the final cards after --set
+                continue
+            want = final.get("loc." + name)
+            try:
+                want = substitute(want, {"home": inp.home, "venv": inp.venv, "tree": inp.tree}, name)
+            except Refusal:
+                pass
+            if want == value:
                 out["equal"].append(name)
             else:
                 out["ignored"].append(name)
@@ -643,7 +713,7 @@ def _ambient(final: Final, ms: ModelSettings, registry: Registry, classes: Class
             declared = key in final.entries
             if declared and final.get(key) == value:
                 out["equal"].append(name)
-            elif _fixed(key, ms) and not inp.experiment:
+            elif key in ms.fixed and not inp.experiment:
                 refusals.append(f"{name} is fixed for this model; it changes only under --experiment")
             elif strict:
                 if declared:

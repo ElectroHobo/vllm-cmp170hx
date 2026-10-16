@@ -36,12 +36,8 @@ TORCHINDUCTOR_CACHE_DIR = "/cache/torchinductor"
 VLLM_CACHE_ROOT = "/cache/vllm"
 FLASHINFER_WORKSPACE_BASE = "/cache"
 
-# Names the engine image sets in its own ENV, with the same values; they
-# arrive as ambient values equal to these and are recorded as such.
-[runtime.container.image_env]
-
 # Arguments that only instrument a run; reported, excluded from the
-# functional hash.
+# functional hash. This list is closed: an overlay cannot extend it.
 [harness]
 args = ["enable-prompt-tokens-details", "profiler-config"]
 

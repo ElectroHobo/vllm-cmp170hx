@@ -12,8 +12,8 @@ import threading
 
 import pytest
 
-from canon import canonical_sha256, sha256_file
-from helpers import World, git, head, promote, read_record, write
+from canon import canonical_sha256
+from helpers import BUILD, World, add_build, git, head, promote, publish, read_record, write
 from treestate import MANIFEST, STAMP, build_owned_sha256
 
 
@@ -32,30 +32,8 @@ def only(d, *expected):
     assert set(reasons(d)) == set(expected), reasons(d)
 
 
-# -- build-owned manifests for the fake tree -------------------------------------
-
-def add_build(tree: str, files: dict[str, str], *, source: str = "built_in_place",
-              native: str | None = "n" * 64, stamp: bool = True) -> dict:
-    for rel, text in files.items():
-        write(os.path.join(tree, rel), text)
-    owned = {rel: sha256_file(os.path.join(tree, rel)) for rel in files}
-    man = {"schema": "build-owned/1", "source": source, "commit": head(tree), "files": owned,
-           "native_manifest_sha256": native, "build_owned_sha256": build_owned_sha256(owned)}
-    write(os.path.join(tree, MANIFEST), json.dumps(man))
-    if stamp:
-        write(os.path.join(tree, STAMP), json.dumps(
-            {"schema": "build-stamp/1", "commit": head(tree), "native_manifest_sha256": native,
-             "build_owned_sha256": man["build_owned_sha256"]}))
-    return man
-
-
-BUILD = {"vllm/_C.abi3.so": "native-lib", "vllm/third_party/kern/compaction.py": "x = 1\n",
-         "vllm/_version.py": "v = 1\n"}
-
-
 @pytest.fixture
 def built(w):
-    add_build(w.tree, BUILD)
     promote(w, ["tp2", "pp2"])
     d = w.resolve()
     assert d["validated"]["state"] == "VALIDATED", reasons(d)
@@ -92,7 +70,7 @@ def test_pin_only_engine_change(built):
     write(os.path.join(built.tree, "README"), "doc\n")
     git(built.tree, "add", "README")
     git(built.tree, "commit", "-q", "-m", "doc")
-    add_build(built.tree, BUILD)
+    add_build(built.tree)
     pins = open(os.path.join(built.settings, "pins.env")).read()
     old = pins.split("ENGINE_COMMIT=")[1].split("\n")[0]
     write(os.path.join(built.settings, "pins.env"), pins.replace(old, head(built.tree)))
@@ -103,12 +81,12 @@ def test_tree_at_uncertified_commit(built):
     write(os.path.join(built.tree, "README"), "doc\n")
     git(built.tree, "add", "README")
     git(built.tree, "commit", "-q", "-m", "doc")
-    add_build(built.tree, BUILD)
+    add_build(built.tree)
     only(built.resolve(), "tree ≠ pin", "engine not in receipt")
 
 
 def test_natives_replaced(built):
-    add_build(built.tree, BUILD, native="m" * 64)
+    add_build(built.tree, natives="natives-2")
     only(built.resolve(), "natives ≠ receipt")
 
 
@@ -131,18 +109,15 @@ def test_unowned_is_dirty(built, rel):
     first = d["engine_target"]["dirty_paths"]["unowned"][0]
     assert first["path"] == rel
     write(os.path.join(built.tree, rel), "{\"a\": 1}\n")
-    assert built.resolve()["engine_target"]["dirty_paths"]["unowned"][0]["sha256"] != first["sha256"]
+    again = built.resolve()["engine_target"]
+    assert again["dirty_paths"]["unowned"][0]["sha256"] != first["sha256"]
+    assert again["state_sha256"] != d["engine_target"]["state_sha256"]
 
 
 @pytest.mark.parametrize("rel", ["x.py.bak-20261016", "run.log", "vllm/__pycache__/a.pyc", "docs/n.md"])
 def test_exempt_is_clean(built, rel):
     write(os.path.join(built.tree, rel), "x")
     assert built.resolve()["validated"]["state"] == "VALIDATED"
-
-
-def test_tracked_change_is_dirty(built):
-    write(os.path.join(built.tree, "csrc", "kernel.cu"), "// edited\n")
-    only(built.resolve(), "dirty tree")
 
 
 def test_changed_requires_file_same_commit(built):
@@ -176,14 +151,14 @@ def test_provenance_metadata_tamper(built, tamper):
 
 
 def test_adopted_never_validated(built):
-    add_build(built.tree, BUILD, source="adopted")
+    add_build(built.tree, source="adopted")
     assert "adopted tree" in reasons(built.resolve())
 
 
 def linked_world(tmp_path, *, change_build_input: bool):
     """vllm-src at commit A with a manifest; a worktree whose artefacts are
     symlinks into it, at commit A or a later commit B."""
-    w = World(tmp_path)
+    w = World(tmp_path, build=False)
     src = os.path.join(w.tmp, "src")
     shutil.copytree(w.tree, src, symlinks=True)
     src_man = add_build(src, {"vllm/_C.abi3.so": "native-lib"}, stamp=False)
@@ -193,28 +168,33 @@ def linked_world(tmp_path, *, change_build_input: bool):
     git(w.tree, "add", rel)
     git(w.tree, "commit", "-q", "-m", "next")
     os.symlink(os.path.join(src, "vllm/_C.abi3.so"), os.path.join(w.tree, "vllm/_C.abi3.so"))
-    owned = {"vllm/_C.abi3.so": src_man["files"]["vllm/_C.abi3.so"]}
+    write(os.path.join(w.tree, "vllm/_version.py"), "v = 2\n")
+    from canon import sha256_file
+    owned = {"vllm/_C.abi3.so": src_man["files"]["vllm/_C.abi3.so"],
+             "vllm/_version.py": sha256_file(os.path.join(w.tree, "vllm/_version.py"))}
     man = {"schema": "build-owned/1", "source": "linked", "commit": a, "files": owned,
-           "native_manifest_sha256": None, "build_owned_sha256": build_owned_sha256(owned),
+           "native_manifest_sha256": src_man["native_manifest_sha256"],
+           "native_manifest_path": src_man["native_manifest_path"],
+           "build_owned_sha256": build_owned_sha256(owned),
            "linked_from": {"tree": src, "commit": a, "build_owned_sha256": src_man["build_owned_sha256"]}}
     write(os.path.join(w.tree, MANIFEST), json.dumps(man))
     pins = open(os.path.join(w.settings, "pins.env")).read()
     write(os.path.join(w.settings, "pins.env"), pins.replace(pins.split("ENGINE_COMMIT=")[1].split("\n")[0], head(w.tree)))
     assert w.verify() == 0
-    return w, src
+    return w, src, man
 
 
 def test_linked_compatible_clean(tmp_path):
-    w, _ = linked_world(tmp_path, change_build_input=False)
-    d = w.resolve()
-    et = d["engine_target"]
+    w, _, _ = linked_world(tmp_path, change_build_input=False)
+    et = w.resolve()["engine_target"]
     assert not et["dirty"] and not et["cross_commit_artifacts"], et["dirty_paths"]
 
 
 def test_linked_cross_commit(tmp_path):
-    w, _ = linked_world(tmp_path, change_build_input=True)
+    w, _, _ = linked_world(tmp_path, change_build_input=True)
     d = w.resolve()
     assert d["engine_target"]["cross_commit_artifacts"] and not d["engine_target"]["dirty"]
+    assert "cross-commit artefacts" in reasons(d)        # candidates see it too
     promote(w, ["tp2"])
     assert "cross-commit artefacts" not in reasons(w.resolve())   # the receipt names this build
     r = json.load(open(os.path.join(w.settings, "validated", "receipt.json")))
@@ -224,10 +204,40 @@ def test_linked_cross_commit(tmp_path):
 
 
 def test_linked_source_rebuilt(tmp_path):
-    w, src = linked_world(tmp_path, change_build_input=False)
+    w, src, _ = linked_world(tmp_path, change_build_input=False)
     write(os.path.join(src, "vllm/_C.abi3.so"), "rebuilt")
-    d = w.resolve()
-    assert "modified_owned" in d["engine_target"]["dirty_paths"]
+    assert "modified_owned" in w.resolve()["engine_target"]["dirty_paths"]
+
+
+def test_linked_claims_extra_owned_file(tmp_path):
+    """A self-consistent map plus file edit: an arbitrary runtime file added
+    to the owned map, with map hash and file in step."""
+    w, _, man = linked_world(tmp_path, change_build_input=False)
+    from canon import sha256_file
+    write(os.path.join(w.tree, "vllm/extra_hook.py"), "import os\n")
+    man["files"]["vllm/extra_hook.py"] = sha256_file(os.path.join(w.tree, "vllm/extra_hook.py"))
+    man["build_owned_sha256"] = build_owned_sha256(man["files"])
+    write(os.path.join(w.tree, MANIFEST), json.dumps(man))
+    bad = w.resolve()["engine_target"]["dirty_paths"]["metadata_invalid"]
+    assert any("neither linked nor written" in b for b in bad)
+
+
+def test_built_map_without_record_or_different_record(built):
+    m = json.load(open(os.path.join(built.tree, MANIFEST)))
+    rec = m.pop("build_record")
+    write(os.path.join(built.tree, MANIFEST), json.dumps(m))
+    assert "dirty tree" in reasons(built.resolve())
+    add_build(built.tree)
+    write(rec["path"], json.dumps({"schema": "build-record/1", "files": {"x": "0" * 64}}))
+    bad = built.resolve()["engine_target"]["dirty_paths"]["metadata_invalid"]
+    assert any("build record" in b for b in bad)
+
+
+def test_native_manifest_file_modified(built):
+    m = json.load(open(os.path.join(built.tree, MANIFEST)))
+    write(m["native_manifest_path"], json.dumps({"natives": "edited"}))
+    bad = built.resolve()["engine_target"]["dirty_paths"]["metadata_invalid"]
+    assert any("native manifest" in b for b in bad)
 
 
 # -- generations --------------------------------------------------------------------
@@ -239,7 +249,6 @@ def test_generation_pointer_and_swap_mid_read(w):
     promote(w, ["tp2"], generation="1")
     assert w.resolve()["validated"]["state"] == "VALIDATED"
     sd = SettingsDir(w.settings)
-    d2 = w.resolve(layout="tp1")
     swapped = []
 
     def swap():
@@ -249,12 +258,11 @@ def test_generation_pointer_and_swap_mid_read(w):
                                  kwargs={"generation": "2", "gate": "gate-2"})
             t.start()
             t.join(0.5)   # the writer needs no lock: it renames the pointer
-    gen = validated.read_generation(sd, "tp2", between=swap)
+    gen = validated.read_generation(sd, between=swap)
     r = json.loads(gen.receipt)
-    v = json.loads(gen.layout_file)
+    v = json.loads(gen.layout("tp2"))
     assert r["layouts"]["tp2"]["gate_record"] == v["gate_record"]
     assert os.path.realpath(os.path.join(w.settings, "validated")).endswith("validated.d/2")
-    _ = d2
 
 
 def test_prune_waits_for_reader_and_lock_not_inherited(w):
@@ -278,7 +286,7 @@ def test_prune_waits_for_reader_and_lock_not_inherited(w):
         t.start()
         t.join(0.3)
         events.append("reader-done")
-    validated.read_generation(SettingsDir(w.settings), "tp2", between=between)
+    validated.read_generation(SettingsDir(w.settings), between=between)
     t.join(5)
     assert events == ["reader-done", "prune"]
     p = w.run()
@@ -288,12 +296,33 @@ def test_prune_waits_for_reader_and_lock_not_inherited(w):
 
 
 def test_tree_hash_ignores_pointer_form(w):
-    from settings_dir import SettingsDir
     promote(w, ["tp2"])
-    plain = SettingsDir(w.settings).tree_sha256()
+    plain = w.resolve()["settings"]["tree_sha256"]
     shutil.rmtree(os.path.join(w.settings, "validated"))
     promote(w, ["tp2"], generation="1")
-    assert SettingsDir(w.settings).tree_sha256() == plain
+    assert w.resolve()["settings"]["tree_sha256"] == plain
+
+
+def test_full_build_reads_one_generation_with_staging_pointer(w):
+    """A publisher paused with validated.new present: the launch still reads,
+    and receipt, validated statement and settings hashes come from one
+    generation."""
+    import main
+    shutil.rmtree(os.path.join(w.settings, "validated"))
+    promote(w, ["tp2"], generation="1")
+    files = {name: open(os.path.join(w.settings, "validated.d", "1", name), "rb").read()
+             for name in os.listdir(os.path.join(w.settings, "validated.d", "1"))}
+    files["tp2.json"] = files["tp2.json"].replace(b"gate-synth-1", b"gate-synth-2")
+    seen = {}
+
+    def during():
+        seen["doc"] = main.build(main.parse_args(w.base_args()), w.env())
+    publish(w.settings, files, "2", pause_before_rename=during)
+    d = seen["doc"]
+    assert d["validated"]["generation"] == "1" and d["validated"]["state"] == "VALIDATED"
+    import hashlib
+    assert d["settings"]["files"]["validated/tp2.json"] == hashlib.sha256(
+        open(os.path.join(w.settings, "validated.d", "1", "tp2.json"), "rb").read()).hexdigest()
 
 
 # -- candidate and final ---------------------------------------------------------------
@@ -303,7 +332,25 @@ def test_candidate_matches_its_frozen_launch(w, tmp_path):
     frozen.write_text(json.dumps(w.resolve()))
     d = w.resolve("--role", "candidate", "--expect", str(frozen))
     assert d["expected"]["functional_match"] is True
-    assert d["validated"]["state"] == "NOT_VALIDATED" and "no receipt" in reasons(d)
+    only(d, "no receipt")
+
+
+@pytest.mark.parametrize("damage", ["tracked", "metadata", "adopted"])
+def test_candidate_still_reports_tree_problems(w, tmp_path, damage):
+    frozen = tmp_path / "expected.json"
+    frozen.write_text(json.dumps(w.resolve()))
+    if damage == "tracked":
+        write(os.path.join(w.tree, "csrc", "kernel.cu"), "// edited\n")
+    elif damage == "metadata":
+        s = json.load(open(os.path.join(w.tree, STAMP)))
+        s["commit"] = "1" * 40
+        write(os.path.join(w.tree, STAMP), json.dumps(s))
+    else:
+        add_build(w.tree, source="adopted")
+    d = w.resolve("--role", "candidate", "--expect", str(frozen))
+    assert d["expected"]["functional_match"] is True
+    assert "no receipt" in reasons(d)
+    assert ("adopted tree" if damage == "adopted" else "dirty tree") in reasons(d)
 
 
 def test_intentional_change_versus_accident(w, tmp_path):
@@ -319,6 +366,8 @@ def test_intentional_change_versus_accident(w, tmp_path):
     bad = w.resolve("--set", "env.VLLM_KERNEL_X=1", "--expect", str(frozen))
     assert bad["expected"]["functional_match"] is False
     assert bad["expected"]["env_differs"] == ["VLLM_KERNEL_X"]
+    p = w.run("--set", "env.VLLM_KERNEL_X=1", "--expect", str(frozen))
+    assert p.returncode == 3 and "differs from the expected launch" in p.stderr
 
 
 def test_final_without_receipt_refused(w):
@@ -327,6 +376,35 @@ def test_final_without_receipt_refused(w):
     assert "never treated as a candidate" in w.refused("--role", "final")
     promote(w, ["tp2"])
     assert "must not carry a receipt" in w.refused("--role", "candidate")
+
+
+# -- receipt structure: missing never equals missing ------------------------------------------
+
+@pytest.mark.parametrize("field,edit", [
+    ("pins", lambda r: r.update(pins={})),
+    ("pins.TARGET_REVISION", lambda r: r["pins"].pop("TARGET_REVISION")),
+    ("engines", lambda r: r.update(engines=[])),
+    ("engines.build_owned", lambda r: r["engines"][0].update(build_owned_sha256=None)),
+    ("engines.natives", lambda r: r["engines"][0].update(native_manifest_sha256=None)),
+    ("checkpoints", lambda r: r.update(checkpoints={})),
+    ("layouts", lambda r: r.update(layouts={})),
+])
+def test_receipt_field_removed(built, field, edit):
+    p = os.path.join(built.settings, "validated", "receipt.json")
+    r = json.load(open(p))
+    edit(r)
+    write(p, json.dumps(r))
+    d = built.resolve()
+    assert d["validated"]["state"] == "NOT_VALIDATED", field
+
+
+def test_tree_without_build_identity_not_validated(tmp_path):
+    w = World(tmp_path, build=False)
+    assert w.verify() == 0
+    promote(w, ["tp2"])
+    d = w.resolve()
+    assert d["validated"]["state"] == "NOT_VALIDATED"
+    assert "build ≠ receipt" in reasons(d) or "receipt malformed" in " ".join(reasons(d))
 
 
 # -- adversarial inputs and schemas ----------------------------------------------------
@@ -397,5 +475,6 @@ def test_exec_matches_printed(w):
     assert p.stderr.startswith("VALIDATED synth-dense tp2")
     argv, env = read_record(w.venv)
     assert argv == d["argv"]
+    assert set(env) == set(d["child_env"])
     assert {k: v for k, v in env.items() if d["child_env"][k]["class"] == "functional"} == d["env_functional"]
     assert canonical_sha256({"argv": d["argv_functional"], "env": d["env_functional"]}) == d["functional_sha256"]

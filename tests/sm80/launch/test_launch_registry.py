@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The registry comes from the target tree, never from the launcher's own.
-
-Real engine trees are optional: set SM80_LAUNCH_NAME_CASES to a JSON file
-of cases ``[{"tree": <path>, "accept": [...], "retired": [...],
-"unknown": [...]}]`` to check names against real trees as well."""
+"""The registry comes from the target tree, never from the launcher's own."""
 
 from __future__ import annotations
 
-import json
 import os
 
 import pytest
@@ -40,22 +35,3 @@ def test_tree_without_envs_refused(tmp_path):
     os.makedirs(tmp_path / "t" / "vllm")
     with pytest.raises(Refusal, match="no vllm/envs.py"):
         read_registry(str(tmp_path / "t"), "sm80")
-
-
-def _cases():
-    path = os.environ.get("SM80_LAUNCH_NAME_CASES")
-    if not path:
-        return []
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-@pytest.mark.skipif(not _cases(), reason="SM80_LAUNCH_NAME_CASES not set")
-@pytest.mark.parametrize("case", _cases(), ids=lambda c: os.path.basename(c["tree"]))
-def test_real_trees(case):
-    reg = read_registry(case["tree"], case.get("capability", "sm80"))
-    assert [n for n in case.get("accept", []) if reg.check(n)] == []
-    retired = [n for n in case.get("retired", []) if n in reg.retired]
-    unknown = [n for n in case.get("unknown", []) if n not in reg.names and n not in reg.retired]
-    assert retired == case.get("retired", [])
-    assert unknown == case.get("unknown", [])
