@@ -73,6 +73,33 @@ def test_variant_with_layout_subtable_and_unset(w):
     assert d["unset"]["args.trust-remote-code"] == "variant"
 
 
+@pytest.mark.parametrize("text, key", [
+    ('[env]\nVLLM_FAST_PATH = { value = "1", why = "x" }\nunset_here = ["env.VLLM_FAST_PATH"]\n',
+     "env.VLLM_FAST_PATH"),
+    ('[args]\nmax-num-seqs = 4\nunset_here = ["args.max_num_seqs"]\n', "args.max-num-seqs"),
+    ('[args.compilation-config]\nlevel = 1\nunset_here = ["args.compilation-config.level"]\n',
+     "args.compilation-config.level"),
+    ('[location]\nTMPDIR = "/x"\nunset_here = ["loc.TMPDIR"]\n', "loc.TMPDIR"),
+    ('[layout.pp2]\nunset = ["args.block-size"]\n[layout.pp2.args]\nblock-size = 16\n',
+     "args.block-size"),
+])
+@pytest.mark.parametrize("kind", ["variant", "overlay"])
+def test_key_both_set_and_unset_in_one_table_refused(w, tmp_path, text, key, kind):
+    """One table that both sets and unsets a key contradicts itself: refused
+    (variant and overlay files alike), whichever layout it targets."""
+    head = f'schema = "launch-{kind}/1"\n'
+    if "unset_here" in text:
+        body, _, unset = text.partition("unset_here = ")
+        text = f"unset = {unset}" + body       # top-level keys come before tables
+    path = write(str(tmp_path / f"{kind}.toml"), head + text)
+    if kind == "variant":
+        write(os.path.join(w.settings, "variants", "both.toml"), head + text)
+        assert "both set" in w.refused("--variant", "both", layout="pp2") and key in w.refused(
+            "--variant", "both", layout="pp2")
+    else:
+        assert "both set" in w.refused("--overlay", path, "--experiment", "e", layout="pp2")
+
+
 def test_user_knobs(w, tmp_path):
     env = write(str(tmp_path / "user.env"),
                 "PORT=9001\nPLACEMENT=ram\nMM_CAP=1\nMM_MAX_PIXELS=1568\nAPI_KEY='s3cret'\n"
@@ -259,14 +286,14 @@ def cuda_homes(w) -> tuple[str, str]:
 @pytest.mark.parametrize("line, native, container", [
     ("", "/usr/local/cuda", "/usr/local/cuda"),
     ('cuda_home = "/opt/cuda-13.3"', "/opt/cuda-13.3", "/usr/local/cuda"),
-    ('cuda_home = { native = "/opt/cuda-13.3", container = "/usr/local/cuda-13.3" }',
-     "/opt/cuda-13.3", "/usr/local/cuda-13.3"),
-    ('cuda_home = { container = "/usr/local/cuda-13.3" }', "/usr/local/cuda", "/usr/local/cuda-13.3"),
+    ('cuda_home = { native = "/opt/cuda-13.3", container = "/usr/local/cuda" }',
+     "/opt/cuda-13.3", "/usr/local/cuda"),
     ('cuda_home = { native = "/opt/cuda-13.3" }', "/opt/cuda-13.3", "/usr/local/cuda"),
 ])
 def test_hardware_cuda_home_per_runtime(w, line, native, container):
     """A plain cuda_home names the native CUDA only; a { native, container }
-    table names it per runtime; a runtime it leaves out keeps the default."""
+    table names it per runtime (the container entry can only restate the
+    image's CUDA_HOME); a runtime it leaves out keeps the default."""
     with_cuda_home(w, line)
     assert cuda_homes(w) == (native, container)
 
@@ -288,7 +315,12 @@ def test_plain_cuda_home_resolves_as_before(w):
     ('cuda_home = { native = 13 }', "cuda_home.native: not a directory name"),
     ('cuda_home = { native = "" }', "cuda_home.native: not a directory name"),
     ("cuda_home = 13", "a directory name or a { native, container } table"),
+    ('cuda_home = { container = "/usr/local/cuda-13.3" }', "differs from the image's CUDA_HOME"),
+    ('cuda_home = { native = "/opt/cuda", container = "/usr/local/cuda-13.3" }',
+     "differs from the image's CUDA_HOME"),
 ])
 def test_hardware_cuda_home_malformed_refused(w, line, expect):
+    """Refused natively too: a settings error shows before any container runs."""
     with_cuda_home(w, line)
     assert expect in w.refused()
+    assert expect in w.refused("--runtime", "container", "--tree", w.tree)

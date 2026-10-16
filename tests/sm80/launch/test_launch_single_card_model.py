@@ -3,7 +3,10 @@
 """A settings directory of another shape: LiquidAI/LFM2.5-24B-A2B (lfm2_moe,
 BF16, one card, 131072 context, its own reasoning and tool-call parsers, no
 draft model, no speculative decoding, no fork switches, no required fork
-natives). It resolves, launches and validates with only what it declares."""
+natives). It resolves and validates with only what it declares, and the
+launcher execs the recording server stub with that command. The stub and
+the synthetic argument file accept any parser name: whether the engine
+registers the parsers named here is not checked by these tests."""
 from __future__ import annotations
 
 import json
@@ -40,7 +43,7 @@ served-model-name = "LFM2.5-24B-A2B"
 max-model-len = { value = 131072, why = "The model's full context." }
 dtype = "bfloat16"
 max-num-seqs = 8
-reasoning-parser = { value = "lfm2", why = "The model always thinks first; the parser splits the thinking from the answer." }
+reasoning-parser = { value = "deepseek_r1", why = "The chat template opens the thinking block in the generation prompt; this parser splits the thinking from the answer when the start token is absent." }
 tool-call-parser = { value = "lfm2", why = "The model writes tool calls as Python calls." }
 enable-auto-tool-choice = true
 """
@@ -161,12 +164,15 @@ def test_resolves_with_only_its_own_settings(w):
                          "host"}
     a = d["argv"]
     assert a[a.index("--tensor-parallel-size") + 1] == "1"
-    assert a[a.index("--reasoning-parser") + 1] == a[a.index("--tool-call-parser") + 1] == "lfm2"
+    assert a[a.index("--reasoning-parser") + 1] == "deepseek_r1"
+    assert a[a.index("--tool-call-parser") + 1] == "lfm2"
     assert d["child_env"]["CUDA_VISIBLE_DEVICES"]["value"] == "0"
     assert_own_shape(d)
 
 
-def test_validates_and_launches_on_one_card(w):
+def test_validates_and_execs_the_server_stub_on_one_card(w):
+    """VALIDATED on one card; the exec'd stub records exactly the resolved
+    command and no fork or NCCL name (a recording stub, not a server)."""
     promote(w, ["tp1"])
     d = w.resolve(layout="tp1")
     assert d["validated"]["state"] == "VALIDATED", d["validated"]

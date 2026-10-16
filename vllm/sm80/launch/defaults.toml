@@ -145,6 +145,16 @@ names = ["LANG", "TERM", "TZ", "USER", "LOGNAME", "SHELL", "PWD",
          "DBUS_SESSION_BUS_ADDRESS", "SHLVL", "OLDPWD", "_", "HOSTNAME",
          "MAIL", "MOTD_SHOWN", "LS_COLORS", "COLORTERM", "INVOCATION_ID",
          "JOURNAL_STREAM", "SYSTEMD_EXEC_PID",
-         # base-image package metadata (CUDA images); the engine does not read it
-         "NVARCH", "NVIDIA_PRODUCT_NAME"]
-prefixes = ["LC_", "SSH_", "XDG_", "NV_"]
+         # base-image package metadata of the image above (by name: any
+         # other NV_* name stays unclassified); the engine does not read it
+         "NVARCH", "NVIDIA_PRODUCT_NAME",
+         "NV_CUDA_CUDART_DEV_VERSION", "NV_CUDA_CUDART_VERSION", "NV_CUDA_LIB_VERSION",
+         "NV_CUDA_NSIGHT_COMPUTE_DEV_PACKAGE", "NV_CUDA_NSIGHT_COMPUTE_VERSION",
+         "NV_LIBCUBLAS_DEV_PACKAGE", "NV_LIBCUBLAS_DEV_PACKAGE_NAME", "NV_LIBCUBLAS_DEV_VERSION",
+         "NV_LIBCUBLAS_PACKAGE", "NV_LIBCUBLAS_PACKAGE_NAME", "NV_LIBCUBLAS_VERSION",
+         "NV_LIBCUSPARSE_DEV_VERSION", "NV_LIBCUSPARSE_VERSION",
+         "NV_LIBNCCL_DEV_PACKAGE", "NV_LIBNCCL_DEV_PACKAGE_NAME", "NV_LIBNCCL_DEV_PACKAGE_VERSION",
+         "NV_LIBNCCL_PACKAGE", "NV_LIBNCCL_PACKAGE_NAME", "NV_LIBNCCL_PACKAGE_VERSION",
+         "NV_LIBNPP_DEV_PACKAGE", "NV_LIBNPP_DEV_VERSION", "NV_LIBNPP_PACKAGE",
+         "NV_LIBNPP_VERSION", "NV_NVML_DEV_VERSION", "NV_NVTX_VERSION"]
+prefixes = ["LC_", "SSH_", "XDG_"]

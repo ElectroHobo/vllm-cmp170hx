@@ -254,7 +254,9 @@ def test_settings_value_of_an_image_name_wins(w):
 
 @pytest.mark.parametrize("name, value", [("LD_PRELOAD", "/x.so"), ("FOO_DEBUG", "1"),
                                          ("HF_TOKEN", "t"), ("VLLM_PORT", "1"), ("HOME", "/root"),
-                                         ("SESSION_JOB", "j")])
+                                         ("SESSION_JOB", "j"), ("CUDA_MODULE_LOADING", "EAGER"),
+                                         ("NCCL_DEBUG", "INFO"), ("PYTHONHASHSEED", "0"),
+                                         ("NV_NEW_PACKAGE", "1")])
 def test_image_env_names_outside_the_image_classes_are_refused(name, value):
     from envclass import ClassTable
     from errors import Refusal
@@ -264,3 +266,16 @@ def test_image_env_names_outside_the_image_classes_are_refused(name, value):
     assert code == {n: IMAGE_ENV[n] for n in ("CUDA_HOME", "LD_LIBRARY_PATH", "LIBRARY_PATH", "VIRTUAL_ENV")}
     with pytest.raises(Refusal, match=name):
         _image_env({**IMAGE_ENV, name: value}, table)
+
+
+@pytest.mark.parametrize("runtime", ["native", "container"])
+def test_only_the_image_nv_names_are_inert(w, runtime):
+    """The image's NV_* names are inert by name; another NV_* name is
+    unclassified, so it never reaches the server."""
+    from envclass import ClassTable
+    table = ClassTable(_defaults()["classes"], [])
+    assert {table.classify(n) for n in IMAGE_ENV if n.startswith("NV_")} == {"inert"}
+    assert table.classify("NV_NEW_PACKAGE") == "unclassified"
+    d = w.resolve("--runtime", runtime, "--tree", w.tree, environ=w.env(NV_NEW_PACKAGE="1"))
+    assert "NV_NEW_PACKAGE" in d["dropped"] and "NV_NEW_PACKAGE" not in d["child_env"]
+    assert d["validated"]["state"] == "VALIDATED" or runtime == "container"

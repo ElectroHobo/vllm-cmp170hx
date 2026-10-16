@@ -48,6 +48,16 @@ from registry import ArgOptions, Registry
 from settings_dir import check_arg_spellings, normalize_arg_name, normalize_key
 
 LOCKED_LAYERS = ("overlay", "user", "ambient", "cli")   # [fixed] needs --experiment
+
+# Functional-class names the container image's ENV may carry. They reach the
+# server outside the functional hash, so only names that change no output
+# are listed; any other functional name in the image ENV is refused.
+IMAGE_FUNCTIONAL = {
+    "CUDA_VERSION": "base-image package metadata; the engine and its libraries do not read it",
+    "NCCL_VERSION": "base-image package metadata; the engine and its libraries do not read it",
+    "PYTHONDONTWRITEBYTECODE": "the interpreter writes no .pyc files; nothing it runs changes",
+}
+
 RUNTIMES = ("native", "container")
 GEOMETRY_ARGS = ("args.tensor-parallel-size", "args.pipeline-parallel-size")
 GEOMETRY_ARGS_NAMES = tuple(k[5:] for k in GEOMETRY_ARGS)
@@ -128,7 +138,9 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
     """Apply one settings table (layout, variant, overlay, hardware, model).
 
     A [location] value may be ``{ native = "...", container = "..." }``:
-    only the current runtime's entry applies (none if it is missing)."""
+    only the current runtime's entry applies (none if it is missing). A key
+    the table both sets and unsets is refused."""
+    set_keys = [key for key in _TOP_KEYS if key in table]
     for key in _TOP_KEYS:
         if key in table:
             v = table[key]
@@ -143,6 +155,7 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
         key = "args." + normalize_arg_name(k)
         if key in GEOMETRY_ARGS:
             raise Refusal(f"{source}: set tp/pp, not --{key[5:]}")
+        set_keys.append(key)
         sub_whys: dict[str, str] = {}
         val, why = split_value(v, source, sub_whys)
         final.put(key, val, layer, source, why)
@@ -152,6 +165,7 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
         for k, v in table.get(section, {}).items():
             if not _ENV_NAME.match(k):
                 raise Refusal(f"{source}: {k!r} is not an environment name")
+            set_keys.append(prefix + k)
             val, why = split_value(v, source)
             if section == "location" and isinstance(val, dict):
                 if not set(val) <= set(RUNTIMES):
@@ -166,6 +180,10 @@ def apply_table(final: Final, table: dict, layer: str, source: str, *,
         key = normalize_key(key)
         if key in GEOMETRY_ARGS or key in ("tp", "pp", "cards"):
             raise Refusal(f"{source}: geometry cannot be unset")
+        both = [s for s in set_keys if s == key or s.startswith(key + ".") or key.startswith(s + ".")]
+        if both:
+            raise Refusal(f"{source}: {key} is both set ({', '.join(both)}) and unset in one table; "
+                          "keep one")
         final.drop(key, layer)
     if layout is not None:
         sub = table.get("layout", {}).get(layout)
@@ -880,8 +898,9 @@ def _image_env(image: dict, classes: ClassTable) -> tuple[dict[str, str], dict[s
     complete config Env) split into the code-loading values the launcher
     builds from it (all but PATH, which the launcher builds itself) and the
     functional or inert values the environment must hold unchanged.
-    Container-runtime names are passed as the runtime sets them; any other
-    class is refused, so every name of the image is classified."""
+    Container-runtime names are passed as the runtime sets them; functional
+    names only from ``IMAGE_FUNCTIONAL``; anything else is refused, so every
+    name of the image is classified and none it serves unhashed is read."""
     code: dict[str, str] = {}
     values: dict[str, str] = {}
     for name, value in image.items():
@@ -893,9 +912,12 @@ def _image_env(image: dict, classes: ClassTable) -> tuple[dict[str, str], dict[s
         if cls == "code-loading":
             if name != "PATH":
                 code[name] = value
-        elif cls in ("functional", "inert") and not name.startswith("VLLM_"):
+        elif cls == "inert" or (cls == "functional" and name in IMAGE_FUNCTIONAL):
             values[name] = value
+        elif cls == "functional":
+            raise Refusal(f"defaults: image_env {name} is functional and not a name the engine "
+                          "leaves unread (" + ", ".join(sorted(IMAGE_FUNCTIONAL)) + ")")
         elif cls != "container-runtime":
             raise Refusal(f"defaults: image_env {name} is class {cls}; the image ENV holds only "
-                          "code-loading, container-runtime, functional (not VLLM_*) or inert names")
+                          "code-loading, container-runtime, unread functional or inert names")
     return code, values

@@ -185,20 +185,26 @@ def checkpoint_paths(ns, ms, rt: dict, pins: dict, home: str) -> dict[str, str]:
     return out
 
 
-def hardware_cuda_home(hw: dict, runtime: str) -> str | None:
+def hardware_cuda_home(hw: dict, runtime: str, image_cuda_home: str | None) -> str | None:
     """The hardware file's CUDA for this runtime: ``cuda_home = "<dir>"``
     names the native CUDA only; ``cuda_home = { native = "<dir>",
     container = "<dir>" }`` names it per runtime (either may be left out).
-    None leaves the runtime default."""
+    None leaves the runtime default. A container entry must name the
+    image's CUDA_HOME (``[runtime.container.image_env]``): the image's own
+    environment sets it, so any other directory would differ from every
+    container's environment."""
     value = hw.get("cuda_home")
     if isinstance(value, dict):
         unknown = sorted(set(value) - {"native", "container"})
         if unknown:
             raise Refusal(f"hardware cuda_home: unknown runtime {', '.join(unknown)} (native, container)")
-        value = value.get(runtime)
-        if value is not None and (not isinstance(value, str) or not value):
-            raise Refusal(f"hardware cuda_home.{runtime}: not a directory name")
-        return value
+        for name, v in value.items():
+            if not isinstance(v, str) or not v:
+                raise Refusal(f"hardware cuda_home.{name}: not a directory name")
+        if "container" in value and value["container"] != image_cuda_home:
+            raise Refusal(f"hardware cuda_home.container {value['container']!r} differs from the "
+                          f"image's CUDA_HOME {image_cuda_home!r}")
+        return value.get(runtime)
     if value is not None and not isinstance(value, str):
         raise Refusal("hardware cuda_home: a directory name or a { native, container } table")
     return value if value and runtime == "native" else None
@@ -226,7 +232,8 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
         raise Refusal("--venv is required natively")
     policy = ns.policy or rt["policy"]
     hw = sd.toml(sd.named("hardware", ms.hardware), "launch-hardware")
-    cuda_home = hardware_cuda_home(hw, ns.runtime)
+    cuda_home = hardware_cuda_home(hw, ns.runtime,
+                                   defaults["runtime"]["container"].get("image_env", {}).get("CUDA_HOME"))
     if cuda_home:
         rt["cuda_home"] = cuda_home
     layout = ns.layout or ms.default_layout
