@@ -368,7 +368,7 @@ RAW = [["--no-enable-lora"], ["--no_enable_lora"], ["--no-enable-l"],
        ["--compilation-config.mode=0"], ["--compilation-config.mode", "0"],
        ["--compilation_config.mode", "0"], ["--compilation-conf.mode", "0"],
        ["--device-memory-utilization", "0.5"], ["--gpu-memory-util", "0.5"],
-       ["--max-model=1024"]]
+       ["--max-model=1024"], ["--max-model"], ["--max-model-len.x=1"]]
 
 
 @pytest.mark.parametrize("tokens", RAW)
@@ -524,3 +524,25 @@ def test_cache_directories_are_location(w, name):
     assert ClassTable(defaults["classes"], []).classify(name) == "location"
     d = w.resolve(environ=w.env(**{name: "/elsewhere"}))
     assert name in d["ignored"] and d["validated"]["state"] == "VALIDATED"
+
+
+# the cache locations of the published container recipes (docker/container.env)
+RECIPE_LOCATIONS = {
+    "HOME": "/cache", "HF_HOME": "/cache/huggingface", "XDG_CACHE_HOME": "/cache/.cache",
+    "TRITON_CACHE_DIR": "/cache/.triton/cache", "TORCHINDUCTOR_CACHE_DIR": "/cache/torchinductor",
+    "VLLM_CACHE_ROOT": "/cache/.cache/vllm", "FLASHINFER_WORKSPACE_BASE": "/cache",
+    "TMPDIR": "/cache/tmp", "TORCH_EXTENSIONS_DIR": "/cache/.cache/torch_extensions",
+    "TILELANG_CACHE_DIR": "/cache/.tilelang/cache", "TILELANG_TMP_DIR": "/cache/.tilelang/cache/tmp",
+    "CUDA_CACHE_PATH": "/cache/.nv/ComputeCache",
+}
+
+
+def test_container_locations_match_the_recipes(w):
+    d = w.resolve("--runtime", "container", "--tree", w.tree, "--venv", w.venv)
+    got = {k: v["value"] for k, v in d["child_env"].items() if v["class"] == "location"
+           and k != "CUDA_VISIBLE_DEVICES"}
+    assert got == RECIPE_LOCATIONS
+    # the same values in the environment of the container are equal, not a change
+    d = w.resolve("--runtime", "container", "--tree", w.tree, "--venv", w.venv,
+                  environ=w.env(**RECIPE_LOCATIONS))
+    assert set(RECIPE_LOCATIONS) <= set(d["ambient_equal"])

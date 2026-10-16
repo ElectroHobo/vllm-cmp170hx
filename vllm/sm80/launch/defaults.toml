@@ -30,11 +30,16 @@ hub_dirs = ["/cache/huggingface/hub", "/hf-hub"]
 [runtime.container.location]
 HOME = "/cache"
 HF_HOME = "/cache/huggingface"
-XDG_CACHE_HOME = "/cache"
-TRITON_CACHE_DIR = "/cache/triton"
+XDG_CACHE_HOME = "/cache/.cache"
+TRITON_CACHE_DIR = "/cache/.triton/cache"
 TORCHINDUCTOR_CACHE_DIR = "/cache/torchinductor"
-VLLM_CACHE_ROOT = "/cache/vllm"
+VLLM_CACHE_ROOT = "/cache/.cache/vllm"
 FLASHINFER_WORKSPACE_BASE = "/cache"
+TMPDIR = "/cache/tmp"
+TORCH_EXTENSIONS_DIR = "/cache/.cache/torch_extensions"
+TILELANG_CACHE_DIR = "/cache/.tilelang/cache"
+TILELANG_TMP_DIR = "/cache/.tilelang/cache/tmp"
+CUDA_CACHE_PATH = "/cache/.nv/ComputeCache"
 
 # Arguments that only instrument a run; reported, excluded from the
 # functional hash. This list is closed: an overlay cannot extend it.
