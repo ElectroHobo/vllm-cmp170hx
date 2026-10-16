@@ -626,6 +626,68 @@ def test_generated_inventory_still_fails_closed(fw, name):
     assert "must be full option names" in fw.refused()
 
 
+def frontend_world(tmp_path, source: str) -> World:
+    return World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS,
+                                        "vllm/entrypoints/launchers/cli_args.py": source})
+
+
+SHADOWED = {
+    "ClassVar": "    trust_request_chat_templ: ClassVar[bool] = False\n",
+    "InitVar": "    trust_request_chat_templ: InitVar[bool] = False\n",
+}
+
+
+@pytest.mark.parametrize("kind", sorted(SHADOWED))
+def test_pseudo_field_override_removes_inherited_option(tmp_path, kind):
+    """A subclass ClassVar/InitVar declaration removes the inherited field of
+    the same name, as dataclasses.fields does: the short name is no option,
+    is refused as a declaration, and on incoming channels is still the
+    abbreviation argparse expands to the protected full option."""
+    source = FRONTEND_ARGS.replace("from typing import ClassVar", "from dataclasses import InitVar\nfrom typing import ClassVar") \
+        .replace("    trust_request_chat_template: bool = False\n",
+                 "    trust_request_chat_template: bool = False\n    trust_request_chat_templ: bool = False\n") \
+        .replace('    response_role: str = "assistant"\n', '    response_role: str = "assistant"\n' + SHADOWED[kind])
+    w = frontend_world(tmp_path, source)
+    from registry import read_arg_options
+    opts = read_arg_options(w.tree)
+    assert "trust-request-chat-templ" not in opts.options and "trust-request-chat-template" in opts.options
+    text = model_text(w).replace('fixed = [', 'fixed = ["args.trust-request-chat-template", ', 1) \
+        .replace("trust-remote-code = true\n", "trust-remote-code = true\ntrust-request-chat-template = false\n")
+    write(os.path.join(w.settings, "model.toml"), text)
+    w.resolve()
+    assert "fixed by the settings" in w.refused("--", "--trust-request-chat-templ")
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=--trust-request-chat-templ\n")
+    w.refused("--env-file", env)
+    w.refused("--set", "args.trust-request-chat-templ=true")
+    w.resolve("--experiment", "e", "--", "--trust-request-chat-templ")
+    write(os.path.join(w.settings, "model.toml"),
+          text.replace('controlled_args = [', 'controlled_args = ["trust-request-chat-templ", ', 1))
+    assert "must be full option names" in w.refused()
+
+
+def test_field_redeclared_below_a_pseudo_field_is_an_option(tmp_path):
+    source = FRONTEND_ARGS.replace("    trust_request_chat_template: bool = False\n",
+                                   "    trust_request_chat_template: ClassVar[bool] = False\n") \
+        .replace('    response_role: str = "assistant"\n',
+                 '    response_role: str = "assistant"\n    trust_request_chat_template: bool = False\n')
+    from registry import read_arg_options
+    assert "trust-request-chat-template" in read_arg_options(frontend_world(tmp_path, source).tree).options
+
+
+@pytest.mark.parametrize("change", [
+    ("class FrontendArgs(BaseFrontendArgs):", "class FrontendArgs(ImportedArgs):"),
+    ("class FrontendArgs(BaseFrontendArgs):", "class FrontendArgs(BaseFrontendArgs, UnusedArgs):"),
+    ("@dataclass\nclass FrontendArgs(", "class FrontendArgs("),
+    ('    response_role: str = "assistant"\n', '    response_role: "str" = "assistant"\n'),
+])
+def test_unreadable_argument_class_refused(tmp_path, change):
+    """A shape the reader cannot follow exactly refuses the inventory."""
+    source = FRONTEND_ARGS.replace(*change)
+    assert source != FRONTEND_ARGS
+    w = frontend_world(tmp_path, source)
+    assert "argument class" in w.refused()
+
+
 def test_unprotected_spellings_allowed_with_aliases(alias_w):
     d = alias_w.resolve("--", "--enable-log-requests")
     assert d["argv"][-1] == "--enable-log-requests"

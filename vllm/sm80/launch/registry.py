@@ -196,29 +196,53 @@ def _generates(cls: ast.ClassDef) -> bool:
     return False
 
 
-def _class_var(annotation: ast.AST) -> bool:
-    node = annotation.value if isinstance(annotation, ast.Subscript) else annotation
-    name = node.attr if isinstance(node, ast.Attribute) else getattr(node, "id", "")
-    return name in ("ClassVar", "InitVar")
+_PSEUDO_FIELDS = ("ClassVar", "InitVar", "KW_ONLY")
+_DATACLASS_DECORATORS = ("dataclass", "config")
+
+
+def _type_name(node: ast.AST) -> str:
+    node = node.value if isinstance(node, ast.Subscript) else node
+    return node.attr if isinstance(node, ast.Attribute) else getattr(node, "id", "")
+
+
+def _dataclass(cls: ast.ClassDef) -> bool:
+    return any(_type_name(d.func if isinstance(d, ast.Call) else d) in _DATACLASS_DECORATORS
+               for d in cls.decorator_list)
 
 
 def _generated_options(module: ast.Module) -> set[str]:
     """Options of the frontend classes the module installs on a parser
     (``Cls.add_cli_args(parser)``) whose add_cli_args, own or inherited
     from a base class of the same module, generates option names: one
-    ``--field-name`` per dataclass field of the class and its same-module
-    bases (class-level annotated names, ClassVar and InitVar excluded), as
-    ``dataclasses.fields`` and ``key.replace('_', '-')`` give them."""
+    ``--field-name`` per field ``dataclasses.fields`` gives the class, named
+    as ``key.replace('_', '-')``.
+
+    The fields follow dataclass semantics: the class's bases are walked from
+    the root down and each class-level annotated name replaces an inherited
+    one, so a nearer ClassVar, InitVar or KW_ONLY declaration removes an
+    inherited field of the same name. Only shapes this reads exactly are
+    accepted; anything else (a base defined elsewhere, several bases, a
+    class in the chain that is not a dataclass, a string annotation) is a
+    refusal, so the inventory is never wrong without saying so."""
     classes = {c.name: c for c in module.body if isinstance(c, ast.ClassDef)}
 
     def chain(name: str) -> list[ast.ClassDef]:
-        out, todo = [], [name]
-        while todo:
-            c = classes.get(todo.pop(0))
-            if c is not None and c not in out:
-                out.append(c)
-                todo += [b.id for b in c.bases if isinstance(b, ast.Name)]
-        return out
+        """The class and its bases, nearest first (single inheritance only)."""
+        out = []
+        cls = classes[name]
+        while True:
+            if cls in out:
+                raise Refusal(f"argument class {cls.name}: cyclic bases")
+            out.append(cls)
+            bases = [b for b in cls.bases if not (isinstance(b, ast.Name) and b.id == "object")]
+            if not bases:
+                return out
+            if len(bases) != 1 or not isinstance(bases[0], ast.Name) or bases[0].id not in classes \
+                    or cls.keywords:
+                raise Refusal(f"argument class {cls.name}: bases "
+                              f"{', '.join(ast.unparse(b) for b in cls.bases)} cannot be read "
+                              "statically; its generated options are unknown")
+            cls = classes[bases[0].id]
 
     def generating(name: str) -> bool:
         for c in chain(name):               # nearest add_cli_args decides
@@ -232,14 +256,21 @@ def _generated_options(module: ast.Module) -> set[str]:
                  and n.func.attr == "add_cli_args" and isinstance(n.func.value, ast.Name)
                  and n.func.value.id in classes}
     out: set[str] = set()
-    for name in installed:
+    for name in sorted(installed):
         if not generating(name):
             continue
-        for c in chain(name):
+        fields: dict[str, bool] = {}        # name -> a real field (not a pseudo-field)
+        for c in reversed(chain(name)):
+            if not _dataclass(c):
+                raise Refusal(f"argument class {c.name} is not a dataclass the launcher can read; "
+                              "its generated options are unknown")
             for st in c.body:
-                if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) \
-                        and not _class_var(st.annotation):
-                    out.add(st.target.id.replace("_", "-"))
+                if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                    if isinstance(st.annotation, ast.Constant):
+                        raise Refusal(f"argument class {c.name}: string annotation of "
+                                      f"{st.target.id} cannot be read statically")
+                    fields[st.target.id] = _type_name(st.annotation) not in _PSEUDO_FIELDS
+        out |= {f.replace("_", "-") for f, real in fields.items() if real}
     return out
 
 
