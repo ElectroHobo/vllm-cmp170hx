@@ -32,7 +32,8 @@ from itertools import islice
 import torch
 
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
-from vllm.model_executor.models.utils import PPMissingLayer
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.models.deepseek_v41.nvidia import dspark as upstream_dspark
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
@@ -232,6 +233,16 @@ class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         DeepseekV4Model.adopt(self.language_model.model)
+        # Upstream builds the head unquantized (the base checkpoint's is
+        # BF16); the EXL3 checkpoint's head is packed, so it is built with
+        # the model's quantization config.
+        config = self.language_model.config
+        self.language_model.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{maybe_prefix(prefix, 'language_model')}.lm_head",
+        )
 
 
 class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):

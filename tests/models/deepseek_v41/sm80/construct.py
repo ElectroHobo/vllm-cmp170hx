@@ -176,3 +176,34 @@ def build_model(config: VllmConfig) -> torch.nn.Module:
     assert model_cls is not None, architecture
     with set_current_vllm_config(config), set_default_torch_dtype(torch.bfloat16):
         return model_cls(vllm_config=config, prefix="")
+
+
+class _EngramTable(torch.nn.Module):
+    """A parameter-free Engram table, as the sm_80 Engram storage builds
+    (its rows come from the base checkpoint, not from the EXL3 directory)."""
+
+    def __init__(self, n_hash_cols: int, tp_size: int):
+        super().__init__()
+        self.dp_size = 1
+        self.tp_size = tp_size
+        self.n_hash_cols = n_hash_cols
+        self.part_n_hash_cols = n_hash_cols // tp_size
+        self.cpu_offload = True
+
+
+def stub_engram_tables(monkeypatch, tp_size: int) -> None:
+    """Build Engram layers with :class:`_EngramTable` tables: the sm_80
+    storage opens the base checkpoint's table files, which no construction
+    test has."""
+    from vllm.models.deepseek_v41.common import engram
+
+    def create(self, layout, layer_hash_index):
+        return _EngramTable(
+            (layout.max_ngram_size - 1) * layout.n_heads, tp_size
+        )
+
+    monkeypatch.setattr(engram.Engram, "_create_embedding", create)
+    # The n-gram hash state loads the tokenizer: runtime state, not weights.
+    from vllm.models.deepseek_v41.nvidia import model
+
+    monkeypatch.setattr(model, "NgramHashState", lambda *args, **kwargs: None)

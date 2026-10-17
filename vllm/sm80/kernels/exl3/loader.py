@@ -68,6 +68,13 @@ class Exl3ModelLoader(DefaultModelLoader):
         self.counter_after_loading_weights = time.perf_counter()
 
 
+def require_cuda_parameters(model: nn.Module) -> None:
+    """Refuse a loaded EXL3 model with a parameter off the GPU."""
+    for name, parameter in model.named_parameters():
+        if not parameter.is_cuda:
+            raise ValueError(f"EXL3 parameter must remain CUDA-owned: {name}")
+
+
 def manifest_still_needed(vllm_config, is_draft: bool) -> bool:
     """Whether a draft model will still be built from the target's EXL3 config.
 
@@ -125,6 +132,8 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
             method = getattr(module, "quant_method", None)
             if isinstance(method, Exl3LinearMethod):
                 bias_offset = 0
+                for key in method.nonlocal_keys:
+                    ledger.mark(key, "unused", "group assigned to another TP rank")
                 for weight in module.exl3_weights:
                     weight.load(files, ledger)
                     bias_key = f"{weight.matrix.prefix}.bias"
@@ -190,9 +199,7 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     }
     if missing:
         raise ValueError(f"Unloaded EXL3 runtime parameters: {sorted(missing)[:16]}")
-    for name, parameter in model.named_parameters():
-        if not parameter.is_cuda:
-            raise ValueError(f"EXL3 parameter must remain CUDA-owned: {name}")
+    require_cuda_parameters(model)
     counts = Counter(disposition for disposition, _ in ledger.entries.values())
     logger.info(
         "EXL3 packed format, BF16 activations; %s model; PLE placement=%s; "

@@ -340,6 +340,8 @@ class Exl3LinearMethod(LinearMethodBase):
         # LM head: (offset, width, partition) of this rank's vocabulary in the
         # H128 blocks it computes; None for other layers.
         self.head_columns: tuple[int, int, int] | None = None
+        # Keys of the matrices other ranks hold (grouped projections).
+        self.nonlocal_keys: list[str] = []
 
     def create_weights(
         self,
@@ -522,6 +524,13 @@ class Exl3GroupedLinearMethod(Exl3LinearMethod):
         if groups % size or output_size % groups:
             raise ValueError(f"EXL3 cannot split {groups} groups over {size} ranks")
         local, group_out = groups // size, output_size // groups
+        mine = range(layer.tp_rank * local, (layer.tp_rank + 1) * local)
+        self.nonlocal_keys = [
+            key
+            for group, matrix in enumerate(self.matrices)
+            if group not in mine
+            for key in matrix.keys
+        ]
         if sum(output_partition_sizes) != local * group_out:
             raise ValueError("EXL3 group widths do not match the layer partition")
         weights = []
