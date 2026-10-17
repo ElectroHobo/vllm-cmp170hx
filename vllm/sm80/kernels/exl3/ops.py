@@ -69,6 +69,7 @@ def _moe_fake(
     intermediate_size,
     out,
     workspace,
+    swiglu_limit=0.0,
 ):
     torch._check(x.dtype == torch.bfloat16)
     torch._check(out.dtype == torch.bfloat16)
@@ -94,7 +95,9 @@ def _ple_fake(
     torch._check(global_ids.numel() == packed_rows.shape[0])
 
 
-_ABI_VERSION = 1
+# 2: the MoE operators take swiglu_limit (a clamp before SiLU(gate) * up,
+# 0 for none).
+_ABI_VERSION = 2
 # Operators this tree calls; a library without one of them is refused.
 _OPERATORS = (
     "linear_out",
@@ -384,7 +387,10 @@ def moe_out(
     intermediate_size: int,
     out,
     workspace,
+    swiglu_limit: float = 0.0,
 ) -> None:
+    """Routed experts; ``swiglu_limit`` > 0 clamps the FP32 gate from above
+    and up on both sides before SiLU(gate) * up (csrc/exl3/moe.cu)."""
     ensure_extension()
     torch.ops._exl3_C.moe_out(
         x,
@@ -396,6 +402,7 @@ def moe_out(
         intermediate_size,
         out,
         workspace,
+        swiglu_limit,
     )
 
 
@@ -409,7 +416,9 @@ def moe_out_v2(
     intermediate_size: int,
     out,
     workspace,
+    swiglu_limit: float = 0.0,
 ) -> None:
+    """moe_out's contract on the tensor cores; see csrc/exl3/moe_v2.cu."""
     ensure_extension()
     torch.ops._exl3_C.moe_out_v2(
         x,
@@ -421,6 +430,7 @@ def moe_out_v2(
         intermediate_size,
         out,
         workspace,
+        swiglu_limit,
     )
 
 
@@ -435,6 +445,7 @@ def warmup_moe_v2(
     hidden_size: int,
     intermediate_size: int,
     top_k: int,
+    swiglu_limit: float = 0.0,
 ) -> None:
     """Run moe_out_v2 per device before any CUDA graph capture.
 
@@ -473,6 +484,7 @@ def warmup_moe_v2(
             intermediate_size,
             out[:count],
             workspace,
+            swiglu_limit=swiglu_limit,
         )
     torch.cuda.synchronize(device)
     _moe_v2_warm_devices.add(device)
@@ -502,6 +514,7 @@ def moe_out_prefill(
     intermediate_size: int,
     out,
     workspace,
+    swiglu_limit: float = 0.0,
 ) -> None:
     """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of
     the moe_out_v2 configuration; see csrc/exl3/moe_prefill.cu."""
@@ -516,6 +529,7 @@ def moe_out_prefill(
         intermediate_size,
         out,
         workspace,
+        swiglu_limit,
     )
 
 
@@ -530,6 +544,7 @@ def warmup_moe_prefill(
     hidden_size: int,
     intermediate_size: int,
     top_k: int,
+    swiglu_limit: float = 0.0,
 ) -> None:
     """Run moe_out_prefill once per device before any CUDA graph capture.
 
@@ -566,6 +581,7 @@ def warmup_moe_prefill(
         intermediate_size,
         out,
         workspace,
+        swiglu_limit=swiglu_limit,
     )
     torch.cuda.synchronize(device)
     _moe_prefill_warm_devices.add(device)

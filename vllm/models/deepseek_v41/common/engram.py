@@ -72,6 +72,7 @@ from vllm.models.deepseek_v41.common.ops.query_quant import (
     mxfp8_scale_bytes,
     mxfp8_scale_offset,
 )
+from vllm.models.deepseek_v41.nvidia.sm80_engram import sm80_engram_embedding
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
@@ -1574,6 +1575,7 @@ class Engram(nn.Module):
         max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
         self._init_staging(max_tokens, layout.head_dim)
 
+    @sm80_engram_embedding
     def _create_embedding(
         self, layout: EngramLayout, layer_hash_index: int
     ) -> ParallelEngramEmbedding:
