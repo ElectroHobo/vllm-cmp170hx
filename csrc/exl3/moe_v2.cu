@@ -291,7 +291,8 @@ __device__ __forceinline__ bool activation_block(const Routing& routing, const i
                                                  int64_t assignments, int64_t intermediate,
                                                  int64_t ipad, const float* gate, const float* up,
                                                  int64_t slice_stride, int64_t pos, int64_t block,
-                                                 int lane, double (&v)[4], int64_t& assignment) {
+                                                 int lane, float limit, double (&v)[4],
+                                                 int64_t& assignment) {
   const int* sorted = table + RouteLayout::sorted_offset();
   const int* sorted_experts = table + RouteLayout::experts_offset(assignments);
   const int count = __ldg(table);
@@ -338,10 +339,11 @@ __device__ __forceinline__ bool activation_block(const Routing& routing, const i
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const int64_t col = base + 32 * i;
-    const double gv = __dmul_rn(g[i], double(gate_scale[i]));
-    const double uv = __dmul_rn(u[i], double(up_scale[i]));
+    double gv = __dmul_rn(g[i], double(gate_scale[i]));
+    double uv = __dmul_rn(u[i], double(up_scale[i]));
     v[i] = 0.0;
     if (col < intermediate) {
+      swiglu_clamp(gv, uv, limit);
       v[i] = __dmul_rn(__dmul_rn(silu(gv), uv), double(down_scale[i]));
     }
   }
@@ -357,7 +359,7 @@ template <int kSlices, int kRowBlocks>
 __global__ void __launch_bounds__(32 * kRowBlocks)
 activate_down_row(Routing routing, const int* table, int64_t assignments, int64_t intermediate,
                   int64_t ipad, const float* gate, const float* up, int64_t slice_stride,
-                  DownHalves halves, int down_slices) {
+                  DownHalves halves, int down_slices, float limit) {
   __shared__ float warp_peaks[kRowBlocks];
   const int lane = threadIdx.x & 31;
   const int block = threadIdx.x >> 5;
@@ -366,7 +368,7 @@ activate_down_row(Routing routing, const int* table, int64_t assignments, int64_
     double v[4];
     int64_t assignment;
     if (!activation_block<kSlices>(routing, table, assignments, intermediate, ipad, gate, up,
-                                   slice_stride, pos, block, lane, v, assignment)) {
+                                   slice_stride, pos, block, lane, limit, v, assignment)) {
       break;
     }
     float f[4];
@@ -897,8 +899,9 @@ void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
                 const torch::Tensor& packed_ptrs,
                 const torch::Tensor& packed_meta,
                 const torch::Tensor& expert_map, int64_t intermediate_size,
-                torch::Tensor& out, torch::Tensor& workspace) {
+                torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit) {
   using namespace moe_v2;
+  const float limit = checked_swiglu_limit(swiglu_limit);
   TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
   check_tensor(x, x, at::kBFloat16, "x");
   check_integer(topk_ids, x, "topk_ids");
@@ -1006,7 +1009,7 @@ void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
       activate_down_row<decltype(slices)::value, kLaneIntermediate / 128>
           <<<launch_blocks(assignments), static_cast<int>(kLaneIntermediate / 4), 0, stream>>>(
               routing, table, assignments, intermediate_size, ipad, gate, up, gate_up_stride,
-              DownHalves{down_halves, down_unscale}, down_used);
+              DownHalves{down_halves, down_unscale}, down_used, limit);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
     if (long_slices) {

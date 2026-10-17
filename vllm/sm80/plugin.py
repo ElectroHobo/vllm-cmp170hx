@@ -14,7 +14,7 @@ _registered = False
 
 
 # ---------------------------------------------------------------------------
-# GLM model code
+# Model code (GLM, DeepSeek-V4.1)
 # ---------------------------------------------------------------------------
 
 # Architectures whose fork classes replace the upstream ones in vLLM's model
@@ -27,6 +27,14 @@ MODEL_OVERRIDES = {
     ),
     "Glm5NextForConditionalGeneration": (
         "vllm.models.glm5next.nvidia.sm80_model:Glm5NextForConditionalGeneration"
+    ),
+    # The DeepSeek-V4.1 vision wrapper (its text model is built inside it)
+    # and its DSpark drafter, whose class lives in the same model package.
+    "DeepseekV41ForCausalLM": (
+        "vllm.models.deepseek_v41.nvidia.sm80_model:DeepseekV41ForCausalLM"
+    ),
+    "DSparkV41DraftModel": (
+        "vllm.models.deepseek_v41.nvidia.sm80_model:DSparkDeepseekV4ForCausalLM"
     ),
 }
 

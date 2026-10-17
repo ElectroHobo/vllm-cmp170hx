@@ -151,6 +151,24 @@ def aligned_shard(logical: int, padded: int, rank: int, size: int) -> slice:
     return slice(rank * width, (rank + 1) * width)
 
 
+def block_shard(logical: int, padded: int, rank: int, size: int) -> slice:
+    """A TP shard of whole H128 blocks when the blocks need not divide evenly:
+    ranks below ``blocks % size`` take one block more. Only for a projection
+    whose shard width no other rank or layer depends on (Exl3Layout
+    .shards_unevenly)."""
+    if size <= 0 or not 0 <= rank < size:
+        raise ValueError("Invalid EXL3 shard rank/size")
+    if size == 1:
+        return slice(0, padded)
+    if logical != padded or logical % 128:
+        raise ValueError(f"EXL3 TP cuts must preserve H128 blocks: {logical=} {padded=}")
+    base, extra = divmod(logical // 128, size)
+    if base == 0:
+        raise ValueError(f"EXL3 cannot give {size} ranks a block of {logical}")
+    start = rank * base + min(rank, extra)
+    return slice(start * 128, (start + base + (rank < extra)) * 128)
+
+
 class Exl3Manifest:
     def __init__(self, directory: str | Path, *, require_qwen_aux: bool = False):
         self.directory = Path(directory)
