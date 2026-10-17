@@ -100,6 +100,9 @@ if TYPE_CHECKING:
     VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE: str = "planned"
     VLLM_EXL3_PLE_NATIVE_READ: bool = False
     VLLM_EXL3_PLE_HOSTFN_READ: bool = False
+    VLLM_ENGRAM_PLACEMENT: str = "ssd"
+    VLLM_ENGRAM_ROW_CACHE_GIB: float = 1.0
+    VLLM_ENGRAM_NATIVE_READ: bool = False
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_QWEN4_ROUTER_FP32: bool = False
@@ -825,6 +828,28 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Off by default.
     "VLLM_EXL3_PLE_HOSTFN_READ": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_HOSTFN_READ", "0"))
+    ),
+    # Where the sm_80 Engram storage keeps the E4M3 values of its owned table
+    # rows (vllm/models/deepseek_v41/nvidia/sm80_engram.py): "ssd" reads them
+    # on demand from the base-checkpoint shards through a bounded host row
+    # cache; "ram" copies them into pinned host memory at startup (the
+    # comparison path). Scales are resident host memory either way.
+    "VLLM_ENGRAM_PLACEMENT": lambda: _env_with_choices(
+        "VLLM_ENGRAM_PLACEMENT", "ssd", ["ssd", "ram"]
+    )(),
+    # Host row cache of the sm_80 Engram SSD placement, in GiB per rank,
+    # split evenly over the Engram tables; includes its tags. 0 disables the
+    # cache (every row is read from the file). Unused by "ram".
+    "VLLM_ENGRAM_ROW_CACHE_GIB": lambda: float(
+        os.getenv("VLLM_ENGRAM_ROW_CACHE_GIB", "1")
+    ),
+    # Read the Engram SSD rows that miss the row cache in one native call
+    # that releases the GIL (csrc/exl3/ple_read.cpp, the PLE reader core)
+    # instead of per-row Python reads. Same rows and bytes; page-cache and
+    # storage reads are then counted together as unclassified. Off by
+    # default.
+    "VLLM_ENGRAM_NATIVE_READ": lambda: bool(
+        int(os.getenv("VLLM_ENGRAM_NATIVE_READ", "0"))
     ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
     # of at most 64 rows when every local expert matrix is bits_x2 10 /
