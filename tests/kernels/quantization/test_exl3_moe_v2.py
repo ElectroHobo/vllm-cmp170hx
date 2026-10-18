@@ -10,8 +10,8 @@ and on, and the operator's workspace contract.
 GPU (SM 8.0 only): at the served shape (hidden 2560, intermediate 640, top-10,
 256 of 512 experts local, bits_x2 10 / codebook 2), the off path is bitwise
 moe_out and the scalar reference; moe_out_v2 is held to moe_out's error against
-an FP64 reference (pooled mean <= 1.10x, max <= 1.25x, BF16 rounding ties
-forgiven, exact where moe_out is exact) over awkward routings; it is
+an FP64 reference (pooled mean <= 1.10x, max <= 1.25x with no element excused,
+exact where moe_out is exact) over awkward routings; it is
 deterministic; and a captured call replays bitwise like the eager call
 without any allocator event.
 """
@@ -404,14 +404,6 @@ def _bitwise(a, b, name):
     assert torch.equal(a.view(torch.int16), b.view(torch.int16)), name
 
 
-def _tie_mask(cand, inc, ref):
-    ci = cand.view(torch.int16).to(torch.int32)
-    ii = inc.view(torch.int16).to(torch.int32)
-    adjacent = ((ci - ii).abs() == 1) & ((ci < 0) == (ii < 0))
-    c, i = cand.double(), inc.double()
-    return adjacent & ((ref - 0.5 * (c + i)).abs() <= (c - i).abs() / 16)
-
-
 @needs_sm80
 @pytest.mark.parametrize("rows", [1, 4, 32, 64, 65])
 def test_off_path_is_moe_out_and_the_scalar_reference(served, rows):
@@ -456,15 +448,13 @@ SCENARIOS = [
 
 class _Fp64Pool:
     """moe_out_v2's FP64 gate, pooled over calls: mean error <= 1.10x and max
-    error <= 1.25x moe_out's, BF16 rounding ties forgiven (only when every
-    element over the budget is one, at most 0.1 % of the elements), exact
+    error <= 1.25x moe_out's (every element counts; no tolerance floor), exact
     where moe_out is exact, all finite."""
 
     def __init__(self):
         self.n = 0
         self.c_sum = self.i_sum = 0.0
         self.c_max = self.i_max = 0.0
-        self.parts = []
 
     def add(self, cand, inc, ref, name):
         assert torch.isfinite(cand).all(), name
@@ -476,19 +466,9 @@ class _Fp64Pool:
         self.i_sum += float(ei.sum())
         self.c_max = max(self.c_max, float(ec.max()))
         self.i_max = max(self.i_max, float(ei.max()))
-        self.parts.append((ec, _tie_mask(cand, inc, ref)))
 
     def ratios(self):
-        mean_ratio = self.c_sum / self.i_sum
-        max_ratio = self.c_max / self.i_max
-        if max_ratio > 1.25:
-            budget = 1.25 * self.i_max
-            over = sum(int((e > budget).sum()) for e, _ in self.parts)
-            forgiven = sum(int(((e > budget) & t).sum()) for e, t in self.parts)
-            if over == forgiven and forgiven <= 1e-3 * self.n:
-                rest = max(float(torch.where(t, 0.0, e).max()) for e, t in self.parts)
-                max_ratio = rest / self.i_max
-        return mean_ratio, max_ratio
+        return self.c_sum / self.i_sum, self.c_max / self.i_max
 
     def check(self, name="moe_out_v2"):
         """Assert the gate; return (mean ratio, max ratio)."""

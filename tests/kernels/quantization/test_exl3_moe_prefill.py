@@ -13,7 +13,7 @@ expert's trellis is 16-byte aligned.
 GPU (SM 8.0 only): at the served shape (hidden 2560, intermediate 640, top-10,
 256 of 512 experts local, bits_x2 10 / codebook 2), the off path is bitwise
 moe_out; moe_out_prefill is held to moe_out's error against an FP64 reference
-(pooled mean <= 1.10x, max <= 1.25x, BF16 rounding ties forgiven, exact where
+(pooled mean <= 1.10x, max <= 1.25x with no element excused, exact where
 moe_out is exact) over awkward routings of 65..1001 rows; it is deterministic;
 it refuses calls it does not cover; and a captured call replays bitwise like
 the eager call without any allocator event. Every weight set's trellis is
