@@ -2,6 +2,9 @@
 
 #include <ATen/MemoryOverlap.h>
 #include <torch/types.h>
+#ifdef __CUDACC__
+#include <cuda_bf16.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -49,6 +52,13 @@ inline void check_integer(const torch::Tensor& t, const torch::Tensor& x,
               name, " must have int32 or int64 dtype");
   check_tensor(t, x, t.scalar_type(), name);
 }
+// The dense linear's out: BF16 (the FP32 result rounded once to nearest) or
+// FP32 (the result itself).
+inline void check_linear_out(const torch::Tensor& out, const torch::Tensor& x) {
+  TORCH_CHECK(out.scalar_type() == at::kBFloat16 || out.scalar_type() == at::kFloat,
+              "EXL3 linear out must be BF16 or FP32");
+  check_tensor(out, x, out.scalar_type(), "out");
+}
 inline void check_mutations(const torch::Tensor& out,
                             const torch::Tensor& workspace,
                             std::initializer_list<const torch::Tensor*> inputs) {
@@ -83,6 +93,20 @@ __device__ __forceinline__ void swiglu_clamp(double& gate, double& up, float lim
     const double bound = limit;
     gate = fmin(gate, bound);
     up = fmin(fmax(up, -bound), bound);
+  }
+}
+// The dense linear's store of one FP32 result (check_linear_out).
+__device__ __forceinline__ void store_output(__nv_bfloat16* out, float value) {
+  *out = __float2bfloat16_rn(value);
+}
+__device__ __forceinline__ void store_output(float* out, float value) { *out = value; }
+// Calls launch(p) with p the data of out as __nv_bfloat16* or float*.
+template <typename Launch>
+void with_linear_out(torch::Tensor& out, Launch&& launch) {
+  if (out.scalar_type() == at::kFloat) {
+    launch(out.data_ptr<float>());
+  } else {
+    launch(reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
   }
 }
 #endif

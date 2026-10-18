@@ -20,7 +20,12 @@ What changes on sm_80:
   the reference routing (``sm80_moe.adopt_moe``);
 - the drafter holds no embedding or LM head of its own (the DSpark loader
   aliases the target's), and keeps its confidence head across the EXL3
-  loader's one-tensor-at-a-time ``load_weights`` calls.
+  loader's one-tensor-at-a-time ``load_weights`` calls;
+- the logits, the DSpark Markov bias and the drafts' logits are FP32, as the
+  reference computes them: the plugin defaults ``head_dtype`` to float32
+  (``vllm.sm80.plugin.HF_CONFIG_DEFAULTS``), the EXL3 head stores its FP32
+  result in that dtype and both models' logits processors serve it
+  (``Exl3HeadLogitsProcessor``).
 
 The attention layers are the platform's (``_select_dsv4_attn_cls``); the
 layer topology this supports is TP with whole-expert EP and no sequence
@@ -43,6 +48,7 @@ from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import (
     mhc_pre_delayed,
 )
 from vllm.models.deepseek_v41.nvidia.sm80_moe import adopt_moe
+from vllm.sm80.kernels.exl3.quant import Exl3HeadLogitsProcessor
 
 
 class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
@@ -243,6 +249,7 @@ class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
             quant_config=vllm_config.quant_config,
             prefix=f"{maybe_prefix(prefix, 'language_model')}.lm_head",
         )
+        Exl3HeadLogitsProcessor.adopt(self.language_model.logits_processor)
 
 
 class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
@@ -296,6 +303,9 @@ class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
         DSparkDeepseekV4Model.adopt(self.model)
         # Aliased from the target by the DSpark loader (load_dspark_model).
         self.lm_head = PPMissingLayer()
+        # Base logits through the target's EXL3 head; the Markov bias through
+        # the upstream unquantized-head path, in the head dtype too.
+        Exl3HeadLogitsProcessor.adopt(self.logits_processor)
 
     def load_weights(self, weights) -> set[str]:
         """Upstream ``load_weights``, without dropping the confidence head
