@@ -72,8 +72,8 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/dense_prefill_tc.py` | 316 |
 | `vllm/sm80/kernels/exl3/layout.py` | 108 |
 | `vllm/sm80/kernels/exl3/loader.py` | 224 |
-| `vllm/sm80/kernels/exl3/ops.py` | 747 |
-| `vllm/sm80/kernels/exl3/quant.py` | 1,060 |
+| `vllm/sm80/kernels/exl3/ops.py` | 838 |
+| `vllm/sm80/kernels/exl3/quant.py` | 1,074 |
 | `vllm/sm80/kernels/exl3/step_phase.py` | 59 |
 | `vllm/sm80/kernels/exl3/utils.py` | 370 |
 | `vllm/sm80/kernels/idx_glue_gate.py` | 75 |
@@ -107,7 +107,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **49 files** | **16,202** |
+| **49 files** | **16,307** |
 
 ### `vllm/sm80/`
 
@@ -123,7 +123,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 1,097 |
+| `vllm/sm80/envs.py` | 1,099 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -150,7 +150,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **35 files** | **9,240** |
+| **35 files** | **9,242** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -206,18 +206,18 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/dense_splitk.h` | 26 |
 | `csrc/exl3/gemm.cu` | 489 |
 | `csrc/exl3/gemm.cuh` | 82 |
-| `csrc/exl3/module.cpp` | 100 |
+| `csrc/exl3/module.cpp` | 101 |
 | `csrc/exl3/moe.cu` | 409 |
 | `csrc/exl3/moe_prefill.cu` | 1,045 |
 | `csrc/exl3/moe_prefill.h` | 28 |
-| `csrc/exl3/moe_v2.cu` | 1,058 |
-| `csrc/exl3/moe_v2.h` | 23 |
+| `csrc/exl3/moe_v2.cu` | 1,290 |
+| `csrc/exl3/moe_v2.h` | 25 |
 | `csrc/exl3/ops.h` | 47 |
 | `csrc/exl3/ple.cu` | 234 |
 | `csrc/exl3/ple.h` | 53 |
 | `csrc/exl3/ple_read.cpp` | 549 |
 | `csrc/exl3/reference.cu` | 450 |
-| **25 files** | **7,490** |
+| **25 files** | **7,725** |
 
 #### `docs/`
 
@@ -225,18 +225,18 @@ Files added elsewhere, grouped by top-level directory.
 |---|---:|
 | `docs/THIRD_PARTY.md` | 85 |
 | `docs/UPSTREAM_README.md` | 111 |
-| `docs/features/quantization/exl3.md` | 82 |
+| `docs/features/quantization/exl3.md` | 84 |
 | `docs/features/speculative_decoding/adaptive_k.md` | 150 |
-| **4 files** | **428** |
+| **4 files** | **430** |
 
 #### `plugins/`
 
 | Path | Lines |
 |---|---:|
 | `plugins/sm80/licenses/exl3/LICENSE` | 21 |
-| `plugins/sm80/licenses/exl3/NOTICE` | 24 |
+| `plugins/sm80/licenses/exl3/NOTICE` | 33 |
 | `plugins/sm80/pyproject.toml` | 35 |
-| **3 files** | **80** |
+| **3 files** | **89** |
 
 #### `tests/`
 
@@ -264,10 +264,11 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_dense_splitk_real_inputs.py` | 322 |
 | `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 321 |
 | `tests/kernels/quantization/test_exl3_kernels.py` | 366 |
-| `tests/kernels/quantization/test_exl3_moe_prefill.py` | 529 |
+| `tests/kernels/quantization/test_exl3_moe_prefill.py` | 534 |
 | `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
 | `tests/kernels/quantization/test_exl3_moe_swiglu_clamp.py` | 83 |
-| `tests/kernels/quantization/test_exl3_moe_v2.py` | 598 |
+| `tests/kernels/quantization/test_exl3_moe_v2.py` | 634 |
+| `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 585 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 85 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
@@ -317,12 +318,14 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/exl3_fixture.py` | 284 |
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
 | `tests/models/deepseek_v41/sm80/fixtures/exl3_headers.json` | 25,297 |
-| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 607 |
+| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 611 |
+| `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,406 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 958 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 322 |
+| `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 101 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 280 |
 | `tests/models/deepseek_v41/sm80/test_sm80_kernels_gpu.py` | 312 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
@@ -401,7 +404,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **159 files** | **80,128** |
+| **162 files** | **82,265** |
 
 #### `tools/`
 
@@ -646,11 +649,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 140 |
-| Fork-added product lines | 43,290 |
+| Fork-added product lines | 43,632 |
 | Patched upstream files | 92 |
 | Patched upstream lines | +4,124 / -794 |
 | Patched upstream product files | 70 |
 | Patched upstream product lines | +3,552 / -244 |
-| Product lines added (new files and patches) | 46,842 |
+| Product lines added (new files and patches) | 47,184 |
 | Fork environment variables (flags) | 92 |
 | Unreferenced fork definitions | 2 (21 lines) |

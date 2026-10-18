@@ -26,24 +26,21 @@ _dense_splitk = False
 # Each matrix processes rows in chunks whose native workspace fits it.
 LINEAR_SCRATCH_ELEMENTS = 8 << 20
 
-# moe_out_v2 (csrc/exl3/moe_v2.cu) covers exactly one configuration: calls of
-# 1..MOE_V2_MAX_ROWS rows, hidden 2560, intermediate 640, top-10, 256 of 512
-# experts local, and every routed matrix stored as below.
+# moe_out_v2 (csrc/exl3/moe_v2.cu) covers calls of 1..MOE_V2_MAX_ROWS rows of
+# these configurations: (hidden, intermediate, top-k, local experts, global
+# experts) -> the bits_x2 values its kernels are built for. Every routed matrix
+# of a layer is stored with one of them and codebook 2 (moe_v2_expert_meta).
 MOE_V2_MAX_ROWS = 64
-MOE_V2_HIDDEN = 2560
-MOE_V2_INTERMEDIATE = 640
-MOE_V2_TOP_K = 10
-MOE_V2_LOCAL_EXPERTS = 256
-MOE_V2_GLOBAL_EXPERTS = 512
-# [padded_in, padded_out, bits_x2, codebook] of gate, up and down.
-MOE_V2_EXPERT_META = [
-    [MOE_V2_HIDDEN, MOE_V2_INTERMEDIATE, 10, 2],
-    [MOE_V2_HIDDEN, MOE_V2_INTERMEDIATE, 10, 2],
-    [MOE_V2_INTERMEDIATE, MOE_V2_HIDDEN, 10, 2],
-]
-# moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the configuration
-# moe_out_v2 covers; it serves calls of MOE_PREFILL_MIN_ROWS to
-# MOE_PREFILL_MAX_ROWS rows (the validated range: one 3460-token prefill chunk).
+MOE_V2_CONFIGS = {
+    # Half the experts local (tensor parallel size 2 with expert parallelism).
+    (2560, 640, 10, 256, 512): (10,),
+    # Whole experts, a quarter of them local (expert parallel size 4).
+    (5120, 2304, 6, 96, 384): (6, 4),
+}
+# moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the first of them only; it
+# serves calls of MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the
+# validated range: one 3460-token prefill chunk).
+MOE_PREFILL_CONFIGS = {(2560, 640, 10, 256, 512): (10,)}
 MOE_PREFILL_MIN_ROWS = MOE_V2_MAX_ROWS + 1
 MOE_PREFILL_MAX_ROWS = 3460
 
@@ -78,6 +75,33 @@ def _moe_fake(
     torch._check(workspace.dtype == torch.float32)
 
 
+def _moe_v2_fake(
+    x,
+    topk_ids,
+    topk_weights,
+    packed_ptrs,
+    packed_meta,
+    expert_map,
+    intermediate_size,
+    bits_x2,
+    out,
+    workspace,
+    swiglu_limit=0.0,
+):
+    _moe_fake(
+        x,
+        topk_ids,
+        topk_weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        out,
+        workspace,
+        swiglu_limit,
+    )
+
+
 def _ple_fake(
     packed_rows,
     global_ids,
@@ -95,9 +119,9 @@ def _ple_fake(
     torch._check(global_ids.numel() == packed_rows.shape[0])
 
 
-# 2: the MoE operators take swiglu_limit (a clamp before SiLU(gate) * up,
-# 0 for none).
-_ABI_VERSION = 2
+# 3: moe_out_v2 takes bits_x2. 2: the MoE operators take swiglu_limit (a clamp
+# before SiLU(gate) * up, 0 for none).
+_ABI_VERSION = 3
 # Operators this tree calls; a library without one of them is refused.
 _OPERATORS = (
     "linear_out",
@@ -201,7 +225,7 @@ def ensure_extension() -> None:
             ("linear_out", _linear_fake),
             ("linear_out_splitk", _linear_fake),
             ("moe_out", _moe_fake),
-            ("moe_out_v2", _moe_fake),
+            ("moe_out_v2", _moe_v2_fake),
             ("moe_out_prefill", _moe_fake),
             ("ple_decode_out", _ple_fake),
         ):
@@ -266,6 +290,53 @@ def moe_workspace_size_v2(
     )
 
 
+def moe_v2_expert_meta(hidden_size: int, intermediate_size: int, bits_x2: int):
+    """[padded_in, padded_out, bits_x2, codebook] of gate, up and down of
+    every local expert of a layer the MoE tensor-core operators take."""
+    return [
+        [hidden_size, intermediate_size, bits_x2, 2],
+        [hidden_size, intermediate_size, bits_x2, 2],
+        [intermediate_size, hidden_size, bits_x2, 2],
+    ]
+
+
+def _moe_closed_reason(
+    configs: dict[tuple[int, ...], tuple[int, ...]],
+    capability: tuple[int, int] | None,
+    dtype: torch.dtype,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    local_experts: int,
+    global_experts: int,
+    metadata: list[list[list[int]]],
+) -> str | None:
+    if capability != (8, 0):
+        return f"device capability {capability}, not (8, 0)"
+    if dtype != torch.bfloat16:
+        return f"activation dtype {dtype}, not bfloat16"
+    shape = (hidden_size, intermediate_size, top_k, local_experts, global_experts)
+    rates = configs.get(shape)
+    if rates is None:
+        return (
+            f"(hidden, intermediate, top_k, local experts, global experts) = "
+            f"{shape}, not one of {sorted(configs)}"
+        )
+    if len(metadata) != local_experts:
+        return f"{len(metadata)} expert entries for {local_experts} local experts"
+    bits_x2 = metadata[0][0][2]
+    if bits_x2 not in rates:
+        return f"local expert 0 stores bits_x2 {bits_x2}, not one of {rates}"
+    expected = moe_v2_expert_meta(hidden_size, intermediate_size, bits_x2)
+    for local, meta in enumerate(metadata):
+        if [list(m) for m in meta] != expected:
+            return (
+                f"local expert {local} stores [padded_in, padded_out, bits_x2, "
+                f"codebook] {[list(m) for m in meta]}, not {expected}"
+            )
+    return None
+
+
 def moe_v2_closed_reason(
     capability: tuple[int, int] | None,
     dtype: torch.dtype,
@@ -276,38 +347,48 @@ def moe_v2_closed_reason(
     global_experts: int,
     metadata: list[list[list[int]]],
 ) -> str | None:
-    """Why moe_out_v2 must not serve this layer, or None when it may.
+    """Why moe_out_v2 must not serve this layer, or None when it may (then
+    every routed matrix has bits_x2 ``metadata[0][0][2]``).
 
     Checked once per layer from host-side values (``metadata`` is the
     per-expert [padded_in, padded_out, bits_x2, codebook] list the layer's
     ``exl3_meta`` buffer is built from), never from device tensors.
     """
-    if capability != (8, 0):
-        return f"device capability {capability}, not (8, 0)"
-    if dtype != torch.bfloat16:
-        return f"activation dtype {dtype}, not bfloat16"
-    shape = (hidden_size, intermediate_size, top_k, local_experts, global_experts)
-    expected = (
-        MOE_V2_HIDDEN,
-        MOE_V2_INTERMEDIATE,
-        MOE_V2_TOP_K,
-        MOE_V2_LOCAL_EXPERTS,
-        MOE_V2_GLOBAL_EXPERTS,
+    return _moe_closed_reason(
+        MOE_V2_CONFIGS,
+        capability,
+        dtype,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        local_experts,
+        global_experts,
+        metadata,
     )
-    if shape != expected:
-        return (
-            f"(hidden, intermediate, top_k, local experts, global experts) = "
-            f"{shape}, not {expected}"
-        )
-    if len(metadata) != local_experts:
-        return f"{len(metadata)} expert entries for {local_experts} local experts"
-    for local, meta in enumerate(metadata):
-        if [list(m) for m in meta] != MOE_V2_EXPERT_META:
-            return (
-                f"local expert {local} stores [padded_in, padded_out, bits_x2, "
-                f"codebook] {[list(m) for m in meta]}, not {MOE_V2_EXPERT_META}"
-            )
-    return None
+
+
+def moe_prefill_closed_reason(
+    capability: tuple[int, int] | None,
+    dtype: torch.dtype,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    local_experts: int,
+    global_experts: int,
+    metadata: list[list[list[int]]],
+) -> str | None:
+    """moe_v2_closed_reason for moe_out_prefill (MOE_PREFILL_CONFIGS)."""
+    return _moe_closed_reason(
+        MOE_PREFILL_CONFIGS,
+        capability,
+        dtype,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        local_experts,
+        global_experts,
+        metadata,
+    )
 
 
 def linear_out(
@@ -417,8 +498,11 @@ def moe_out_v2(
     out,
     workspace,
     swiglu_limit: float = 0.0,
+    *,
+    bits_x2: int,
 ) -> None:
-    """moe_out's contract on the tensor cores; see csrc/exl3/moe_v2.cu."""
+    """moe_out's contract on the tensor cores; see csrc/exl3/moe_v2.cu.
+    ``bits_x2`` is the one bit width of every routed matrix of the layer."""
     ensure_extension()
     torch.ops._exl3_C.moe_out_v2(
         x,
@@ -428,13 +512,15 @@ def moe_out_v2(
         packed_meta,
         expert_map,
         intermediate_size,
+        bits_x2,
         out,
         workspace,
         swiglu_limit,
     )
 
 
-_moe_v2_warm_devices: set[torch.device] = set()
+# (device, hidden, intermediate, bits_x2) warmed by warmup_moe_v2.
+_moe_v2_warm: set[tuple] = set()
 
 
 def warmup_moe_v2(
@@ -445,19 +531,23 @@ def warmup_moe_v2(
     hidden_size: int,
     intermediate_size: int,
     top_k: int,
+    bits_x2: int,
     swiglu_limit: float = 0.0,
 ) -> None:
-    """Run moe_out_v2 per device before any CUDA graph capture.
+    """Run moe_out_v2 per device, shape and bits_x2 before any CUDA graph
+    capture.
 
-    Each launch configuration's first call queries the SM count and the
+    Each lane kernel instance's first call queries the SM count and the
     kernel's occupancy and keeps them (moe_v2.cu launch_lane). The operator
-    picks short or long K slices from rows x top_k (160 routed assignments),
-    so one call of one row and one of MOE_V2_MAX_ROWS rows, all with local
-    routes, launch every kernel it can pick, and no capture is a first call.
+    picks short or long K slices from rows x top_k (160 routed assignments at
+    hidden 2560; hidden 5120 has one layout), so one call of one row and one
+    of MOE_V2_MAX_ROWS rows, all with local routes, launch every kernel it can
+    pick for the layer's shape and bits_x2, and no capture is a first call.
     The temporary buffers are freed again.
     """
     device = packed_ptrs.device
-    if device in _moe_v2_warm_devices:
+    key = (device, hidden_size, intermediate_size, bits_x2)
+    if key in _moe_v2_warm:
         return
     rows = MOE_V2_MAX_ROWS
     ids = torch.tensor(
@@ -485,9 +575,10 @@ def warmup_moe_v2(
             out[:count],
             workspace,
             swiglu_limit=swiglu_limit,
+            bits_x2=bits_x2,
         )
     torch.cuda.synchronize(device)
-    _moe_v2_warm_devices.add(device)
+    _moe_v2_warm.add(key)
 
 
 @lru_cache(maxsize=None)

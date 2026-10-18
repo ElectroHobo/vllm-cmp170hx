@@ -21,8 +21,8 @@ TORCH_LIBRARY(_exl3_C, m) {
         "float swiglu_limit=0.0) -> ()");
   m.def("moe_out_v2(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
-        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace, "
-        "float swiglu_limit=0.0) -> ()");
+        "int intermediate_size, int bits_x2, Tensor(a!) out, "
+        "Tensor(b!) workspace, float swiglu_limit=0.0) -> ()");
   m.def("moe_out_prefill(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
         "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace, "
@@ -79,9 +79,10 @@ namespace {
 
 // TORCH_LIBRARY is not the stable ABI: exl3.ops.ensure_extension compares
 // these with the running PyTorch and refuses a library built for another.
-// abi_version 2: the MoE operators take swiglu_limit.
+// abi_version 3: moe_out_v2 takes bits_x2 (2: the MoE operators take
+// swiglu_limit).
 PyObject* build_info(PyObject*, PyObject*) {
-  return Py_BuildValue("{s:i,s:s,s:i,s:i}", "abi_version", 2, "torch_version",
+  return Py_BuildValue("{s:i,s:s,s:i,s:i}", "abi_version", 3, "torch_version",
                        TORCH_VERSION, "cuda_version", CUDART_VERSION,
                        "cxx11_abi", _GLIBCXX_USE_CXX11_ABI);
 }
