@@ -343,13 +343,15 @@ def apply_fp64(x: torch.Tensor, core, suh, svh) -> torch.Tensor:
     return _blockwise_hadamard(_blockwise_hadamard(t) @ core) * svh.double()
 
 
-def moe_fp64(calls, expert_map, decode_expert, intermediate: int):
+def moe_fp64(calls, expert_map, decode_expert, intermediate: int, swiglu_limit=0.0):
     """FP64 routed-expert outputs of several calls of one layer.
 
     calls: [(x, topk_ids, topk_weights)], expert_map: global -> local id;
     decode_expert(local) -> three (core, suh, svh) for gate, up, down.
     out[t] = sum_j w[t, j] down(SiLU(gate x_t) * up x_t) over the local routes
-    (ids outside the map or mapped to -1 are other ranks' or padding)."""
+    (ids outside the map or mapped to -1 are other ranks' or padding).
+    swiglu_limit > 0 clamps gate x_t from above and up x_t on both sides
+    before SiLU(gate) * up, as the operators' swiglu_limit does."""
     device = calls[0][0].device
     emap = expert_map.cpu().tolist()
     outs = [
@@ -367,7 +369,11 @@ def moe_fp64(calls, expert_map, decode_expert, intermediate: int):
         x = torch.stack([calls[i][0][r] for i, r, _ in items])
         hidden = x.shape[1]
         a = apply_fp64(x, *gate)[:, :intermediate]
-        act = a / (1.0 + torch.exp(-a)) * apply_fp64(x, *up)[:, :intermediate]
+        b = apply_fp64(x, *up)[:, :intermediate]
+        if swiglu_limit > 0:
+            a = a.clamp(max=swiglu_limit)
+            b = b.clamp(-swiglu_limit, swiglu_limit)
+        act = a / (1.0 + torch.exp(-a)) * b
         y = apply_fp64(act, *down)[:, :hidden]
         for (index, row, w), value in zip(items, y):
             outs[index][row] += w * value
