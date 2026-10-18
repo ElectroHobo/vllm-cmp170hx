@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The sm_80 Engram table storage: SSD row reads at int64 offsets, the host
-row cache, TP head ownership, telemetry, dequantization against the
-reference formula, the real shards (DSV41_ENGRAM_DIR) and CUDA graph replay
-with changing ids (GPU only)."""
+row cache, TP head ownership, the native reader and its startup check,
+telemetry, dequantization against the reference formula, the real shards
+(VLLM_ENGRAM_TEST_TABLE_DIR, Python and native readers) and CUDA graph
+replay with changing ids (GPU only)."""
 
 import json
 import os
@@ -284,13 +285,18 @@ def test_reader_reads_past_int32_offsets(tables):
         source.close()
 
 
-def test_native_reader_parity(tables):
+def _require_native():
     try:
         from vllm.sm80.kernels.exl3.ops import ensure_extension
 
         ensure_extension()
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"native EXL3 extension unavailable: {exc}")
+
+
+def test_native_reader_parity(tables):
+    _require_native()
+    assert sm80_engram._native_reader_schema() == sm80_engram.PLE_READ_ROWS_SCHEMA
     _, _, lo, hi = engram_owner_range(BIG_HEADS, 2, TP)
     store = EngramRowStore(
         tables.big, lo, hi, placement="ssd", cache_bytes=0, native_read=True
@@ -305,6 +311,93 @@ def test_native_reader_parity(tables):
         assert store.telemetry.snapshot()["unclassified_rows"] == len(ids)
     finally:
         store.close()
+
+
+def _open_fds():
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_native_reader_checked_at_startup(tables, monkeypatch):
+    from vllm.sm80.kernels.exl3 import ops
+
+    path, base = tables.small.values_path, tables.small.values_offset
+    before = _open_fds()
+
+    def missing():
+        raise RuntimeError("no vllm._exl3_C")
+
+    monkeypatch.setattr(sm80_engram, "_native_reader_schema", missing)
+    with pytest.raises(RuntimeError, match="VLLM_ENGRAM_NATIVE_READ=1 needs"):
+        EngramRowSource(path, base, DIM, 0, SMALL_ROWS, native=True)
+    with pytest.raises(RuntimeError, match="VLLM_ENGRAM_NATIVE_READ=1 needs"):
+        EngramRowStore(
+            tables.small, 0, 600, placement="ssd", cache_bytes=0, native_read=True
+        )
+    # An extension built before ple_read_rows took max_threads.
+    old = sm80_engram.PLE_READ_ROWS_SCHEMA.replace(", int max_threads", "")
+    monkeypatch.setattr(sm80_engram, "_native_reader_schema", lambda: old)
+    with pytest.raises(RuntimeError, match="rebuild the native extension"):
+        EngramRowSource(path, base, DIM, 0, SMALL_ROWS, native=True)
+    # The right schema, but the operator refuses the call.
+    monkeypatch.setattr(
+        sm80_engram, "_native_reader_schema", lambda: sm80_engram.PLE_READ_ROWS_SCHEMA
+    )
+
+    def refuse(*args):
+        raise RuntimeError("bad call")
+
+    monkeypatch.setattr(ops, "ple_read_rows", refuse)
+    with pytest.raises(RuntimeError, match="refused an empty read"):
+        EngramRowSource(path, base, DIM, 0, SMALL_ROWS, native=True)
+    assert _open_fds() == before
+    # The Python reader needs no extension.
+    EngramRowSource(path, base, DIM, 0, SMALL_ROWS).close()
+    assert _open_fds() == before
+
+
+def test_telemetry_readable_and_logged(tables, monkeypatch):
+    lines = []
+    monkeypatch.setattr(
+        sm80_engram.logger, "info", lambda msg, *args: lines.append(msg % args)
+    )
+    table = Sm80EngramEmbedding(
+        SMALL_ROWS,
+        DIM,
+        SMALL_HEADS,
+        tables.small,
+        tp_rank=1,
+        tp_size=TP,
+        max_tokens=16,
+        placement="ssd",
+        cache_bytes=1 << 20,
+        label="layer 14",
+        log_every=2,
+    )
+    sm80_engram._TABLES.add(table)
+    try:
+        for seed in range(5):
+            indices = _hash_like_indices(SMALL_HEADS, np.arange(SMALL_ROWS), 16, seed)
+            table.lookup(indices, torch.empty(16, 2, DIM, dtype=torch.bfloat16))
+        counts = sm80_engram.engram_telemetry()["layer 14"]
+        assert counts["lookups"] == 5 and counts["rows_requested"] == 5 * 32
+        assert counts["host_ns"] >= counts["fetch_ns"] > 0
+        assert counts["cache_hits"] + counts["cache_misses"] == counts["rows_unique"]
+        assert counts["cache_misses"] == (
+            counts["page_cache_rows"]
+            + counts["storage_rows"]
+            + counts["unclassified_rows"]
+        )
+        assert len(lines) == 2
+        assert all(
+            line.startswith("sm_80 Engram layer 14 telemetry: ") for line in lines
+        )
+        assert "lookups 4 " in lines[1] and "; last lookups 2 " in lines[1]
+    finally:
+        table.close()
+    assert lines[-1].startswith("sm_80 Engram layer 14 telemetry at close: lookups 5 ")
+    assert "; last lookups 1 " in lines[-1]
+    table.reset_telemetry()
+    assert table.telemetry()["lookups"] == 0
 
 
 def test_ram_placement_matches_ssd(tables):
@@ -615,14 +708,17 @@ def test_upstream_engram_carries_the_hook():
 
 _REAL_LAYERS = {1: 384_006_168, 14: 384_016_682}
 _REAL_FILES = ("model-00047-of-00048.safetensors", "model-00048-of-00048.safetensors")
+# The base checkpoint directory of the real-shard tests: both Engram shards
+# and its model.safetensors.index.json.
+_REAL_DIR_ENV = "VLLM_ENGRAM_TEST_TABLE_DIR"
 
 
 def _real_dir():
-    directory = os.environ.get("DSV41_ENGRAM_DIR")
+    directory = os.environ.get(_REAL_DIR_ENV)
     if not directory or not all(
         os.path.isfile(os.path.join(directory, name)) for name in _REAL_FILES
     ):
-        pytest.skip("DSV41_ENGRAM_DIR with both Engram shards is not set")
+        pytest.skip(f"{_REAL_DIR_ENV} with both Engram shards is not set")
     return directory
 
 
@@ -643,42 +739,67 @@ def _real_head_sizes():
     return [tuple(p for order in layer for p in order) for layer in layout.primes]
 
 
-def test_real_shards_parity():
+def _real_samples():
+    """(layer, files, lo, hi, rows) per layer and rank: 1024 random owned
+    rows plus the rank's first and last rows (the table's first and last
+    rows among them), 8192 random rows in all. Seeded, so every test reads
+    the same rows."""
     directory = _real_dir()
     rng = np.random.default_rng(1017)
     for (layer, rows), heads in zip(_REAL_LAYERS.items(), _real_head_sizes()):
         files = locate_engram_table(directory, layer, rows, DIM)
-        assert sum(heads) <= rows
+        assert sum(heads) == rows
         for rank in range(TP):
             _, _, lo, hi = engram_owner_range(heads, rank, TP)
             sample = np.concatenate([rng.integers(lo, hi, 1024), [lo, hi - 1]])
-            if rank == 0:
-                sample = np.concatenate([sample, [0]])
-            store = EngramRowStore(files, lo, hi, placement="ssd", cache_bytes=0)
-            try:
-                values, scales = _fetch(store, sample)
-            finally:
-                store.close()
-            want_values, want_scales = _independent_rows(
-                files.values_path, layer, sample
-            )
-            np.testing.assert_array_equal(values, want_values)
-            np.testing.assert_array_equal(scales, want_scales)
-            got = dequant_engram_rows_reference(
-                torch.from_numpy(values), torch.from_numpy(scales)
-            )
-            assert not got.isnan().any()
-        # The table's last row lies past the last head: read it unowned-free.
-        source = EngramRowSource(
-            files.values_path, files.values_offset, DIM, rows - 1, rows
+            assert rank or lo == 0
+            assert rank < TP - 1 or hi == rows
+            yield layer, files, lo, hi, sample
+
+
+def _real_fetch(files, lo, hi, sample, native):
+    store = EngramRowStore(
+        files, lo, hi, placement="ssd", cache_bytes=0, native_read=native
+    )
+    try:
+        values, scales = _fetch(store, sample)
+        return values, scales, store.telemetry.snapshot()
+    finally:
+        store.close()
+
+
+def test_real_shards_parity():
+    checked = 0
+    for layer, files, lo, hi, sample in _real_samples():
+        values, scales, _ = _real_fetch(files, lo, hi, sample, native=False)
+        want_values, want_scales = _independent_rows(files.values_path, layer, sample)
+        np.testing.assert_array_equal(values, want_values)
+        np.testing.assert_array_equal(scales, want_scales)
+        got = dequant_engram_rows_reference(
+            torch.from_numpy(values), torch.from_numpy(scales)
         )
-        try:
-            dest = np.empty((1, DIM), dtype=np.uint8)
-            source.read(np.array([rows - 1]), dest)
-        finally:
-            source.close()
-        want, _ = _independent_rows(files.values_path, layer, [rows - 1])
-        np.testing.assert_array_equal(dest, want)
+        assert not got.isnan().any()
+        checked += len(sample)
+    assert checked == 2 * TP * 1026
+
+
+def test_real_shards_native_parity():
+    _real_dir()
+    _require_native()
+    checked = 0
+    for layer, files, lo, hi, sample in _real_samples():
+        values, scales, counts = _real_fetch(files, lo, hi, sample, native=True)
+        want_values, want_scales = _independent_rows(files.values_path, layer, sample)
+        np.testing.assert_array_equal(values, want_values)
+        np.testing.assert_array_equal(scales, want_scales)
+        assert counts["unclassified_rows"] == len(np.unique(sample))
+        python_values, python_scales, _ = _real_fetch(
+            files, lo, hi, sample, native=False
+        )
+        np.testing.assert_array_equal(values, python_values)
+        np.testing.assert_array_equal(scales, python_scales)
+        checked += len(sample)
+    assert checked == 2 * TP * 1026
 
 
 # ---------------------------------------------------------------------------

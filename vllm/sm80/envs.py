@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     VLLM_ENGRAM_PLACEMENT: str = "ssd"
     VLLM_ENGRAM_ROW_CACHE_GIB: float = 1.0
     VLLM_ENGRAM_NATIVE_READ: bool = False
+    VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_QWEN4_ROUTER_FP32: bool = False
@@ -861,6 +862,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # default.
     "VLLM_ENGRAM_NATIVE_READ": lambda: bool(
         int(os.getenv("VLLM_ENGRAM_NATIVE_READ", "0"))
+    ),
+    # Diagnostic: log the counters of each sm_80 Engram table (rows, cache
+    # hits and misses, page-cache and storage bytes, host read and wait
+    # time) every N lookups of that table, one lookup per step, and at
+    # close and exit (vllm/models/deepseek_v41/nvidia/sm80_engram.py). The
+    # counters are kept either way. Default 0: never logged.
+    "VLLM_ENGRAM_TELEMETRY_STEPS": lambda: int(
+        os.getenv("VLLM_ENGRAM_TELEMETRY_STEPS", "0")
     ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
     # of at most 64 rows when every local expert matrix is bits_x2 10 /

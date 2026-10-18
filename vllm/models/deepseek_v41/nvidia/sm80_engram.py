@@ -34,6 +34,7 @@ overwrites the host staging, and the stream waits for the previous dequant
 before it overwrites the device staging.
 """
 
+import atexit
 import ctypes
 import errno
 import functools
@@ -42,6 +43,7 @@ import os
 import struct
 import threading
 import time
+import weakref
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -71,6 +73,12 @@ _RWF_NOWAIT = 0x8
 _MAX_HEADER_BYTES = 100 << 20
 _GOLDEN = np.uint64(0x9E3779B97F4A7C15)
 GiB = 1 << 30
+# The native reader's operator, as csrc/exl3/module.cpp declares it.
+PLE_READ_ROWS_SCHEMA = (
+    "_exl3_C::ple_read_rows(int fd, Tensor ids, Tensor(a!) dest, int count, "
+    "int base, int row_bytes, int owner_lo, int owner_hi, Tensor head_offsets, "
+    "Tensor head_vocab_sizes, int retries, int max_threads) -> Tensor"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +212,8 @@ class EngramTelemetry:
         "unclassified_bytes",
         "read_ns",
         "fetch_ns",
+        "gpu_wait_ns",
+        "host_ns",
     )
 
     def __init__(self) -> None:
@@ -222,6 +232,62 @@ class EngramTelemetry:
     def reset(self) -> None:
         with self._lock:
             self._counts = dict.fromkeys(self.FIELDS, 0)
+
+
+def format_engram_telemetry(counts: dict[str, int]) -> str:
+    """One line of counters: rows, cache, page-cache and storage bytes, and
+    host time (fetch, read, wait for the GPU, whole lookup)."""
+    mib = 1 << 20
+    hits, misses = counts["cache_hits"], counts["cache_misses"]
+    return (
+        f"lookups {counts['lookups']} rows {counts['rows_requested']} "
+        f"(unowned {counts['rows_unowned']}, unique {counts['rows_unique']}) "
+        f"cache hits {hits} misses {misses} "
+        f"({100.0 * hits / max(hits + misses, 1):.1f}% hit) "
+        f"evictions {counts['cache_evictions']}; read MiB page cache "
+        f"{counts['page_cache_bytes'] / mib:.1f} storage "
+        f"{counts['storage_bytes'] / mib:.1f} unclassified "
+        f"{counts['unclassified_bytes'] / mib:.1f}; host ms fetch "
+        f"{counts['fetch_ns'] / 1e6:.1f} read {counts['read_ns'] / 1e6:.1f} "
+        f"gpu wait {counts['gpu_wait_ns'] / 1e6:.1f} "
+        f"lookup {counts['host_ns'] / 1e6:.1f}"
+    )
+
+
+# The live sm_80 Engram tables of this process.
+_TABLES: "weakref.WeakSet[Sm80EngramEmbedding]" = weakref.WeakSet()
+
+
+def engram_telemetry() -> dict[str, dict[str, int]]:
+    """The counters of every live sm_80 Engram table in this process, by
+    label (``layer <id>``)."""
+    return {table.label: table.telemetry() for table in list(_TABLES)}
+
+
+def _native_reader_schema() -> str:
+    """The ple_read_rows schema of the loaded native EXL3 extension."""
+    from vllm.sm80.kernels.exl3.ops import ensure_extension
+
+    ensure_extension()
+    return str(torch.ops._exl3_C.ple_read_rows.default._schema)
+
+
+def check_native_reader() -> None:
+    """Refuse the native reader unless the loaded extension has the
+    ple_read_rows this module calls (at startup, not at the first miss)."""
+    try:
+        schema = _native_reader_schema()
+    except Exception as exc:
+        raise RuntimeError(
+            "VLLM_ENGRAM_NATIVE_READ=1 needs the native EXL3 extension "
+            f"(vllm._exl3_C) with ple_read_rows: {exc}"
+        ) from exc
+    if schema != PLE_READ_ROWS_SCHEMA:
+        raise RuntimeError(
+            "VLLM_ENGRAM_NATIVE_READ=1: the loaded vllm._exl3_C declares "
+            f"{schema!r}, expected the schema {PLE_READ_ROWS_SCHEMA!r}; "
+            "rebuild the native extension for this tree"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +451,8 @@ class EngramRowSource:
         self._nowait = _preadv2() is not None
         self._pool: ThreadPoolExecutor | None = None
         self._pool_lock = threading.Lock()
+        if native:
+            check_native_reader()
         self.fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
         # Rows are read at random; readahead would only fetch unused rows.
         os.posix_fadvise(
@@ -395,6 +463,18 @@ class EngramRowSource:
                 torch.tensor([owner_lo], dtype=torch.int64),
                 torch.tensor([owner_hi - owner_lo], dtype=torch.int64),
             )
+            try:
+                # One empty batch: the operator dispatches with these arguments.
+                self._read_native(
+                    np.empty(0, dtype=np.int64),
+                    np.empty((0, row_bytes), dtype=np.uint8),
+                )
+            except BaseException as exc:
+                self.close()
+                raise RuntimeError(
+                    f"VLLM_ENGRAM_NATIVE_READ=1: ple_read_rows refused an empty "
+                    f"read of {path}: {exc}"
+                ) from exc
 
     @property
     def extent_offset(self) -> int:
@@ -742,6 +822,8 @@ class Sm80EngramEmbedding(nn.Module):
         native_read: bool = False,
         device: torch.device | str = "cpu",
         block_size: int = ENGRAM_QUANT_BLOCK,
+        label: str = "engram",
+        log_every: int = 0,
     ) -> None:
         super().__init__()
         if block_size != ENGRAM_QUANT_BLOCK or dim % block_size:
@@ -766,6 +848,11 @@ class Sm80EngramEmbedding(nn.Module):
         ) = engram_owner_range(head_sizes, tp_rank, tp_size)
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         self.device = torch.device(device)
+        self.label = label
+        # Lookups between telemetry log lines; 0 never logs.
+        self.log_every = log_every
+        self._since_log = 0
+        self._logged = dict.fromkeys(EngramTelemetry.FIELDS, 0)
         cuda = self.device.type == "cuda"
         self.store = EngramRowStore(
             files,
@@ -824,6 +911,28 @@ class Sm80EngramEmbedding(nn.Module):
 
     def reset_telemetry(self) -> None:
         self.store.telemetry.reset()
+        self._logged = dict.fromkeys(EngramTelemetry.FIELDS, 0)
+
+    def log_telemetry(self, when: str = "") -> None:
+        """Log the counters since start and since the last line."""
+        total = self.telemetry()
+        window = {name: total[name] - self._logged[name] for name in total}
+        self._logged = total
+        logger.info(
+            "sm_80 Engram %s telemetry%s: %s; last %s",
+            self.label,
+            f" {when}" if when else "",
+            format_engram_telemetry(total),
+            format_engram_telemetry(window),
+        )
+
+    def _count_lookup(self, **counts: int) -> None:
+        self.store.telemetry.add(**counts)
+        if self.log_every:
+            self._since_log += 1
+            if self._since_log >= self.log_every:
+                self._since_log = 0
+                self.log_telemetry()
 
     def page_cache_residency(self) -> tuple[int, int]:
         """(resident, total) page-cache pages of this rank's value extent."""
@@ -865,6 +974,7 @@ class Sm80EngramEmbedding(nn.Module):
         values = self._host_values_np[:count]
         scales = self._host_scales_np[:count]
         if self.device.type != "cuda":
+            start = time.perf_counter_ns()
             self._stage_ids(indices, num_tokens)
             self.store.fetch(ids, values, scales)
             from vllm.models.deepseek_v41.nvidia.ops.sm80_engram_dequant import (
@@ -874,6 +984,7 @@ class Sm80EngramEmbedding(nn.Module):
             dequant_engram_rows(
                 self._host_values[:count], self._host_scales[:count], rows_out
             )
+            self._count_lookup(host_ns=time.perf_counter_ns() - start)
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -886,14 +997,17 @@ class Sm80EngramEmbedding(nn.Module):
         )
 
         stream = torch.cuda.current_stream()
+        start = time.perf_counter_ns()
         # The device staging is free once the previous dequant has read it.
         stream.wait_event(self._consumed)
         self._stage_ids(indices, num_tokens)
         self._host_ids[:count].copy_(self._dev_ids[:count], non_blocking=True)
         self._ids_ready.record(stream)
         # The host staging is free once the previous copy has read it.
+        wait_start = time.perf_counter_ns()
         self._staged.synchronize()
         self._ids_ready.synchronize()
+        gpu_wait = time.perf_counter_ns() - wait_start
         self.store.fetch(ids, values, scales)
         dev_values = self._dev_values[:count]
         dev_scales = self._dev_scales[:count]
@@ -902,6 +1016,7 @@ class Sm80EngramEmbedding(nn.Module):
         self._staged.record(stream)
         dequant_engram_rows(dev_values, dev_scales, rows_out)
         self._consumed.record(stream)
+        self._count_lookup(gpu_wait_ns=gpu_wait, host_ns=time.perf_counter_ns() - start)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("sm_80 Engram tables are read through Engram.lookup")
@@ -910,6 +1025,8 @@ class Sm80EngramEmbedding(nn.Module):
         """Wait for queued staging copies, then close the table file."""
         if self.device.type == "cuda":
             self._staged.synchronize()
+        if self.log_every:
+            self.log_telemetry("at close")
         self.store.close()
 
 
@@ -961,6 +1078,9 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
     cache_gib = envs.VLLM_ENGRAM_ROW_CACHE_GIB
     if cache_gib < 0:
         raise ValueError("VLLM_ENGRAM_ROW_CACHE_GIB must be nonnegative")
+    log_every = envs.VLLM_ENGRAM_TELEMETRY_STEPS
+    if log_every < 0:
+        raise ValueError("VLLM_ENGRAM_TELEMETRY_STEPS must be nonnegative")
     table = Sm80EngramEmbedding(
         rows,
         layout.head_dim,
@@ -973,7 +1093,13 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         cache_bytes=int(cache_gib * GiB) // len(layout.layer_ids),
         native_read=envs.VLLM_ENGRAM_NATIVE_READ,
         device=torch.device("cuda", torch.cuda.current_device()),
+        label=f"layer {layer_id}",
+        log_every=log_every,
     )
+    _TABLES.add(table)
+    if log_every:
+        # Engine shutdown does not close modules: log the totals at exit.
+        atexit.register(table.log_telemetry, "at exit")
     resident, total = table.page_cache_residency()
     if placement == "ram":
         values = f"resident {table.store.table.nbytes / GiB:.2f} GiB"
