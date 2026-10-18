@@ -524,7 +524,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # throwaway graph pool, the graph objects, the buffers the capture creates
     # and what profiling leaves allocated, instead of the profiling capture's
     # whole free-memory drop (which also holds one-time costs of the first
-    # capture and the warmups' allocator cache). Logs the split once per rank,
+    # capture and the warmups' allocator cache). The profiling capture captures
+    # every FULL graph rather than vLLM's two largest plus a linear
+    # extrapolation. Logs the split once per rank,
     # and after the real capture what it keeps against the estimate. Runs the
     # fork GPU worker (vllm/sm80/worker/graph_mem_worker.py, V2 model runner
     # only; vllm/sm80/worker/cudagraph_mem.py). 2 also records the allocation

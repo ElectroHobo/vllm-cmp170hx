@@ -23,8 +23,16 @@ does not pay again. With the flag set, the profiling run is split:
 * ``cache``: the allocator cache the capture warmups left, released after the
   capture (vLLM counts it; it is free memory).
 
-The estimate is ``pool + objects + buffers + held`` plus vLLM's own FULL-graph
-extrapolation term, unchanged. ``buffers`` that outlive the teardown are
+The profiling capture captures every FULL graph. vLLM captures only the two
+largest and extrapolates the rest linearly from the second one's cost, which
+assumes every smaller graph costs the same. It does not: on DeepSeek-V4.1 a
+graph size's cost depends on the kernels and buffers its batch size selects
+(FULL_DECODE_ONLY: 0.55 GiB extrapolated against a 0.32 GiB pool at sizes
+1-8; 0.68 GiB against 1.04 GiB at the DSpark verify sizes 6-48). With every
+graph captured the pool is measured, not extrapolated.
+
+The estimate is ``pool + objects + buffers + held``. ``buffers`` that outlive
+the teardown are
 counted twice (in ``buffers`` and ``held``), so a buffer the real capture
 creates again is covered either way. After the real capture the allocator
 cache is released and what the capture keeps is logged against the estimate.
@@ -105,6 +113,7 @@ class _Window:
     free_end: int = 0
     reserved_end: int = 0
     graphs: int = 0
+    full_graphs: int = 0
 
 
 _window: _Window | None = None
@@ -179,6 +188,20 @@ def _count_graphs() -> int:
             if entry.cudagraph is not None:
                 count += 1
     return count
+
+
+def measure_full_graphs(manager: Any) -> None:
+    """Inside the profiling run, before its capture: capture every FULL graph
+    of ``manager`` instead of vLLM's sample of the largest two, and take no
+    per-graph samples, so vLLM's extrapolation adds nothing and its return
+    value is the measured drop."""
+    if _window is None or manager is None:
+        return
+    from vllm.config.compilation import CUDAGraphMode
+
+    manager._max_full_descs_to_capture = None
+    manager._capture_mem_samples = None
+    _window.full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, ()))
 
 
 def _window_start(w: _Window) -> None:
@@ -280,23 +303,22 @@ def profile(profile_fn: Callable[[Any], int], runner: Any) -> int:
     held = max(free0 - free1, 0)
     teardown_freed = free1 - window.free_end
     objects = max(teardown_freed - (window.reserved_end - reserved1), 0)
-    # vLLM's FULL-graph extrapolation (0 without sampled FULL graphs).
-    full_extra = max(upstream - window.measured, 0)
-    estimate = window.pool + objects + window.buffers + held + full_extra
+    # Every FULL graph was captured (measure_full_graphs): vLLM's return value
+    # is the measured drop, with no extrapolated term.
+    assert upstream == window.measured, (upstream, window.measured)
+    estimate = window.pool + objects + window.buffers + held
     logger.info(
         "CUDA graph memory estimate split: graph pool %.1f MiB, graph objects "
         "%.1f MiB, capture buffers %.1f MiB, held after teardown (cold "
-        "one-time) %.1f MiB, FULL extrapolation %.1f MiB; estimate %.1f MiB; "
-        "vLLM's estimate %.1f MiB, given back %.1f MiB (allocator cache "
-        "%.1f MiB)",
+        "one-time) %.1f MiB; estimate %.1f MiB; profiling capture drop %.1f "
+        "MiB with all %d FULL graphs captured, allocator cache %.1f MiB",
         window.pool / _MiB,
         objects / _MiB,
         window.buffers / _MiB,
         held / _MiB,
-        full_extra / _MiB,
         estimate / _MiB,
         upstream / _MiB,
-        (upstream - estimate) / _MiB,
+        window.full_graphs,
         window.cache / _MiB,
     )
     _log_held(

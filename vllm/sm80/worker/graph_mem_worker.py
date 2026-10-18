@@ -6,7 +6,8 @@
 The fork platform names :class:`GraphMemWorker` as the worker only with the
 flag set. Its model runner is vLLM's V2 runner with
 ``profile_cudagraph_memory`` and ``capture_model`` routed through
-``cudagraph_mem``; everything else is upstream's. Other runners (V1, the
+``cudagraph_mem`` (which also has the profiling capture capture every FULL
+graph); everything else is upstream's. Other runners (V1, the
 encoder-only runner) are built unchanged and keep vLLM's estimate.
 """
 
@@ -38,6 +39,8 @@ def runner_cls() -> type:
             )
 
         def capture_model(self, *, profile_only: bool = False) -> int:
+            if profile_only:
+                cudagraph_mem.measure_full_graphs(self.cudagraph_manager)
             return cudagraph_mem.capture(super().capture_model, profile_only)
 
     return GraphMemModelRunner

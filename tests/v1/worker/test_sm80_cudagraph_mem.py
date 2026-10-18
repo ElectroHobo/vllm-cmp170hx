@@ -175,9 +175,10 @@ def _setup(monkeypatch, dev: FakeDevice, cap: Capture) -> tuple[Any, dict]:
         dev.cached(cap.cache)
         if cap.buffer:
             state["buffer"] = dev.alloc(cap.buffer)
-        samples = runner.cudagraph_manager._capture_mem_samples
-        if profile_only and samples is not None:
-            samples.extend(cap.samples)
+        manager = runner.cudagraph_manager
+        state["full_cap"] = manager._max_full_descs_to_capture
+        if profile_only and manager._capture_mem_samples is not None:
+            manager._capture_mem_samples.extend(cap.samples)
         return start - dev.free
 
     def teardown(_r) -> None:
@@ -320,17 +321,39 @@ def test_leaked_pool_counted_on_top_of_new_pool(monkeypatch):
     assert runner.profile_cudagraph_memory() == 2 * cap.pool + cap.objects
 
 
-def test_full_extrapolation_kept(monkeypatch):
-    """vLLM's FULL-graph extrapolation term is added unchanged."""
+def test_all_full_graphs_measured(monkeypatch, caplog_vllm):
+    """The profiling capture captures every FULL graph and takes no samples,
+    so vLLM's linear extrapolation adds nothing: the pool is measured."""
+    dev = FakeDevice()
+    # Samples the extrapolation would have used: 100 + 4 * 20 MiB.
+    cap = Capture(samples=[100 * MiB, 20 * MiB], num_full=5)
+    runner, state = _setup(monkeypatch, dev, cap)
+
+    assert runner.profile_cudagraph_memory() == cap.pool + cap.objects
+    assert state["full_cap"] is None
+    assert "with all 5 FULL graphs captured" in caplog_vllm.text
+
+
+def test_measure_full_graphs_outside_profiling_is_a_no_op():
+    manager = _FakeManager(Capture(num_full=3))
+    manager._max_full_descs_to_capture = 2
+    manager._capture_mem_samples = []
+    cudagraph_mem.measure_full_graphs(manager)
+    assert manager._max_full_descs_to_capture == 2
+    assert manager._capture_mem_samples == []
+
+
+def test_upstream_profiling_keeps_vllm_sampling(monkeypatch):
+    """Outside the split's profiling window vLLM samples two FULL graphs
+    and extrapolates, as without the flag."""
     dev = FakeDevice()
     cap = Capture(samples=[100 * MiB, 20 * MiB], num_full=5)
-    runner, _ = _setup(monkeypatch, dev, cap)
+    runner, state = _setup(monkeypatch, dev, cap)
 
-    full_extra = cgu._extrapolate_full_graph_memory(cap.samples, cap.num_full) - sum(
-        cap.samples
-    )
-    assert full_extra == 3 * 20 * MiB
-    assert runner.profile_cudagraph_memory() == cap.pool + cap.objects + full_extra
+    result = mrv2.GPUModelRunner.profile_cudagraph_memory(runner)
+
+    assert state["full_cap"] == cgu._FULL_GRAPH_PROFILING_SAMPLES
+    assert result == _vllm_estimate(cap)
 
 
 @pytest.mark.parametrize("buffer_outlives_teardown", [False, True])
@@ -400,8 +423,8 @@ def test_split_logged(monkeypatch, caplog_vllm):
     assert (
         "CUDA graph memory estimate split: graph pool 150.0 MiB, graph objects "
         "10.0 MiB, capture buffers 0.0 MiB, held after teardown (cold one-time) "
-        "0.0 MiB, FULL extrapolation 0.0 MiB; estimate 160.0 MiB; vLLM's "
-        "estimate 1060.0 MiB, given back 900.0 MiB (allocator cache 900.0 MiB)"
+        "0.0 MiB; estimate 160.0 MiB; profiling capture drop 1060.0 MiB with "
+        "all 0 FULL graphs captured, allocator cache 900.0 MiB"
     ) in caplog_vllm.text
 
 
