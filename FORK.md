@@ -316,7 +316,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/topk_reference.py` | 59 |
 | `tests/model_executor/layers/test_exl3_layers.py` | 615 |
 | `tests/model_executor/model_loader/test_exl3_manifest.py` | 250 |
-| `tests/model_executor/model_loader/test_exl3_override.py` | 240 |
+| `tests/model_executor/model_loader/test_exl3_override.py` | 247 |
 | `tests/models/deepseek_v41/__init__.py` | 0 |
 | `tests/models/deepseek_v41/sm80/__init__.py` | 0 |
 | `tests/models/deepseek_v41/sm80/construct.py` | 209 |
@@ -413,16 +413,16 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **166 files** | **83,451** |
+| **166 files** | **83,458** |
 
 #### `tools/`
 
 | Path | Lines |
 |---|---:|
-| `tools/sm80/build_override_sidecar.py` | 356 |
+| `tools/sm80/build_override_sidecar.py` | 370 |
 | `tools/sm80/fork_map.py` | 706 |
 | `tools/sm80/upstream_edit_exceptions.yaml` | 128 |
-| **3 files** | **1,190** |
+| **3 files** | **1,204** |
 
 ## 2. Patched upstream files
 
