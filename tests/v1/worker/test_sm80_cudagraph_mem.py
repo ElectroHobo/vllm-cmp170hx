@@ -206,16 +206,26 @@ def _vllm_estimate(cap: Capture) -> int:
 
 def test_flag_defaults_off(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
-    assert envs.VLLM_CUDAGRAPH_ESTIMATE_SPLIT is False
+    monkeypatch.delenv("VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB", raising=False)
+    assert envs.VLLM_CUDAGRAPH_ESTIMATE_SPLIT == 0
+    assert envs.VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB == 0
     assert not cudagraph_mem.enabled()
+    assert not cudagraph_mem.tracing()
 
 
-@pytest.mark.parametrize("flag", ["0", "1"])
+def test_levels(monkeypatch):
+    monkeypatch.setenv(FLAG, "1")
+    assert cudagraph_mem.enabled() and not cudagraph_mem.tracing()
+    monkeypatch.setenv(FLAG, "2")
+    assert cudagraph_mem.enabled() and cudagraph_mem.tracing()
+
+
+@pytest.mark.parametrize("flag", ["0", "1", "2"])
 def test_select_worker(monkeypatch, flag):
     monkeypatch.setenv(FLAG, flag)
     parallel = SimpleNamespace(worker_cls=cudagraph_mem.UPSTREAM_WORKER)
     cudagraph_mem.select_worker(parallel)
-    expected = cudagraph_mem.WORKER if flag == "1" else cudagraph_mem.UPSTREAM_WORKER
+    expected = cudagraph_mem.WORKER if flag != "0" else cudagraph_mem.UPSTREAM_WORKER
     assert parallel.worker_cls == expected
     # The qualname resolves to the fork worker.
     assert (
@@ -393,3 +403,132 @@ def test_split_logged(monkeypatch, caplog_vllm):
         "0.0 MiB, FULL extrapolation 0.0 MiB; estimate 160.0 MiB; vLLM's "
         "estimate 1060.0 MiB, given back 900.0 MiB (allocator cache 900.0 MiB)"
     ) in caplog_vllm.text
+
+
+def _seg(address, total, live, stream=0, frames=()):
+    blocks = [
+        {"address": address + i, "size": size, "state": "active_allocated",
+         "frames": list(frames)}
+        for i, size in enumerate(live)
+    ]
+    rest = total - sum(live)
+    if rest:
+        blocks.append({"address": address + 99, "size": rest, "state": "inactive"})
+    return {"address": address, "total_size": total, "stream": stream,
+            "segment_pool_id": (0, 0), "blocks": blocks}
+
+
+def _frames(name):
+    return [
+        {"filename": "/x/torch/cuda/memory.py", "line": 1, "name": "alloc"},
+        {"filename": "/t/vllm/models/m.py", "line": 7, "name": name},
+        {"filename": "/t/vllm/v1/worker/gpu/model_runner.py", "line": 9, "name": "run"},
+    ]
+
+
+def test_log_held_attributes_new_segments(caplog_vllm):
+    start = [_seg(1, 20 * MiB, [MiB])]
+    end = start + [
+        _seg(2 << 30, 500 * MiB, [2 * MiB], stream=0x55),
+        _seg(3 << 30, 20 * MiB, [8 * MiB], stream=0),
+    ]
+    cudagraph_mem._log_held(600 * MiB, 520 * MiB, start, end, trace=False)
+    text = caplog_vllm.text
+    assert "held after teardown 600.0 MiB: torch reserved +520.0 MiB" in text
+    assert "2 new segments 520.0 MiB: live blocks 10.0 MiB, free inside them " \
+        "510.0 MiB" in text
+    assert "0x55: 1 seg 500.0 MiB live 2.0" in text
+    assert "outside torch 80.0 MiB" in text
+    assert "held block" not in text
+
+
+def test_log_held_lists_stacks_when_tracing(caplog_vllm):
+    end = [
+        _seg(2 << 30, 500 * MiB, [2 * MiB, MiB], stream=0x55, frames=_frames("big")),
+        _seg(3 << 30, 20 * MiB, [8 * MiB], frames=_frames("small")),
+    ]
+    cudagraph_mem._log_held(520 * MiB, 520 * MiB, [], end, trace=True)
+    lines = [r.getMessage() for r in caplog_vllm.records if "held block" in r.getMessage()]
+    # Ranked by the segments their blocks keep; vLLM frames only, innermost first.
+    assert lines[0] == (
+        "CUDA graph memory held block: 2 x, live 3.0 MiB, segments 500.0 MiB: "
+        "models/m.py:7 big < v1/worker/gpu/model_runner.py:9 run"
+    )
+    assert lines[1].startswith("CUDA graph memory held block: 1 x, live 8.0 MiB, "
+                               "segments 20.0 MiB: models/m.py:7 small")
+
+
+def test_profile_records_history_only_when_tracing(monkeypatch, caplog_vllm):
+    calls = []
+    monkeypatch.setattr(cudagraph_mem, "_record_history",
+                        lambda on: calls.append(on) or True)
+    for level, expected in (("1", []), ("2", [True, False])):
+        calls.clear()
+        monkeypatch.setenv(FLAG, level)
+        dev = FakeDevice()
+        runner, _ = _setup(monkeypatch, dev, Capture())
+        runner.profile_cudagraph_memory()
+        assert calls == expected
+    assert "held after teardown 0.0 MiB" in caplog_vllm.text
+
+
+def test_history_stopped_when_no_capture(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cudagraph_mem, "_record_history",
+                        lambda on: calls.append(on) or True)
+    monkeypatch.setenv(FLAG, "2")
+    dev = FakeDevice()
+    runner, _ = _setup(monkeypatch, dev, Capture())
+    monkeypatch.setattr(mrv2, "_profile_cudagraph_memory", lambda r: 0)
+    assert runner.profile_cudagraph_memory() == 0
+    assert calls == [True, False]
+
+
+@pytest.mark.parametrize("limit", ["0", "20"])
+def test_capture_max_split_scoped(monkeypatch, limit):
+    monkeypatch.setenv("VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB", limit)
+    monkeypatch.setattr(torch.cuda.memory, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(
+        torch._C, "_accelerator_getAllocatorSettings",
+        lambda: "expandable_segments:False", raising=False,
+    )
+    seen = []
+    monkeypatch.setattr(torch._C, "_accelerator_setAllocatorSettings",
+                        seen.append, raising=False)
+    dev = FakeDevice()
+    runner, _ = _setup(monkeypatch, dev, Capture())
+
+    runner.profile_cudagraph_memory()
+    runner.capture_model()
+
+    if limit == "0":
+        assert seen == []
+    else:
+        # Set and restored around the profiling and the real capture.
+        assert seen == [
+            "expandable_segments:False,max_split_size_mb:20",
+            "expandable_segments:False",
+        ] * 2
+
+
+def test_count_graphs(monkeypatch):
+    from vllm.compilation import breakable_cudagraph as bcg
+    from vllm.compilation import cuda_graph as cg
+
+    breakable = SimpleNamespace(entries={
+        "a": SimpleNamespace(capture=SimpleNamespace(num_graphs=41)),
+        "b": SimpleNamespace(capture=None),
+    })
+    piecewise = SimpleNamespace(concrete_cudagraph_entries={
+        "a": SimpleNamespace(cudagraph=object()),
+        "b": SimpleNamespace(cudagraph=None),
+    })
+    monkeypatch.setattr(bcg.BreakableCUDAGraphWrapper, "_all_instances", [breakable])
+    monkeypatch.setattr(cg.CUDAGraphWrapper, "_all_instances", [piecewise])
+    assert cudagraph_mem._count_graphs() == 42
+
+
+def test_held_line_reports_bytes_per_graph(caplog_vllm):
+    cudagraph_mem._log_held(1024 * MiB, 0, [], [], trace=False, graphs=512)
+    assert "outside torch 1024.0 MiB (512 graph segments captured: 2.00 MiB " \
+        "each)" in caplog_vllm.text
