@@ -8,9 +8,10 @@ them the Sinkhorn loop), selected with ``VLLM_DSV41_FUSED_MHC`` in
 ``sm80_model.py``. Kernel A (below) always runs; the finish after it is the
 Triton kernel B with ``VLLM_DSV41_FUSED_MHC_FINISH`` (two kernels per call),
 else the reference's torch formulas on kernel A's partials
-(:func:`_torch_finish`: ``hc_split_sinkhorn``, ``hc_collapse``,
-``rms_norm`` of ``ops/sm80_mhc.py``). The two switches are separate so that
-kernel B, a new kernel, is judged on its own. Ops:
+(:func:`_torch_finish`: ``hc_split_sinkhorn`` in FP64 on the partials summed
+in a fixed FP64 order, then ``hc_collapse`` and ``rms_norm`` of
+``ops/sm80_mhc.py`` in FP32). The two switches are separate so that kernel B,
+a new kernel, is judged on its own. Ops:
 
 - ``mhc_fused_post_pre_delayed``: the previous sublayer's post, then the
   delayed pre of the new streams;
@@ -230,6 +231,21 @@ def _delayed_finish_kernel(
             tl.store(li_row + h, _bf16(ob).to(tl.bfloat16), mask=hm)
 
 
+def _sum_partials(p: torch.Tensor) -> torch.Tensor:
+    """``p`` [KS, ...] summed over its first axis in FP64, in a fixed
+    pairwise order of elementwise adds: the same bits for a token whatever
+    the other tokens of the call (a torch reduction picks its order from the
+    whole shape)."""
+    p = p.double()
+    while p.shape[0] > 1:
+        half = p.shape[0] // 2
+        rest = p[2 * half :]
+        p = p[0 : 2 * half : 2] + p[1 : 2 * half : 2]
+        if rest.shape[0]:
+            p = torch.cat((p, rest))
+    return p[0]
+
+
 def _torch_finish(
     mix: torch.Tensor,
     sqr: torch.Tensor,
@@ -246,18 +262,26 @@ def _torch_finish(
 ):
     """The finish in the reference's torch formulas on kernel A's partials:
     the projection and the squared sum reduced over the hidden slices, then
-    ``Block.hc_mixes``' scaling and ``hc_split_sinkhorn``, the collapse with
-    the carried pre-mix and the RMSNorm (``ops/sm80_mhc.py``)."""
+    ``Block.hc_mixes``' scaling and ``hc_split_sinkhorn`` in FP64, each
+    coefficient rounded once to FP32 (in FP32 these few values carry the
+    torch formulas' own rounding at the ulp level); the collapse with the
+    carried pre-mix and the RMSNorm in FP32 as ``ops/sm80_mhc.py``."""
     T, hc, hidden = streams.shape
-    rsqrt = torch.rsqrt(sqr.sum(dim=0) / (hc * hidden) + rms_eps)
-    mixes = mix.sum(dim=0) * rsqrt.unsqueeze(-1)
+    rsqrt = torch.rsqrt(_sum_partials(sqr) / (hc * hidden) + rms_eps)
+    mixes = _sum_partials(mix) * rsqrt.unsqueeze(-1)
     pre, post, comb = sm80_mhc.hc_split_sinkhorn(
-        mixes, hc_scale, hc_base, hc, sinkhorn_repeat, hc_eps, hc_post_mult_value
+        mixes,
+        hc_scale.double(),
+        hc_base.double(),
+        hc,
+        sinkhorn_repeat,
+        hc_eps,
+        hc_post_mult_value,
     )
     layer_input = sm80_mhc.hc_collapse(streams, pre_mix)
     if norm_weight is not None:
         layer_input = sm80_mhc.rms_norm(layer_input, norm_weight, norm_eps)
-    return post.unsqueeze(-1), comb, layer_input, pre
+    return post.float().unsqueeze(-1), comb.float(), layer_input, pre.float()
 
 
 def _delayed(

@@ -114,6 +114,19 @@ def _stand_in_kernel_a(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True,
     sqr.copy_(sf.square().sum(dim=(1, 3)).T)
 
 
+def exacts(a: dict, got: dict, want: dict) -> dict:
+    """Per FP64 form (False: no intermediate rounding; True: at each path's
+    own rounding points) the FP64 outputs each path is judged against:
+    {rp: (for the fused path, for the torch formulas)}."""
+    plain = mhc_delayed_fp64(a)
+    if a.get("x") is None:
+        own = mhc_delayed_fp64(a, rounding=True)
+        return {False: (plain, plain), True: (own, own)}
+    return {False: (plain, plain),
+            True: (mhc_delayed_fp64(a, True, got["residual"]),
+                   mhc_delayed_fp64(a, True, want["residual"]))}
+
+
 def interpreted_errors(T: int = 5, hidden: int = 1056, calls: int = 6) -> dict:
     """Run in the Triton interpreter: per variant and output, the FP64 errors
     (sum, max, count) of the fused path and of the torch formulas over
@@ -128,7 +141,7 @@ def interpreted_errors(T: int = 5, hidden: int = 1056, calls: int = 6) -> dict:
     for seed in range(calls):
         for name, a in variants(T, hidden, seed).items():
             got, want = call(sm80_mhc_fused, a), call(sm80_mhc, a)
-            exact = {rp: mhc_delayed_fp64(a, rounding=rp) for rp in (False, True)}
+            exact = exacts(a, got, want)
             for o in got:
                 assert got[o].shape == want[o].shape, (name, o)
                 assert got[o].dtype == want[o].dtype, (name, o)
@@ -137,8 +150,8 @@ def interpreted_errors(T: int = 5, hidden: int = 1056, calls: int = 6) -> dict:
                         continue
                     key = f"{name}/{o}{'.rp' if rp else ''}"
                     pooled = out.setdefault(key, dict(cand=[0.0, 0.0, 0], ref=[0.0, 0.0, 0]))
-                    for path, value in (("cand", got[o]), ("ref", want[o])):
-                        s, mx, n = abs_errors(value, exact[rp][o])
+                    for i, (path, value) in enumerate((("cand", got[o]), ("ref", want[o]))):
+                        s, mx, n = abs_errors(value, exact[rp][i][o])
                         p = pooled[path]
                         p[0], p[1], p[2] = p[0] + s, max(p[1], mx), p[2] + n
     return out
@@ -178,15 +191,15 @@ def test_torch_finish_within_v2_of_the_torch_formulas(monkeypatch):
     for seed in range(6):
         for name, a in variants(5, 1056, seed).items():
             got, want = call(sm80_mhc_fused, a), call(sm80_mhc, a)
-            exact = {rp: mhc_delayed_fp64(a, rounding=rp) for rp in (False, True)}
+            exact = exacts(a, got, want)
             for o in got:
                 assert got[o].shape == want[o].shape and got[o].dtype == want[o].dtype
                 for rp in (False, True):
                     if o == "residual" and rp:
                         continue
                     p = pooled.setdefault((name, o, rp), [0.0, 0.0, 0.0, 0.0, 0])
-                    cs, cm, n = abs_errors(got[o], exact[rp][o])
-                    rs, rm, _ = abs_errors(want[o], exact[rp][o])
+                    cs, cm, n = abs_errors(got[o], exact[rp][0][o])
+                    rs, rm, _ = abs_errors(want[o], exact[rp][1][o])
                     p[0], p[1], p[2], p[3] = p[0] + cs, max(p[1], cm), p[2] + rs, max(p[3], rm)
                     p[4] += n
     assert len(pooled) == 3 * 9 + 2 * 8

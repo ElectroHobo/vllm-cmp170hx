@@ -25,13 +25,13 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_engram_dequant.py` | 112 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 209 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 466 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 490 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_sparse_attn.py` | 180 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue.py` | 538 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **11 files** | **5,379** |
+| **11 files** | **5,403** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -341,8 +341,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_official_reference.py` | 1,363 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 283 |
 | `tests/models/deepseek_v41/sm80/test_sm80_kernels_gpu.py` | 312 |
-| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused.py` | 285 |
-| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused_gpu.py` | 143 |
+| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused.py` | 298 |
+| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused_gpu.py` | 146 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
 | `tests/models/deepseek_v41/sm80/test_wo_b_allreduce_bits_gpu.py` | 90 |
@@ -420,7 +420,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **172 files** | **86,259** |
+| **172 files** | **86,275** |
 
 #### `tools/`
 
@@ -670,11 +670,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 146 |
-| Fork-added product lines | 45,582 |
+| Fork-added product lines | 45,606 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 49,137 |
+| Product lines added (new files and patches) | 49,161 |
 | Fork environment variables (flags) | 95 |
 | Unreferenced fork definitions | 2 (23 lines) |

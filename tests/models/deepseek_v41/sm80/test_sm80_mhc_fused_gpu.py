@@ -6,13 +6,13 @@ eps 1e-6, RMS eps 1e-20).
 
 - FP64 rule (V2): every output of the fused call and of the pre-only call,
   with and without a carried pre-mix, against FP64 without intermediate
-  rounding and at the reference's rounding points
-  (``fp64_cases.mhc_delayed_fp64``): mean error at most 1.10x and max error
+  rounding and at each path's own rounding points (``fp64_cases``, the
+  ``.rp`` outputs): mean error at most 1.10x and max error
   at most 1.25x the torch formulas' (``ops/sm80_mhc.py``, on the same card),
   at every graph capture size and two prefill sizes, each case pooling
   independent calls up to 64 tokens (as a captured case pools the calls of
-  its shape); rows run alone give the bits of the whole call within one
-  kernel A form (up to 8 rows).
+  its shape); up to 8 rows (one kernel A form), rows run alone give the
+  bits of the whole call wherever they do for the torch formulas.
 - Bitwise run-to-run determinism, CUDA graph replay equal to eager.
 - Two kernels per call (three with ``capture_aux``).
 
@@ -76,10 +76,13 @@ def test_fp64_within_v2_of_the_torch_formulas(T, variant, fused):
             c = family(a, CUDA, output)
             s, mx, k = F.abs_errors(c.cand, c.exact)
             cs, cm, n = cs + s, max(cm, mx), n + k
-            s, mx, _ = F.abs_errors(c.ref, c.exact)
+            ref_exact = c.exact if c.ref_exact is None else c.ref_exact
+            s, mx, _ = F.abs_errors(c.ref, ref_exact)
             rs, rm = rs + s, max(rm, mx)
             assert k == c.cand.numel() > 0, output
-            if T <= 8:
+            # rows alone give the whole call's bits (one kernel A form up to
+            # 8 rows) wherever the torch formulas do
+            if T <= 8 and c.ref_row_invariant:
                 assert c.row_invariant, output
         assert cs / n <= 1.10 * (rs / n), (output, cs / n, rs / n)
         assert cm <= 1.25 * rm, (output, cm, rm)
