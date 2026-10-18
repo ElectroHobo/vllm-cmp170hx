@@ -415,6 +415,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         if self.compress_ratio:
             comp = cast(Any, attn_metadata[self.compressed_cache_prefix])
             batch.comp_block_table = comp.block_table
+            batch.max_seq_len = comp.max_seq_len
             if self.is_kv_source:
                 batch.comp_slots = comp.slot_mapping[:T]
         if self.indexer is not None:

@@ -120,7 +120,9 @@ def test_batch_gathers_decode_and_prefill_rows() -> None:
         query_start_loc=torch.tensor([0, 1, 2, 5]),
         slot_mapping=torch.tensor([5, 6, 7, 8, 9, -1, -1]),
     )
-    comp = SimpleNamespace(block_table=torch.ones(3, 2), slot_mapping=torch.arange(7))
+    comp = SimpleNamespace(
+        block_table=torch.ones(3, 2), slot_mapping=torch.arange(7), max_seq_len=45
+    )
     idxk = SimpleNamespace(block_table=torch.zeros(3, 2), slot_mapping=torch.arange(7) + 1)
     ring = SimpleNamespace(slot_mapping=torch.arange(7) + 2)
     layer = _bare_layer(
@@ -144,6 +146,7 @@ def test_batch_gathers_decode_and_prefill_rows() -> None:
     assert batch.idxk_slots.tolist() == [1, 2, 3, 4, 5]
     assert batch.ring_slots.tolist() == [2, 3, 4, 5, 6]
     assert batch.positions.tolist() == [40, 41, 42, 43, 44]
+    assert batch.max_seq_len == 45
 
 
 class _Linear:

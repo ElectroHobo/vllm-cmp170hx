@@ -39,6 +39,14 @@ index scores and the sparse attention run as Triton kernels
 and the top-k uses ``torch.topk`` repaired by the shared tie fix. Paged
 addressing goes through tensor indexing (int64) here and int64 offsets in the
 kernels.
+
+No step reads a device value on the host: every tensor is shaped by the
+step's token count and host metadata (``Sm80AttnBatch.max_seq_len``), rows
+that write nothing are computed and then dropped by masked writes (which
+target the null block's first row with its own value), and the indexer's
+score width is the batch's host-side bound on visible compressed positions.
+Only the CPU fallbacks of the Triton kernels (``index_scores_torch``,
+``sparse_attention_torch``) still index by data.
 """
 
 import math
@@ -111,6 +119,9 @@ class Sm80AttnBatch:
     idxk_slots: torch.Tensor | None = None  # [T] int64
     idxk_block_table: torch.Tensor | None = None  # [R, nb] int32
     ring_slots: torch.Tensor | None = None  # [T] int64 ratio-2 state ring slot
+    # Host-side upper bound on any request's sequence length this step (after
+    # its new tokens): bounds the visible compressed positions without a sync.
+    max_seq_len: int = 0
 
     @property
     def num_tokens(self) -> int:
@@ -220,12 +231,13 @@ def _paged(cache: torch.Tensor, slots: torch.Tensor):
 
 
 def store_rows(cache: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
-    """``cache[slot] = row`` for every ``slot >= 0`` (slots are distinct)."""
+    """``cache[slot] = row`` for every ``slot >= 0`` (valid slots are
+    distinct), without a host sync: the other rows write slot 0 -- the null
+    block, which no request owns -- with the value it already holds."""
     keep = slots >= 0
-    if not bool(keep.any()):
-        return
-    blk, off = _paged(cache, slots[keep])
-    cache[blk, off] = rows[keep].to(cache.dtype)
+    blk, off = _paged(cache, torch.where(keep, slots, 0))
+    keep = keep.view((-1,) + (1,) * (rows.dim() - 1))
+    cache[blk, off] = torch.where(keep, rows.to(cache.dtype), cache[blk, off])
 
 
 def gather_compressed_rows(
@@ -263,37 +275,39 @@ def compress(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference ``Compressor.forward`` for every group a token closes.
 
-    Returns ``(rows, latent)``: the indices of the closing tokens and their
-    normalized BF16 latents (pre-RoPE). Ratio 1 is ``norm(wkv(x))`` with the
-    BF16 projection. Ratio 2 pools the closing token with its predecessor --
-    from this chunk, or from the request's state ring when the chunk starts
-    on the second token of a group -- by an fp32 softmax over the gate,
-    rounds the pooled row to BF16 and normalizes it; then the last
-    ``capacity`` raw ``[kv | score]`` rows of each request go to the ring.
+    Returns ``(closes, latent)``, both over all T tokens: whether the token
+    closes a group (and so writes a compressed row), and the normalized BF16
+    latent (pre-RoPE) of the group it would close; rows that close nothing
+    hold values no one stores. Ratio 1 is ``norm(wkv(x))`` with the BF16
+    projection. Ratio 2 pools the closing token with its predecessor -- from
+    this chunk, or from the request's state ring when the chunk starts on
+    the second token of a group -- by an fp32 softmax over the gate, rounds
+    the pooled row to BF16 and normalizes it; then the last ``capacity`` raw
+    ``[kv | score]`` rows of each request go to the ring.
     """
     ratio = cfg.compress_ratio
     d = cfg.head_dim
     assert batch.comp_slots is not None
     pos = batch.positions
+    T = pos.shape[0]
     if ratio == 1:
-        rows = torch.nonzero(batch.comp_slots >= 0).flatten()
-        kv = kv_score[rows, :d].to(torch.bfloat16)
-        return rows, rms_norm(kv, norm_weight, cfg.eps)
+        kv = kv_score[:T, :d].to(torch.bfloat16)
+        return batch.comp_slots >= 0, rms_norm(kv, norm_weight, cfg.eps)
 
     assert ratio == 2 and ring is not None and batch.ring_slots is not None
     assert kv_score.dtype == torch.float32 and kv_score.shape[1] == 2 * d
-    rows = torch.nonzero((batch.comp_slots >= 0) & ((pos + 1) % 2 == 0)).flatten()
+    closes = (batch.comp_slots >= 0) & ((pos + 1) % 2 == 0)
+    t = torch.arange(T, device=pos.device)
     req = batch.token_to_req.to(torch.int64)
     qsl = batch.query_start_loc.to(torch.int64)
-    first = rows == qsl[req[rows]]
-    prev = kv_score[(rows - 1).clamp_min(0)]
     capacity = ring.shape[1]
-    from_ring = rows[first]
-    if from_ring.numel():
-        slot = batch.ring_slots[from_ring].to(torch.int64)
-        assert bool((slot >= 0).all()), "a group closed across chunks has no ring"
-        prev[first] = ring[slot // capacity, (pos[from_ring] - 1) % capacity]
-    cur = kv_score[rows]
+    # A group a chunk's first token closes started in an earlier step: its
+    # first row is in the ring (a closing token always has a ring slot).
+    ring_slot = batch.ring_slots.to(torch.int64).clamp_min(0)
+    from_ring = ring[ring_slot // capacity, (pos - 1) % capacity]
+    first = (t == qsl[req]).unsqueeze(-1)
+    prev = torch.where(first, from_ring, kv_score[(t - 1).clamp_min(0)])
+    cur = kv_score[:T]
     kv = torch.stack((prev[:, :d], cur[:, :d]), dim=1)
     score = torch.stack((prev[:, d:], cur[:, d:]), dim=1)
     pooled = (kv * score.softmax(dim=1)).sum(dim=1)
@@ -301,12 +315,9 @@ def compress(
 
     # Ring tail: only the last `capacity` tokens of each request, so no two
     # writes land on one ring row.
-    t = torch.arange(pos.shape[0], device=pos.device)
     tail = (batch.ring_slots >= 0) & (t >= qsl[req + 1] - capacity)
-    if bool(tail.any()):
-        slot = batch.ring_slots[tail].to(torch.int64)
-        ring[slot // capacity, slot % capacity] = kv_score[tail]
-    return rows, latent
+    store_rows(ring, torch.where(tail, batch.ring_slots, -1), kv_score[:T])
+    return closes, latent
 
 
 def index_keys(
@@ -346,21 +357,19 @@ def store_kv(
         return
     assert kv_score is not None and caches.comp is not None
     assert weights.comp_norm is not None
-    rows, latent = compress(cfg, batch, kv_score, weights.comp_norm, caches.ring)
-    if rows.numel() == 0:
-        return
-    group_pos = batch.positions[rows] + 1 - cfg.compress_ratio
+    closes, latent = compress(cfg, batch, kv_score, weights.comp_norm, caches.ring)
+    group_pos = batch.positions + 1 - cfg.compress_ratio
     if cfg.owns_k:
         assert caches.idxk is not None and batch.idxk_slots is not None
         store_rows(
             caches.idxk,
-            batch.idxk_slots[rows],
+            torch.where(closes, batch.idxk_slots, -1),
             index_keys(cfg, weights, latent, group_pos),
         )
     assert batch.comp_slots is not None
     store_rows(
         caches.comp,
-        batch.comp_slots[rows],
+        torch.where(closes, batch.comp_slots, -1),
         compressed_kv(latent, group_pos, weights.freqs),
     )
 
@@ -382,8 +391,8 @@ def index_query(
     assert weights.index_wq_b is not None
     q = weights.index_wq_b(qr).view(-1, cfg.index_n_heads, cfg.index_head_dim)
     q = qdq_fp4(rope(q, positions, weights.freqs), 32, "e8m0")
-    scale = torch.tensor(cfg.index_weight_scale, dtype=torch.float32)
-    w = (index_weights.float() * scale.to(index_weights.device)).to(torch.bfloat16)
+    # A Python float multiplies an fp32 tensor as its fp32 rounding.
+    w = (index_weights.float() * cfg.index_weight_scale).to(torch.bfloat16)
     return q, w
 
 
@@ -560,7 +569,11 @@ def run_indexer(
     chunk_bytes: int = DEFAULT_SCORE_CHUNK_BYTES,
 ) -> None:
     """Fill ``caches.topk[:T]`` (and the candidate buffer at the candidate
-    source) for every token; rows are scored in chunks of bounded size."""
+    source) for every token; rows are scored in chunks of bounded size.
+
+    The score width is the host bound ``max_seq_len // ratio`` on any row's
+    visible count; columns past a row's own count score ``-inf`` and are
+    never selected, so the width changes no selection."""
     T = batch.num_tokens
     assert caches.idxk is not None and batch.idxk_block_table is not None
     n_vis = torch.where(
@@ -574,21 +587,12 @@ def run_indexer(
     if cfg.is_candidate_source:
         assert caches.candidates is not None
         caches.candidates[:T].fill_(-1)
-    n_vis_cpu = n_vis.cpu()
-    start = 0
-    while start < T:
-        width = max(int(n_vis_cpu[start]), 1)
-        end = start + 1
-        while end < T:
-            cand = max(width, int(n_vis_cpu[end]), 1)
-            if (end - start + 1) * cand * 4 > chunk_bytes:
-                break
-            width = cand
-            end += 1
-        rows = slice(start, end)
-        start = end
-        if int(n_vis_cpu[rows].max()) == 0:
-            continue
+    if batch.max_seq_len <= 0:
+        raise ValueError("Sm80AttnBatch.max_seq_len must bound the sequences")
+    width = max(batch.max_seq_len // cfg.compress_ratio, 1)
+    rows_per_chunk = max(chunk_bytes // (width * 4), 1)
+    for start in range(0, T, rows_per_chunk):
+        rows = slice(start, min(start + rows_per_chunk, T))
         scores = index_scores(
             q[rows],
             w[rows],

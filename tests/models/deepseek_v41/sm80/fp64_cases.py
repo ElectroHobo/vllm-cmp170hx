@@ -302,9 +302,12 @@ def _compress_run(a: dict, device: torch.device, tokens: slice):
     ring = a.get("ring")
     # compress writes the ring's tail: every run starts from the captured ring.
     ring = None if ring is None else ring.to(device, copy=True)
-    return core.compress(
+    closes, latent = core.compress(
         cfg, batch, get("kv_score"), a["norm_weight"].to(device), ring
     )
+    # compress returns every token; the closing ones are the latents stored.
+    rows = torch.nonzero(closes).flatten()
+    return rows, latent[rows]
 
 
 def _compress_fp64(a: dict, rows: torch.Tensor) -> torch.Tensor:
