@@ -126,3 +126,18 @@ exceptions:
     Mamba state block: delete the mamba_state_block_size block in __init__ and
     restore the single upstream block_size line in _mamba_block_aligned_split;
     tests/sm80/test_glm_pp4_mamba_split.py must still pass.
+- file: vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+  hunks: [21689b6f8e90, 501bbcf1c181]
+  reason: >-
+    Bug fix inside the fork's existing draft-width hunks of DFlashSpeculator
+    (set_width and the per-width drafter graphs): the block length follows
+    the anchor offset each drafter sets at construction (0 for DSpark, 1 for
+    DFlash and DFlash2) instead of a fixed 1 + width, which gave DSpark an
+    untrained block of N + 1 rows whose rows overlapped between requests.
+    The width code already sits in this upstream class (propose and
+    init_cudagraph_manager call set_width); no extension point holds it.
+  owner: DeepSeek-V4.1-Flash DSpark serving
+  removal: >-
+    Remove with the draft-width code when it moves into vllm/sm80 behind one
+    call (a DFlash subclass or a width hook); DSpark and DFlash must still
+    pass tests/v1/spec_decode/test_dspark_zero_draft.py.

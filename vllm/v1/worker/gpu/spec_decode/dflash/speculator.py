@@ -147,13 +147,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         if width not in self._draft_token_views:
             width = self.max_width
         self.width = width
+        self.num_query_per_req += width - self.num_speculative_steps
         self.num_speculative_steps = width
-        self.num_query_per_req = 1 + width
         self.draft_tokens = self._draft_token_views[width]
         self.sample_col = self._sample_cols[width]
         if width in self._cg_managers:
             self.query_cudagraph_manager = self._cg_managers[width]
-        self._set_model_block_size(1 + width)
+        self._set_model_block_size(self.num_query_per_req)
         self._on_width(width)
 
     def _set_model_block_size(self, block_size: int) -> None:
@@ -213,7 +213,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.vllm_config,
                 self.device,
                 cudagraph_mode,
-                decode_query_len=1 + width,
+                decode_query_len=self.num_query_per_req + width - self.width,
             )
         self.set_width(self.max_width)
 
