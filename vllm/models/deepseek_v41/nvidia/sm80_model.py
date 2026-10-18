@@ -14,8 +14,9 @@ upstream name (and the EXL3 checkpoint maps onto them through
 What changes on sm_80:
 
 - mHC runs in the reference's FP32 formulas (``ops/sm80_mhc.py``) instead of
-  the TileLang/DeepGEMM kernels: the decoder layers' forward, the backbone's
-  final post and the DSpark drafter's forward call them. With
+  the TileLang/DeepGEMM kernels: the decoder layers' forward and ``write_kv``
+  (the decoder replay's KV write), the backbone's final post and the DSpark
+  drafter's forward call them. With
   ``VLLM_DEEPSEEK_V41_FUSED_MHC`` the decoder layers' delayed pre and fused post +
   pre run through the sm_80 mHC kernel A instead, with the finish in torch or,
   with ``VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH``, as a second kernel
@@ -243,6 +244,11 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             )
         model.__class__ = cls
         _adopt_layers(islice(model.layers, model.start_layer, model.end_layer), model.config)
+        replay = model.decoder_replay_layers
+        if replay is not None:
+            # Upstream bound the replay's KV write to the layer before its
+            # adoption: that write_kv runs the TileLang mHC.
+            replay.write_batch_kv = model.layers[model.decoder_replay_start].write_kv
 
     def _collapse(
         self,
