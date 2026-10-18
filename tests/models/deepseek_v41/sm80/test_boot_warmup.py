@@ -147,11 +147,32 @@ def test_prepare_block_sizes_cover_every_reachable_value(
         assert min(256, triton.next_power_of_2(q + num_query_per_req)) == block
 
 
+def _no_collective(hidden):
+    raise AssertionError("compute_logits gathers across TP ranks")
+
+
+def _on_sm80(monkeypatch, sm80: bool) -> None:
+    platform = spec_warmup.current_platform
+    monkeypatch.setattr(platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        platform, "is_device_capability_family", lambda cap, device_id=0: sm80 == (cap == 80)
+    )
+
+
+def _assert_skipped(monkeypatch, runner) -> None:
+    calls = []
+    for name in ("_warm_rejection_sampler", "_warm_dflash_prepare"):
+        monkeypatch.setattr(spec_warmup, name, lambda *a, n=name: calls.append(n))
+    spec_warmup.warmup_spec_decode(runner)
+    assert calls == []
+
+
 def _fake_worker(monkeypatch, verify_calls, prepare_calls):
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
-    spec = object.__new__(dflash.DFlashSpeculator)
+    spec = object.__new__(DSparkSpeculator)
     for name, value in dict(
         draft_logits=torch.zeros(8, 5, 16),
         num_query_per_req=6,
@@ -199,8 +220,8 @@ def _fake_worker(monkeypatch, verify_calls, prepare_calls):
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
         max_num_tokens=2048,
-        model_config=SimpleNamespace(get_hidden_size=lambda: 32),
-        model=SimpleNamespace(compute_logits=lambda h: h @ torch.ones(32, 16).to(h)),
+        model_config=SimpleNamespace(get_vocab_size=lambda: 16, head_dtype=torch.bfloat16),
+        model=SimpleNamespace(compute_logits=_no_collective),
         input_buffers=SimpleNamespace(
             input_ids=torch.zeros(4, dtype=torch.int32),
             positions=torch.zeros(4, dtype=torch.int64),
@@ -225,6 +246,7 @@ def _fake_worker(monkeypatch, verify_calls, prepare_calls):
         dflash, "prepare_dflash_inputs", lambda *a: prepare_calls.append(a)
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    _on_sm80(monkeypatch, True)
     from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils
 
     monkeypatch.setattr(
@@ -245,7 +267,7 @@ def test_spec_decode_warmup_drives_the_served_paths(monkeypatch) -> None:
     assert len(verify_calls) == 2
     (raw, raw_kw), (proc, _) = verify_calls
     assert raw[0].dtype == torch.bfloat16 and proc[0].dtype == torch.float32
-    assert raw[0].shape[0] == 6 and raw[1] is spec.draft_logits
+    assert raw[0].shape == (6, 16) and raw[1] is spec.draft_logits
     assert raw[2].dtype == torch.int32 and raw[4].dtype == torch.int64
     assert raw[3].tolist() == [0, 6]
     assert raw[10] == 5 and raw_kw["use_block_verification"] is False
@@ -276,6 +298,32 @@ def test_spec_decode_warmup_skips_without_speculator() -> None:
     spec_warmup.warmup_spec_decode(
         SimpleNamespace(speculator=None, is_last_pp_rank=True)
     )
+
+
+def test_spec_decode_warmup_skips_off_sm80(monkeypatch) -> None:
+    verify_calls, prepare_calls = [], []
+    runner, _ = _fake_worker(monkeypatch, verify_calls, prepare_calls)
+    _on_sm80(monkeypatch, False)
+    _assert_skipped(monkeypatch, runner)
+
+
+@pytest.mark.parametrize("kind", ["dflash", "dflash2", "mtp"])
+def test_spec_decode_warmup_skips_other_speculators(monkeypatch, kind) -> None:
+    """Other models' drafters (GLM's DFlash2, Qwen's MTP) keep upstream's
+    boot: only DeepSeek-V4.1's DSpark speculator is warmed."""
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    cls = {"dflash": DFlashSpeculator, "dflash2": DFlash2Speculator}.get(
+        kind, MTPSpeculator
+    )
+    verify_calls, prepare_calls = [], []
+    runner, spec = _fake_worker(monkeypatch, verify_calls, prepare_calls)
+    other = object.__new__(cls)
+    other.__dict__.update(spec.__dict__)
+    runner.speculator = other
+    _assert_skipped(monkeypatch, runner)
 
 
 def test_spec_decode_warmup_is_called_by_the_runner_warmup() -> None:

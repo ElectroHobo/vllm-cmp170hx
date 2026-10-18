@@ -22,8 +22,12 @@ dummy run reaches (model runner V2).
   Warmed by preparing a one-request dummy batch for every reachable value.
 
 Called at the end of the runner's warmup steps (``warmup_kernels``, with
-JIT warmup on), before graph capture. A failure is logged and does not stop
-the engine: the kernels then compile on first use, as before.
+JIT warmup on), before graph capture, and runs only on sm_80 with a DSpark
+speculator (DeepSeek-V4.1's; other models' drafters keep upstream's boot).
+It makes no collective call: the target logits are a local zero tensor of
+the shape and dtype ``compute_logits`` returns, so a rank that fails cannot
+leave the others waiting. A failure is logged and does not stop the engine:
+the kernels then compile on first use, as before.
 """
 
 from typing import TYPE_CHECKING
@@ -31,6 +35,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 
 if TYPE_CHECKING:
@@ -58,8 +63,15 @@ def prepare_block_sizes(num_query_per_req: int, max_num_tokens: int) -> list[int
 
 
 def warmup_spec_decode(runner: "GPUModelRunner") -> None:
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
     speculator = getattr(runner, "speculator", None)
-    if speculator is None or not runner.is_last_pp_rank:
+    if (
+        not isinstance(speculator, DSparkSpeculator)
+        or not runner.is_last_pp_rank
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(80)
+    ):
         return
     try:
         _warm_rejection_sampler(runner, speculator)
@@ -84,10 +96,12 @@ def _warm_rejection_sampler(runner, speculator) -> None:
         return
     n = sampler.num_speculative_steps + 1
     dev = runner.device
-    hidden = torch.zeros(
-        n, runner.model_config.get_hidden_size(), dtype=runner.dtype, device=dev
+    # compute_logits' output (full vocabulary, head dtype), without its
+    # TP gather.
+    model_config = runner.model_config
+    logits = torch.zeros(
+        n, model_config.get_vocab_size(), dtype=model_config.head_dtype, device=dev
     )
-    logits = runner.model.compute_logits(hidden)
     idx_mapping = torch.zeros(1, dtype=torch.int64, device=dev)
     expanded_idx_mapping = torch.zeros(n, dtype=torch.int64, device=dev)
     expanded_local_pos = torch.arange(n, dtype=torch.int32, device=dev)
