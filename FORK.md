@@ -327,7 +327,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_kernels_gpu.py` | 312 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
-| `tests/models/deepseek_v41/sm80/wo_b_allreduce_bits.py` | 221 |
+| `tests/models/deepseek_v41/sm80/wo_b_allreduce_bits.py` | 273 |
 | `tests/models/fixtures/native_checkpoint_configs/glm53_dflash2/config.json` | 61 |
 | `tests/models/fixtures/native_checkpoint_configs/glm53_flash/config.json` | 2,636 |
 | `tests/models/fixtures/native_checkpoint_configs/provenance.json` | 19 |
@@ -401,7 +401,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **159 files** | **79,920** |
+| **159 files** | **79,972** |
 
 #### `tools/`
 
