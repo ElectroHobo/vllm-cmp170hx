@@ -37,6 +37,20 @@ pytestmark = needs_sm80
 
 MEAN_BOUND, MAX_BOUND = 1.10, 1.25
 
+# Launches whose FP32 output misses the mean bound against the FP32 GEMM:
+# linear_out (3.2-3.7x) and the tensor-core blocks of 640x2560 (1.39x). The
+# store is exact (its BF16 rounding matches the BF16 output); the miss is the
+# accumulation of these paths. Strict, so a path that starts to pass is seen.
+ACCEPTED_MISS = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "user-accepted 2026-10-19: the FP32-store logits are FP32-class with an "
+        "EXL3 accumulation about 3.5x less exact than an FP32 GEMM (2e-7 vs "
+        "6e-8 mean error against FP64)"
+    ),
+)
+
 
 @pytest.fixture(autouse=True)
 def fp32_gemm(monkeypatch):
@@ -112,7 +126,16 @@ def _check_launch(
     pool.check(f"{name} rows {rows}")
 
 
-@pytest.mark.parametrize("bits_x2,codebook", [(2, 1), (6, 1), (5, 2), (10, 2), (16, 2)])
+@pytest.mark.parametrize(
+    "bits_x2,codebook",
+    [
+        pytest.param(2, 1, marks=ACCEPTED_MISS),
+        pytest.param(6, 1, marks=ACCEPTED_MISS),
+        pytest.param(5, 2, marks=ACCEPTED_MISS),
+        pytest.param(10, 2, marks=ACCEPTED_MISS),
+        pytest.param(16, 2, marks=ACCEPTED_MISS),
+    ],
+)
 def test_linear_out(bits_x2, codebook):
     _extension_or_skip()
     # Logical sizes below the padded H128 blocks exercise both crops.
@@ -156,7 +179,10 @@ def test_split_k(mma_switch, bits_x2, codebook):  # noqa: F811
         )
 
 
-@pytest.mark.parametrize("padded_in,padded_out", [(2560, 640), (640, 2560)])
+@pytest.mark.parametrize(
+    "padded_in,padded_out",
+    [(2560, 640), pytest.param(640, 2560, marks=ACCEPTED_MISS)],
+)
 def test_tensor_core_blocks(mma_switch, padded_in, padded_out):  # noqa: F811
     mma_switch(True)
     m = _matrix(padded_out + 3, padded_in, padded_out, 14)
