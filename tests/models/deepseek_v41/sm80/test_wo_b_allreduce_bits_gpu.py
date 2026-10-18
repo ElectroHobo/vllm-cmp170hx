@@ -9,6 +9,11 @@ judges its JSON: with the switch on, every message the flags-in-data or the
 custom all-reduce kernel takes is all-reduced in BF16 and gives the bits of
 the FP32 all-reduce; every message NCCL would take keeps the FP32 all-reduce.
 All three backends must occur over the row counts the script sweeps.
+
+The ranks build the fork's JIT all-reduce extensions in their own cache
+(VLLM_CACHE_ROOT under tmp_path) with the interpreter's torch, so the run
+never rewrites the extensions a served engine has loaded; the script puts
+``ninja`` on PATH as the served venv has it.
 """
 
 import json
@@ -50,6 +55,7 @@ pytestmark = pytest.mark.skipif(
 def test_wo_b_bf16_allreduce_bits_tp4(tmp_path):
     out = tmp_path / "wo_b_ar.json"
     env = dict(os.environ, **SERVED_ENV)
+    env["VLLM_CACHE_ROOT"] = str(tmp_path / "vllm-cache")
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in (str(TREE), env.get("PYTHONPATH", "")) if p
     )

@@ -27,8 +27,8 @@ every case ran; the verdict line says whether ``bf16`` equals ``fp32``.
 
 Not a pytest module: it needs four peer-connected sm_80 GPUs, one process
 each, under the served all-reduce switches (test_wo_b_allreduce_bits_gpu.py
-runs it and judges its JSON). It loads the plugins and puts the
-interpreter's ``bin`` on PATH as the engine has them, and exits 2 without
+runs it and judges its JSON). It loads the plugins and puts ``ninja`` on PATH
+as the engine has them, and exits 2 without
 measuring when the communicator is not the served one (with
 VLLM_CUSTOM_ALLREDUCE_FLAGS=1: the flags-in-data kernel must be up)::
 
@@ -74,22 +74,48 @@ def _backend(comm, t: torch.Tensor) -> str:
     return "nccl"
 
 
+def _ninja_dir() -> str | None:
+    """The directory of the ``ninja`` torch's JIT loader runs: one already on
+    PATH, else the interpreter's ``bin``, else the binary the ``ninja``
+    package installed (its scripts directory, which is not the interpreter's
+    ``bin`` when the package comes from another environment's site-packages).
+    None when there is none."""
+    import shutil
+    import sys
+    from importlib import metadata
+
+    found = shutil.which("ninja")
+    if found:
+        return os.path.dirname(found)
+    candidates = [os.path.join(os.path.dirname(sys.executable), "ninja")]
+    try:
+        dist = metadata.distribution("ninja")
+    except metadata.PackageNotFoundError:
+        dist = None
+    for f in (dist.files or ()) if dist is not None else ():
+        if f.name == "ninja" and f.parent.name == "bin":
+            candidates.append(os.path.realpath(dist.locate_file(f)))
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.dirname(c)
+    return None
+
+
 def _engine_like_setup() -> None:
     """What the served engine has before it builds the TP group: vLLM's
     general plugins loaded (the fork's included, checked by its guard), and
-    the venv's ``bin`` on PATH. The flags-in-data kernel is a JIT extension
-    and torch's loader needs ``ninja`` even for a cached build; without it on
-    PATH the communicator logs "Ninja is required" and leaves the flags path
-    off, which is what an earlier run of this script did."""
-    import sys
-
+    ``ninja`` on PATH (the served venv's ``bin`` holds it). The flags-in-data
+    kernel is a JIT extension and torch's loader needs ``ninja`` even for a
+    cached build; without it the communicator logs "Ninja is required" and
+    leaves the flags path off. A test interpreter whose packages come from
+    another environment has no ``ninja`` in its own ``bin``: see _ninja_dir."""
     from vllm.plugins import load_general_plugins
     from vllm.sm80.guard import check_plugin_loaded
 
-    venv_bin = os.path.dirname(sys.executable)
+    ninja_dir = _ninja_dir()
     path = os.environ.get("PATH", "")
-    if venv_bin not in path.split(os.pathsep):
-        os.environ["PATH"] = os.pathsep.join(p for p in (venv_bin, path) if p)
+    if ninja_dir is not None and ninja_dir not in path.split(os.pathsep):
+        os.environ["PATH"] = os.pathsep.join(p for p in (ninja_dir, path) if p)
     load_general_plugins()
     check_plugin_loaded()
 
