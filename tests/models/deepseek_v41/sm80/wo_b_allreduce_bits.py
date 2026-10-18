@@ -25,7 +25,10 @@ Rank 0 prints a table and writes JSON to ``--out``. The exit code is 0 when
 every case ran; the verdict line says whether ``bf16`` equals ``fp32``.
 
 Not a pytest module: it needs four peer-connected sm_80 GPUs, one process
-each, under the served all-reduce switches::
+each, under the served all-reduce switches. It loads the plugins and puts the
+interpreter's ``bin`` on PATH as the engine has them, and exits 2 without
+measuring when the communicator is not the served one (with
+VLLM_CUSTOM_ALLREDUCE_FLAGS=1: the flags-in-data kernel must be up)::
 
     VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=1 VLLM_CUSTOM_ALLREDUCE_FLAGS=1 \\
     VLLM_CUSTOM_ALLREDUCE_ALGO=2stage VLLM_HOST_ALLREDUCE=1 NCCL_P2P_LEVEL=SYS \\
@@ -66,7 +69,49 @@ def _backend(comm, t: torch.Tensor) -> str:
         if flags is not None and flags.eligible(t):
             return "flags"
         return "custom"
-    return "other(nccl/symm)"
+    return "nccl"
+
+
+def _engine_like_setup() -> None:
+    """What the served engine has before it builds the TP group: vLLM's
+    general plugins loaded (the fork's included, checked by its guard), and
+    the venv's ``bin`` on PATH. The flags-in-data kernel is a JIT extension
+    and torch's loader needs ``ninja`` even for a cached build; without it on
+    PATH the communicator logs "Ninja is required" and leaves the flags path
+    off, which is what an earlier run of this script did."""
+    import sys
+
+    from vllm.plugins import load_general_plugins
+    from vllm.sm80.guard import check_plugin_loaded
+
+    venv_bin = os.path.dirname(sys.executable)
+    path = os.environ.get("PATH", "")
+    if venv_bin not in path.split(os.pathsep):
+        os.environ["PATH"] = os.pathsep.join(p for p in (venv_bin, path) if p)
+    load_general_plugins()
+    check_plugin_loaded()
+
+
+def _refuse_unless_served(comm) -> str | None:
+    """Why this communicator is not the served one, or None."""
+    import vllm.envs as envs
+    from vllm.sm80.distributed.communicator import (
+        Sm80CudaCommunicator,
+        needs_fork_communicator,
+    )
+
+    if needs_fork_communicator() and not isinstance(comm, Sm80CudaCommunicator):
+        return f"the TP communicator is {type(comm).__name__}, not the fork's"
+    if envs.VLLM_CUSTOM_ALLREDUCE_FLAGS:
+        ca = getattr(comm, "ca_comm", None)
+        if ca is None or ca.disabled:
+            return "VLLM_CUSTOM_ALLREDUCE_FLAGS=1 but the custom all-reduce is off"
+        if getattr(ca, "_flags", None) is None:
+            return (
+                "VLLM_CUSTOM_ALLREDUCE_FLAGS=1 but the flags-in-data kernel is "
+                "not up (see the 'flags-in-data' log line above for why)"
+            )
+    return None
 
 
 def _time(fn, iters: int) -> float:
@@ -101,6 +146,7 @@ def main() -> None:
         wo_b_all_reduce,
     )
 
+    _engine_like_setup()
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -116,6 +162,12 @@ def main() -> None:
         )
         ensure_model_parallel_initialized(world, 1)
     comm = get_tp_group().device_communicator
+    reason = _refuse_unless_served(comm)
+    if reason is not None:
+        if rank == 0:
+            print(f"REFUSED: {reason}", flush=True)
+        dist.destroy_process_group()
+        raise SystemExit(2)
     dev = torch.device("cuda", local_rank)
 
     results = []
