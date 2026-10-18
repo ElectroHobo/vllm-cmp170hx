@@ -39,7 +39,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | Path | Lines |
 |---|---:|
 | `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 676 |
-| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,142 |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,145 |
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
 | `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 308 |
 | `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 141 |
@@ -50,7 +50,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **12 files** | **4,513** |
+| **12 files** | **4,516** |
 
 ### `vllm/sm80/kernels/`
 
@@ -320,7 +320,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/fp64_cases.py` | 607 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
-| `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 923 |
+| `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 958 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 322 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 280 |
@@ -401,7 +401,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **159 files** | **80,093** |
+| **159 files** | **80,128** |
 
 #### `tools/`
 
@@ -646,11 +646,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 140 |
-| Fork-added product lines | 43,287 |
+| Fork-added product lines | 43,290 |
 | Patched upstream files | 92 |
 | Patched upstream lines | +4,124 / -794 |
 | Patched upstream product files | 70 |
 | Patched upstream product lines | +3,552 / -244 |
-| Product lines added (new files and patches) | 46,839 |
+| Product lines added (new files and patches) | 46,842 |
 | Fork environment variables (flags) | 92 |
 | Unreferenced fork definitions | 2 (21 lines) |

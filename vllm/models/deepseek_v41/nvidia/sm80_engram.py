@@ -459,9 +459,12 @@ class EngramRowSource:
             self.fd, self.extent_offset, self.extent_bytes, os.POSIX_FADV_RANDOM
         )
         if native:
+            # ple_read_rows runs on CPU tensors only. Model construction may
+            # set a default device, so every tensor it gets names the CPU
+            # (numpy-backed ones always live there).
             self._heads = (
-                torch.tensor([owner_lo], dtype=torch.int64),
-                torch.tensor([owner_hi - owner_lo], dtype=torch.int64),
+                torch.tensor([owner_lo], dtype=torch.int64, device="cpu"),
+                torch.tensor([owner_hi - owner_lo], dtype=torch.int64, device="cpu"),
             )
             try:
                 # One empty batch: the operator dispatches with these arguments.

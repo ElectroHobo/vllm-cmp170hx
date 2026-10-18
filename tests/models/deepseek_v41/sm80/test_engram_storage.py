@@ -11,6 +11,7 @@ import os
 import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -315,6 +316,40 @@ def test_native_reader_parity(tables):
 
 def _open_fds():
     return len(os.listdir("/proc/self/fd"))
+
+
+@contextmanager
+def _default_device_set(device):
+    torch.set_default_device(device)
+    try:
+        yield
+    finally:
+        torch.set_default_device(None)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("context", [torch.device, _default_device_set])
+def test_reader_ignores_the_default_device(tables, native, context):
+    """Model construction runs under a default device (CUDA when served):
+    the reader's tensors must stay on the CPU. The meta device reproduces a
+    non-CPU default without a GPU."""
+    if native:
+        _require_native()
+    _, _, lo, hi = engram_owner_range(BIG_HEADS, 1, TP)
+    written = tables.big_written
+    ids = np.concatenate([written[(written >= lo) & (written < hi)], [lo - 1]])
+    with context("meta"):
+        assert torch.empty(1).device.type == "meta"
+        store = EngramRowStore(
+            tables.big, lo, hi, placement="ssd", cache_bytes=0, native_read=native
+        )
+        try:
+            values, scales = _fetch(store, ids)
+        finally:
+            store.close()
+    want_values, want_scales = _expected(tables.big, BIG_LAYER, ids, lo, hi)
+    np.testing.assert_array_equal(values, want_values)
+    np.testing.assert_array_equal(scales, want_scales)
 
 
 def test_native_reader_checked_at_startup(tables, monkeypatch):
