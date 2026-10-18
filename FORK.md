@@ -73,7 +73,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/layout.py` | 108 |
 | `vllm/sm80/kernels/exl3/loader.py` | 224 |
 | `vllm/sm80/kernels/exl3/ops.py` | 877 |
-| `vllm/sm80/kernels/exl3/override.py` | 85 |
+| `vllm/sm80/kernels/exl3/override.py` | 128 |
 | `vllm/sm80/kernels/exl3/quant.py` | 1,079 |
 | `vllm/sm80/kernels/exl3/step_phase.py` | 59 |
 | `vllm/sm80/kernels/exl3/utils.py` | 370 |
@@ -108,7 +108,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **50 files** | **16,436** |
+| **50 files** | **16,479** |
 
 ### `vllm/sm80/`
 
@@ -316,7 +316,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/topk_reference.py` | 59 |
 | `tests/model_executor/layers/test_exl3_layers.py` | 615 |
 | `tests/model_executor/model_loader/test_exl3_manifest.py` | 250 |
-| `tests/model_executor/model_loader/test_exl3_override.py` | 189 |
+| `tests/model_executor/model_loader/test_exl3_override.py` | 240 |
 | `tests/models/deepseek_v41/__init__.py` | 0 |
 | `tests/models/deepseek_v41/sm80/__init__.py` | 0 |
 | `tests/models/deepseek_v41/sm80/construct.py` | 209 |
@@ -413,16 +413,16 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **166 files** | **83,400** |
+| **166 files** | **83,451** |
 
 #### `tools/`
 
 | Path | Lines |
 |---|---:|
-| `tools/sm80/build_override_sidecar.py` | 287 |
+| `tools/sm80/build_override_sidecar.py` | 356 |
 | `tools/sm80/fork_map.py` | 706 |
 | `tools/sm80/upstream_edit_exceptions.yaml` | 128 |
-| **3 files** | **1,121** |
+| **3 files** | **1,190** |
 
 ## 2. Patched upstream files
 
@@ -661,11 +661,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 145 |
-| Fork-added product lines | 44,713 |
+| Fork-added product lines | 44,756 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 48,268 |
+| Product lines added (new files and patches) | 48,311 |
 | Fork environment variables (flags) | 93 |
 | Unreferenced fork definitions | 2 (21 lines) |
