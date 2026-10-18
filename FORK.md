@@ -342,7 +342,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 283 |
 | `tests/models/deepseek_v41/sm80/test_sm80_kernels_gpu.py` | 312 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused.py` | 298 |
-| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused_gpu.py` | 146 |
+| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused_gpu.py` | 162 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
 | `tests/models/deepseek_v41/sm80/test_wo_b_allreduce_bits_gpu.py` | 90 |
@@ -420,7 +420,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **172 files** | **86,275** |
+| **172 files** | **86,291** |
 
 #### `tools/`
 

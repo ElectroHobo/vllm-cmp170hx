@@ -13,6 +13,22 @@ eps 1e-6, RMS eps 1e-20).
   independent calls up to 64 tokens (as a captured case pools the calls of
   its shape); up to 8 rows (one kernel A form), rows run alone give the
   bits of the whole call wherever they do for the torch formulas.
+
+  CORRECTED AFTER THE FIRST GPU RUN (fork a4d9993ce1, 2026-10-18, 66 of 138
+  failing). That run judged the ``.rp`` outputs of the fused call against
+  FP64 from the FP64 streams rounded to BF16, not from the BF16 streams the
+  path itself produced. A stream element a path rounds to the other BF16
+  neighbour (about 3e-5 of elements; fewer for kernel A than for the torch
+  formulas) then counted as error of the coefficients computed from it, and
+  one such element moves ``post`` by up to ~8e-5: the comparison measured
+  which path's rounding landed on which element, not the error on the
+  inputs the arithmetic received. Each path is now judged against FP64 from
+  its own streams (V2: the same inputs the kernel received), the reference
+  path against its own FP64 value (that run used the candidate's), and row
+  invariance is required where the torch formulas have it. The bounds are
+  unchanged. The same run also changed the torch finish (FP64 coefficients,
+  a fixed partial-sum order), a candidate change judged under the same rule.
+
 - Bitwise run-to-run determinism, CUDA graph replay equal to eager.
 - Two kernels per call (three with ``capture_aux``).
 
