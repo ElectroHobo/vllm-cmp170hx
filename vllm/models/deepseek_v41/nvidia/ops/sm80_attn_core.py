@@ -482,7 +482,9 @@ def topk_canonical_cuda(
 ) -> torch.Tensor:
     """:func:`topk_canonical` on CUDA: ``torch.topk`` returns an exact top-k
     whose ties are placed arbitrarily; the shared tie fix makes the set
-    canonical and sorts it (one more read of the scores)."""
+    canonical and sorts it (one more read of the scores). The tie fix runs on
+    the whole ``[n, k]`` buffer, whose columns past the width are -1, so its
+    kernel compiles once per ``k``, not once per chunk width."""
     from vllm.sm80.kernels.indexer.topk_tiefix import topk_tiefix_
 
     n, n_cols = scores.shape
@@ -493,9 +495,8 @@ def topk_canonical_cuda(
     scores = _mask_invisible(scores, n_vis)
     idx = torch.topk(scores, width, dim=-1, sorted=False).indices.to(torch.int32)
     idx = torch.where(idx < n_vis[:, None], idx, -1)
-    sel = out[:, :width]
-    sel.copy_(idx)
-    topk_tiefix_(scores, sel, row_ends=n_vis.to(torch.int32), sort=True)
+    out[:, :width] = idx
+    topk_tiefix_(scores, out, row_ends=n_vis.to(torch.int32), sort=True)
     return out
 
 
