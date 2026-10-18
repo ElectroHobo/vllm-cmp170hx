@@ -16,6 +16,12 @@ software:
 
 Both factors are exact in FP32, so the single FP32 product and its
 round-to-nearest-even BF16 conversion equal the reference bit for bit.
+
+A NaN product (an E4M3 NaN value or the E8M0 NaN scale, e.g. a poisoned
+row) is written as the BF16 bits ``0xFFFF``: torch's CPU float-to-BF16
+conversion, which the reference uses, gives that one pattern for every NaN
+whatever its sign and payload, while Triton's conversion keeps them. The
+kernel stores BF16 bits through an int16 view of the output.
 """
 
 import torch
@@ -53,11 +59,10 @@ def _engram_dequant_kernel(
     min_scale = tl.full((), 0x400000, tl.int32).to(tl.float32, bitcast=True)
     scale = tl.where(scale_bits == 0, min_scale, scale)
     scale = tl.where(scale_bits == 0xFF, float("nan"), scale)
-    tl.store(
-        out + rows[:, None] * DIM + cols[None, :],
-        (value * scale).to(tl.bfloat16),
-        mask=mask,
-    )
+    product = value * scale
+    out_bits = product.to(tl.bfloat16).to(tl.int16, bitcast=True)
+    out_bits = tl.where(product != product, -1, out_bits)  # NaN -> 0xFFFF
+    tl.store(out + rows[:, None] * DIM + cols[None, :], out_bits, mask=mask)
 
 
 def dequant_engram_rows_reference(
@@ -99,7 +104,7 @@ def dequant_engram_rows(
     _engram_dequant_kernel[(triton.cdiv(rows, block_r),)](
         values,
         scales,
-        out,
+        out.view(torch.int16),
         rows,
         DIM=dim,
         QUANT_BLOCK=ENGRAM_QUANT_BLOCK,
