@@ -412,7 +412,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/core/test_scheduler_failed_inputs.py` | 108 |
 | `tests/v1/kv_connector/conftest.py` | 17 |
 | `tests/v1/spec_decode/test_adaptive_k.py` | 223 |
-| `tests/v1/spec_decode/test_dspark_zero_draft.py` | 223 |
+| `tests/v1/spec_decode/test_dspark_zero_draft.py` | 391 |
 | `tests/v1/spec_decode/test_glm5_dflash_accept_depth.py` | 378 |
 | `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 453 |
 | `tests/v1/spec_decode/test_glm5_dflash_draft_width.py` | 560 |
@@ -426,7 +426,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **175 files** | **87,577** |
+| **175 files** | **87,745** |
 
 #### `tools/`
 
@@ -434,8 +434,8 @@ Files added elsewhere, grouped by top-level directory.
 |---|---:|
 | `tools/sm80/build_override_sidecar.py` | 370 |
 | `tools/sm80/fork_map.py` | 706 |
-| `tools/sm80/upstream_edit_exceptions.yaml` | 128 |
-| **3 files** | **1,204** |
+| `tools/sm80/upstream_edit_exceptions.yaml` | 143 |
+| **3 files** | **1,219** |
 
 ## 2. Patched upstream files
 
