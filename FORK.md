@@ -147,7 +147,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/aux_fc_fold.py` | 173 |
 | `vllm/sm80/spec_decode/dflash2_model.py` | 425 |
 | `vllm/sm80/spec_decode/lilicorr_model.py` | 31 |
-| `vllm/sm80/spec_decode/warmup.py` | 170 |
+| `vllm/sm80/spec_decode/warmup.py` | 184 |
 | `vllm/sm80/worker/__init__.py` | 2 |
 | `vllm/sm80/worker/cudagraph_mem.py` | 464 |
 | `vllm/sm80/worker/graph_mem_worker.py` | 57 |
@@ -155,7 +155,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **38 files** | **10,043** |
+| **38 files** | **10,057** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -332,7 +332,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,508 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
-| `tests/models/deepseek_v41/sm80/test_boot_warmup.py` | 289 |
+| `tests/models/deepseek_v41/sm80/test_boot_warmup.py` | 337 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,171 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 378 |
@@ -424,7 +424,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **174 files** | **87,354** |
+| **174 files** | **87,402** |
 
 #### `tools/`
 
@@ -676,11 +676,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 148 |
-| Fork-added product lines | 46,256 |
+| Fork-added product lines | 46,270 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 49,811 |
+| Product lines added (new files and patches) | 49,825 |
 | Fork environment variables (flags) | 97 |
 | Unreferenced fork definitions | 2 (23 lines) |
