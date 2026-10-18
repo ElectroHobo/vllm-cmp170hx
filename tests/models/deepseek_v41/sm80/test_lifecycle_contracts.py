@@ -67,7 +67,7 @@ MUTATIONS = {
         "compressor_ring",
         (
             CORE,
-            "    store_rows(ring, torch.where(tail, batch.ring_slots, -1), kv_score[:T])",
+            "    store_rows(ring, torch.where(tail, ring_slots, -1), kv_score[:T])",
             "    pass",
         ),
         {"ring_carry_reads_own_row", "compressed_rows_match_uninterrupted"},
