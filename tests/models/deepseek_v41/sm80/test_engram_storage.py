@@ -463,6 +463,7 @@ def test_telemetry_readable_and_logged(tables, monkeypatch):
         for seed in range(5):
             indices = _hash_like_indices(SMALL_HEADS, np.arange(SMALL_ROWS), 16, seed)
             table.lookup(indices, torch.empty(16, 2, DIM, dtype=torch.bfloat16))
+            table.take_failed_tokens()  # the runner's once-per-step take
         counts = sm80_engram.engram_telemetry()["layer 14"]
         assert counts["lookups"] == 5 and counts["rows_requested"] == 5 * 32
         assert counts["host_ns"] >= counts["fetch_ns"] > 0
@@ -695,6 +696,202 @@ def test_unreadable_rows_fail_only_their_requests(tmp_path):
             table.close()
 
 
+def _table_2400(tmp_path):
+    _write_table(tmp_path, 14, 2400, np.arange(2400), "model.safetensors")
+    return locate_engram_table(tmp_path, 14, 2400, DIM)
+
+
+def _cut_after_row_2396(files):
+    """Value rows from 2396 on read short (the scales were read at open)."""
+    os.truncate(files.values_path, files.values_offset + 2396 * DIM + 100)
+
+
+def test_fixed_staging_matches_the_eager_fetch(tmp_path):
+    """The fixed (graph) fetch gives the eager fetch's bytes and counters,
+    poisons the same rows, reports them through take_fixed, and leaves the
+    eager staging alone."""
+    files = _table_2400(tmp_path)
+    store = _store(files, 0, 2400, capacity=64)
+    other = _store(files, 0, 2400, capacity=64)
+    _cut_after_row_2396(files)
+    try:
+        fixed = store.add_fixed(48)
+        assert store.fixed == [fixed] and fixed.index == 0
+        rng = np.random.default_rng(7)
+        for step in range(6):
+            ids = rng.integers(-3, 2396, 48)
+            if step == 3:
+                ids[5] = 2397  # past the cut: a short read
+            store.ids.numpy()[:48] = -7
+            fixed.ids.numpy()[:] = ids
+            store.fetcher.run_fixed(fixed.index)
+            want_values, want_scales = _fetch(other, ids)
+            np.testing.assert_array_equal(fixed.values.numpy(), want_values)
+            np.testing.assert_array_equal(fixed.scales.numpy(), want_scales)
+            assert (store.ids.numpy()[:48] == -7).all()
+            failed = store.take_fixed()
+            assert failed == (1 if step == 3 else 0)
+            if step == 3:
+                assert fixed.values.numpy()[5, 0] == 0x7F
+                assert not fixed.values.numpy()[5, 1:].any()
+        a, b = store.counters(), other.counters()
+        for name in (
+            "lookups",
+            "cache_hits",
+            "cache_misses",
+            "cache_inserts",
+            "rows_failed",
+            "rows_unowned",
+            "rows_unique",
+        ):
+            assert a[name] == b[name], name
+        with pytest.raises(RuntimeError, match="No such Engram fixed staging"):
+            store.fetcher.run_fixed(1)
+        with pytest.raises(RuntimeError, match="exceeds the fetch capacity"):
+            store.add_fixed(65)
+    finally:
+        store.close()
+        other.close()
+
+
+class _GraphEmulator:
+    """Stands in for EngramHostFetch.enqueue_fixed on CPU: records the queued
+    (fixed) arguments and does what the queued copies and host function do."""
+
+    def __init__(self, store):
+        self.store, self.fetcher, self.queued = store, store.fetcher, []
+
+    def __getattr__(self, name):
+        return getattr(self.fetcher, name)
+
+    def enqueue_fixed(self, index, dev_ids, dev_values, dev_scales):
+        self.queued.append(
+            (index, dev_ids.data_ptr(), dev_values.data_ptr(), dev_scales.data_ptr())
+        )
+        fixed = self.store.fixed[index]
+        fixed.ids.copy_(dev_ids)
+        self.fetcher.run_fixed(index)
+        dev_values.copy_(fixed.values)
+        dev_scales.copy_(fixed.scales)
+
+
+def test_captured_lookup_is_the_eager_lookup(tables, monkeypatch):
+    """A lookup inside a capture uses the fixed staging of its size with the
+    same arguments every time, and dequantizes to the eager lookup's bits
+    (the reference), poisoned rows included; other sizes are refused."""
+    sizes = (4, 16, 64)
+    table = Sm80EngramEmbedding(
+        BIG_ROWS,
+        DIM,
+        BIG_HEADS,
+        tables.big,
+        tp_rank=2,
+        tp_size=TP,
+        max_tokens=64,
+        placement="ssd",
+        cache_bytes=1 << 20,
+        graph_sizes=sizes,
+    )
+    eager = Sm80EngramEmbedding(
+        BIG_ROWS,
+        DIM,
+        BIG_HEADS,
+        tables.big,
+        tp_rank=2,
+        tp_size=TP,
+        max_tokens=64,
+        placement="ssd",
+        cache_bytes=1 << 20,
+    )
+    try:
+        assert table.graph_token_counts == list(sizes)
+        assert table.device_bytes() == sum(sizes) * 2 * (8 + DIM + DIM // 32)
+        emulator = _GraphEmulator(table.store)
+        table.store.fetcher = emulator
+        monkeypatch.setattr(table, "_capturing", lambda: True)
+        for tokens in sizes:
+            queued = None
+            for seed in range(3):
+                indices = _hash_like_indices(
+                    BIG_HEADS, tables.big_written, tokens, seed
+                )
+                got = torch.full((tokens, 2, DIM), float("nan"), dtype=torch.bfloat16)
+                table.lookup(indices, got)
+                want = torch.empty_like(got)
+                eager.lookup(indices, want)
+                assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+                ref = _reference_lookup(tables.big, BIG_LAYER, BIG_HEADS, 2, indices)
+                assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
+                # Every replay of one size queues the same staging.
+                assert queued is None or emulator.queued[-1] == queued
+                queued = emulator.queued[-1]
+        assert len({q[0] for q in emulator.queued}) == len(sizes)
+        with pytest.raises(RuntimeError, match="no fixed staging"):
+            table.lookup(
+                torch.zeros(8, 8, dtype=torch.int32),
+                torch.empty(8, 2, DIM, dtype=torch.bfloat16),
+            )
+        # The eager staging was never used by the captured lookups.
+        assert table.telemetry()["host_ns"] == 0
+    finally:
+        table.store.fetcher = emulator.fetcher
+        table.close()
+        eager.close()
+
+
+def test_captured_lookup_fails_only_its_requests(tmp_path, monkeypatch):
+    """ENG-1 through the fixed staging: a short read poisons the row, the
+    gathered rows mask its token, the per-step take reports it once."""
+    from vllm.sm80.failed_inputs import failed_request_ids, take_failed_tokens
+
+    heads, tokens = (300,) * 8, 12
+    files = _table_2400(tmp_path)
+    good = np.arange(2396)
+    good = good[(_row_bytes(good, DIM, 1)[:, 0] & 0x7F) != 0x7F]
+    good = good[_row_bytes(good, SCALE_DIM, 2)[:, 0] != 0xFF]
+    indices = _hash_like_indices(heads, good, tokens, seed=5)
+    indices[5, 7] = 2397  # rank 3, request b
+    tables = [
+        Sm80EngramEmbedding(
+            2400,
+            DIM,
+            heads,
+            files,
+            tp_rank=rank,
+            tp_size=TP,
+            max_tokens=tokens,
+            placement="ssd",
+            cache_bytes=1 << 20,
+            graph_sizes=(tokens,),
+        )
+        for rank in range(TP)
+    ]
+    _cut_after_row_2396(files)
+    try:
+        outs = []
+        for table in tables:
+            table.store.fetcher = _GraphEmulator(table.store)
+            monkeypatch.setattr(table, "_capturing", lambda: True)
+            outs.append(torch.empty(tokens, 2, DIM, dtype=torch.bfloat16))
+            table.lookup(indices, outs[-1])
+        engram = SimpleNamespace(embed=lambda ids: torch.cat(outs, dim=1))
+        sm80_engram.mask_failed_after_gather(engram, tables[0])
+        got = engram.embed(indices)
+        assert not got[5].any() and got[[4, 6]].any()
+        model = nn.Module()
+        model.table = tables[0]
+        mask = take_failed_tokens(model).numpy()
+        assert failed_request_ids(mask, np.array([0, 4, 8, 12]), ["a", "b", "c"]) == {
+            "b"
+        }
+        assert tables[3].store.take_fixed() == 1
+        assert tables[3].store.take_fixed() == 0
+    finally:
+        for table in tables:
+            table.store.fetcher = table.store.fetcher.fetcher
+            table.close()
+
+
 def test_upstream_engram_carries_the_hook():
     from vllm.models.deepseek_v41.common.engram import Engram
 
@@ -800,28 +997,47 @@ def test_gpu_dequant_kernel_bitwise_exhaustive():
 
 
 @needs_cuda
-def test_gpu_lookup_refuses_capture(tables):
+def test_gpu_captured_lookup_replays_the_eager_lookup(tables):
+    """Captured with torch.cuda.graph: each replay fetches that replay's ids,
+    byte-equal to the eager lookup; a size without fixed staging is refused
+    at capture."""
+    tokens = 8
     table = Sm80EngramEmbedding(
-        SMALL_ROWS,
+        BIG_ROWS,
         DIM,
-        SMALL_HEADS,
-        tables.small,
-        tp_rank=0,
+        BIG_HEADS,
+        tables.big,
+        tp_rank=1,
         tp_size=TP,
-        max_tokens=8,
+        max_tokens=16,
         placement="ssd",
         cache_bytes=1 << 20,
         device="cuda",
+        graph_sizes=(tokens,),
     )
     try:
-        ids = torch.zeros(8, 8, dtype=torch.int32, device="cuda")
-        out = torch.empty(8, 2, DIM, dtype=torch.bfloat16, device="cuda")
+        static_ids = torch.full((tokens, 8), -1, dtype=torch.int32, device="cuda")
+        rows = torch.empty(tokens, 2, DIM, dtype=torch.bfloat16, device="cuda")
+        table.lookup(static_ids, rows)  # warm-up compiles the dequant
+        torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            table.lookup(static_ids + 0, rows)
+        for seed in range(4):
+            indices = _hash_like_indices(BIG_HEADS, tables.big_written, tokens, seed)
+            static_ids.copy_(indices.cuda())
+            graph.replay()
+            torch.cuda.synchronize()
+            want = _reference_lookup(tables.big, BIG_LAYER, BIG_HEADS, 1, indices)
+            _assert_bitwise(rows.cpu(), want)
         with (
-            pytest.raises(RuntimeError, match="cannot be captured"),
-            torch.cuda.graph(graph),
+            pytest.raises(RuntimeError, match="no fixed staging"),
+            torch.cuda.graph(torch.cuda.CUDAGraph()),
         ):
-            table.lookup(ids, out)
+            table.lookup(
+                torch.zeros(4, 8, dtype=torch.int32, device="cuda"),
+                torch.empty(4, 2, DIM, dtype=torch.bfloat16, device="cuda"),
+            )
     finally:
         table.close()
 

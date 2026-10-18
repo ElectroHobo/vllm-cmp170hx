@@ -65,6 +65,18 @@ int64_t now_ns() {
 
 struct FetchState;
 
+// A fixed staging of one graph size: the host function captured into a CUDA
+// graph runs on these buffers on every replay, so nothing is chosen when it
+// is queued.
+struct FixedSlot {
+  FetchState* state = nullptr;
+  torch::Tensor ids, values, scales_out;
+  int64_t* id = nullptr;
+  uint8_t* out_values = nullptr;
+  uint8_t* out_scales = nullptr;
+  int64_t count = 0;
+};
+
 struct FetchJob {
   FetchState* state = nullptr;
   int64_t sequence = 0;
@@ -166,7 +178,8 @@ struct FetchState {
   ~FetchState() { ::close(fd); }
 
   // The fetch of ids[0:count); returns (failed rows, first failure).
-  int64_t fetch(int64_t count, int64_t* first_row, Failure* first);
+  int64_t fetch(int64_t count, const int64_t* id, uint8_t* out_values,
+                uint8_t* out_scales, int64_t* first_row, Failure* first);
 
   int fd;
   torch::Tensor scales, table, ids, values, scales_out;
@@ -177,6 +190,18 @@ struct FetchState {
   RowCache cache;
   Scratch scratch;
   std::unique_ptr<FetchJob[]> jobs;
+  // Fixed stagings (graph sizes), added before any is queued; their failures
+  // since the last take_fixed, the first one's row, errno and offset, and
+  // fetches stopped by an unexpected error. Atomics: take_fixed must not wait
+  // for a fetch in flight.
+  std::vector<std::unique_ptr<FixedSlot>> fixed;
+  std::atomic<int64_t> fixed_failed{0};
+  std::atomic<int64_t> fixed_row{0};
+  std::atomic<int64_t> fixed_error{0};
+  std::atomic<int64_t> fixed_offset{0};
+  std::atomic<int64_t> fixed_stopped{0};
+  // A fixed fetch was queued: a captured graph may run it at any time.
+  std::atomic<bool> fixed_queued{false};
   std::mutex mutex;
   std::atomic<int64_t> counters[kCounters];
   // Per-fetch working storage, allocated once for `capacity` ids.
@@ -190,15 +215,14 @@ struct FetchState {
   int64_t oldest = 0;
 };
 
-int64_t FetchState::fetch(int64_t count, int64_t* first_row, Failure* first) {
+int64_t FetchState::fetch(int64_t count, const int64_t* id,
+                          uint8_t* out_values, uint8_t* out_scales,
+                          int64_t* first_row, Failure* first) {
   std::lock_guard<std::mutex> lock(mutex);
   const int64_t start = now_ns();
   int64_t c[kCounters] = {};
   c[kLookups] = 1;
   c[kRowsRequested] = count;
-  const int64_t* id = ids.data_ptr<int64_t>();
-  uint8_t* out_values = static_cast<uint8_t*>(values.data_ptr());
-  uint8_t* out_scales = static_cast<uint8_t*>(scales_out.data_ptr());
   const uint8_t* resident_scales = static_cast<const uint8_t*>(scales.data_ptr());
 
   // Owned ids take their scales; the others zero values and scale 1.0.
@@ -369,7 +393,10 @@ void execute(FetchJob& job) noexcept {
   try {
     Failure first{0, 0, 0};
     int64_t first_row = 0;
-    job.failed = s.fetch(job.count, &first_row, &first);
+    job.failed = s.fetch(job.count, s.ids.data_ptr<int64_t>(),
+                         static_cast<uint8_t*>(s.values.data_ptr()),
+                         static_cast<uint8_t*>(s.scales_out.data_ptr()),
+                         &first_row, &first);
     if (job.failed) {
       job.first_row = first_row;
       job.first_error = first.error;
@@ -396,6 +423,57 @@ void execute(FetchJob& job) noexcept {
 }
 
 void CUDART_CB run_queued(void* job) { execute(*static_cast<FetchJob*>(job)); }
+
+// The host function of a fixed staging: the same fetch, with its failures
+// added to the state's fixed-failure record. Runs on every replay of the
+// graph that captured it; makes no CUDA call and lets no exception out.
+void execute_fixed(FixedSlot& f) noexcept {
+  FetchState& s = *f.state;
+  try {
+    Failure first{0, 0, 0};
+    int64_t first_row = 0;
+    const int64_t failed = s.fetch(f.count, f.id, f.out_values, f.out_scales,
+                                   &first_row, &first);
+    if (failed && s.fixed_failed.fetch_add(failed) == 0) {
+      s.fixed_row.store(first_row);
+      s.fixed_error.store(first.error);
+      s.fixed_offset.store(first.offset);
+    }
+  } catch (...) {
+    for (std::thread& worker : s.scratch.workers) {
+      if (worker.joinable()) {
+        try {
+          worker.join();
+        } catch (...) {
+        }
+      }
+    }
+    for (int64_t i = 0; i < f.count; ++i) {
+      std::memset(f.out_values + i * s.row_bytes, 0, s.row_bytes);
+      f.out_values[i * s.row_bytes] = kPoison;
+    }
+    s.fixed_failed.fetch_add(f.count);
+    s.fixed_stopped.fetch_add(1);
+  }
+}
+
+void CUDART_CB run_fixed_queued(void* slot) {
+  execute_fixed(*static_cast<FixedSlot*>(slot));
+}
+
+void check_cuda(const torch::Tensor& t, int64_t bytes, const char* name) {
+  TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.nbytes() >= bytes,
+              "Engram fixed fetch: ", name,
+              " must be contiguous CUDA memory of at least ", bytes, " bytes");
+}
+
+void check_copy(cudaError_t error, const char* what) {
+  if (error != cudaSuccess) {
+    static_cast<void>(cudaGetLastError());
+    TORCH_CHECK(false, "Engram fixed fetch: ", what, ": ",
+                cudaGetErrorString(error));
+  }
+}
 
 void check_cpu(const torch::Tensor& t, const char* name) {
   TORCH_CHECK(t.device().is_cpu() && t.is_contiguous() &&
@@ -451,6 +529,11 @@ class EngramHostFetch : public torch::CustomClassHolder {
   }
 
   ~EngramHostFetch() override {
+    // A captured graph may still replay a fixed fetch: keep its state.
+    if (state_->fixed_queued.load()) {
+      static_cast<void>(state_.release());
+      return;
+    }
     for (int64_t i = 0; i < state_->slots; ++i) {
       if (state_->jobs[i].phase.load(std::memory_order_acquire) == kQueued) {
         static_cast<void>(state_.release());
@@ -530,6 +613,91 @@ class EngramHostFetch : public torch::CustomClassHolder {
 
   int64_t cache_rows() { return state_->cache.num_sets * state_->cache.ways; }
 
+  // A fixed staging for fetches of exactly ids.numel() rows (one graph
+  // size); returns its index. Add every one before queueing any.
+  int64_t add_fixed(torch::Tensor ids, torch::Tensor values,
+                    torch::Tensor scales_out) {
+    FetchState& s = *state_;
+    TORCH_CHECK(!s.fixed_queued.load(),
+                "Engram fixed stagings must be added before any is queued");
+    TORCH_CHECK(ids.device().is_cpu() && ids.scalar_type() == torch::kInt64 &&
+                    ids.dim() == 1 && ids.is_contiguous(),
+                "Engram fixed ids must be a contiguous 1-D CPU int64 tensor");
+    check_cpu(values, "fixed values");
+    check_cpu(scales_out, "fixed scale staging");
+    const int64_t count = ids.numel();
+    TORCH_CHECK(0 < count && count <= s.capacity,
+                "Engram fixed staging exceeds the fetch capacity");
+    TORCH_CHECK(values.numel() == count * s.row_bytes &&
+                    scales_out.numel() == count * s.scale_bytes,
+                "Engram fixed staging does not match its id count");
+    auto slot = std::make_unique<FixedSlot>();
+    slot->state = &s;
+    slot->ids = std::move(ids);
+    slot->values = std::move(values);
+    slot->scales_out = std::move(scales_out);
+    slot->id = slot->ids.data_ptr<int64_t>();
+    slot->out_values = static_cast<uint8_t*>(slot->values.data_ptr());
+    slot->out_scales = static_cast<uint8_t*>(slot->scales_out.data_ptr());
+    slot->count = count;
+    s.fixed.push_back(std::move(slot));
+    return static_cast<int64_t>(s.fixed.size()) - 1;
+  }
+
+  // Queue on the current CUDA stream, capture allowed: the copy of dev_ids
+  // to the slot's host ids, the fetch as a host function on the slot's
+  // staging, and the copies of its values and scales to dev_values and
+  // dev_scales. Every argument is fixed, so a graph replays it as is.
+  void enqueue_fixed(int64_t index, torch::Tensor dev_ids,
+                     torch::Tensor dev_values, torch::Tensor dev_scales) {
+    FetchState& s = *state_;
+    TORCH_CHECK(0 <= index && index < static_cast<int64_t>(s.fixed.size()),
+                "No such Engram fixed staging");
+    FixedSlot& f = *s.fixed[index];
+    check_cuda(dev_ids, f.count * 8, "device ids");
+    check_cuda(dev_values, f.count * s.row_bytes, "device values");
+    check_cuda(dev_scales, f.count * s.scale_bytes, "device scales");
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    s.fixed_queued.store(true);
+    check_copy(cudaMemcpyAsync(f.id, dev_ids.data_ptr(), f.count * 8,
+                               cudaMemcpyDeviceToHost, stream),
+               "copy of the ids to the host");
+    check_copy(cudaLaunchHostFunc(stream, &run_fixed_queued, &f),
+               "queue the host fetch");
+    check_copy(cudaMemcpyAsync(dev_values.data_ptr(), f.out_values,
+                               f.count * s.row_bytes, cudaMemcpyHostToDevice,
+                               stream),
+               "copy of the values to the device");
+    check_copy(cudaMemcpyAsync(dev_scales.data_ptr(), f.out_scales,
+                               f.count * s.scale_bytes, cudaMemcpyHostToDevice,
+                               stream),
+               "copy of the scales to the device");
+  }
+
+  // The fixed fetch of slot `index` on the calling thread (no copies).
+  void run_fixed(int64_t index) {
+    FetchState& s = *state_;
+    TORCH_CHECK(0 <= index && index < static_cast<int64_t>(s.fixed.size()),
+                "No such Engram fixed staging");
+    execute_fixed(*s.fixed[index]);
+  }
+
+  // [failed rows, first failed row id, its errno (0: end of file), byte
+  // offset reached, fetches stopped] of the fixed fetches since the last
+  // call; never waits for a fetch in flight.
+  torch::Tensor take_fixed() {
+    FetchState& s = *state_;
+    torch::Tensor result =
+        torch::empty({5}, torch::dtype(torch::kInt64).device(torch::kCPU));
+    int64_t* data = result.data_ptr<int64_t>();
+    data[1] = s.fixed_row.load();
+    data[2] = s.fixed_error.load();
+    data[3] = s.fixed_offset.load();
+    data[0] = s.fixed_failed.exchange(0);
+    data[4] = s.fixed_stopped.exchange(0);
+    return result;
+  }
+
   int64_t cache_bytes() { return state_->cache.nbytes(); }
 
   int64_t prefault() {
@@ -580,5 +748,9 @@ void register_engram_host_fetch(torch::Library& m) {
       .def("reset_counters", &EngramHostFetch::reset_counters)
       .def("cache_rows", &EngramHostFetch::cache_rows)
       .def("cache_bytes", &EngramHostFetch::cache_bytes)
-      .def("prefault", &EngramHostFetch::prefault);
+      .def("prefault", &EngramHostFetch::prefault)
+      .def("add_fixed", &EngramHostFetch::add_fixed)
+      .def("enqueue_fixed", &EngramHostFetch::enqueue_fixed)
+      .def("run_fixed", &EngramHostFetch::run_fixed)
+      .def("take_fixed", &EngramHostFetch::take_fixed);
 }
