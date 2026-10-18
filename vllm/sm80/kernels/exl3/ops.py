@@ -45,11 +45,16 @@ MOE_PREFILL_MIN_ROWS = MOE_V2_MAX_ROWS + 1
 MOE_PREFILL_MAX_ROWS = 3460
 
 
+# Output dtypes of the dense linear: BF16 rounds the FP32 result once; FP32
+# stores it as the kernels computed it.
+LINEAR_OUT_DTYPES = (torch.bfloat16, torch.float32)
+
+
 def _linear_fake(
     x, trellis, suh, svh, bits_x2, codebook, logical_in, logical_out, out, workspace
 ):
     torch._check(x.dtype == torch.bfloat16)
-    torch._check(out.dtype == torch.bfloat16)
+    torch._check(out.dtype in LINEAR_OUT_DTYPES)
     torch._check(out.shape[0] == x.shape[0])
     torch._check(out.shape[1] == logical_out)
     torch._check(x.shape[1] == logical_in)
@@ -841,9 +846,10 @@ def _linear(
     codebook: int,
     logical_out: int,
     row_chunk: int,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     workspace = _linear_scratch(x.device)
-    out = torch.empty((x.shape[0], logical_out), dtype=x.dtype, device=x.device)
+    out = torch.empty((x.shape[0], logical_out), dtype=out_dtype, device=x.device)
     operator = linear_out_splitk if _dense_splitk else linear_out
     if dense_prefill_tc.active:
         operator = dense_prefill_tc.route(operator, x.shape[0], _dense_splitk)
@@ -863,10 +869,21 @@ def _linear(
     return out
 
 
-def _linear_meta(x, trellis, suh, svh, bits_x2, codebook, logical_out, row_chunk):
+def _linear_meta(
+    x,
+    trellis,
+    suh,
+    svh,
+    bits_x2,
+    codebook,
+    logical_out,
+    row_chunk,
+    out_dtype=torch.bfloat16,
+):
     torch._check(x.dtype == torch.bfloat16)
     torch._check(x.dim() == 2)
-    return x.new_empty((x.shape[0], logical_out))
+    torch._check(out_dtype in LINEAR_OUT_DTYPES)
+    return x.new_empty((x.shape[0], logical_out), dtype=out_dtype)
 
 
 direct_register_custom_op(

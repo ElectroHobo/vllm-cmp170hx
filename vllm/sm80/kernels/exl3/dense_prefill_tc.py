@@ -110,8 +110,9 @@ def closed_reason(
 
 
 def _warmup(sms: int) -> None:
-    """Run linear_out_prefill once per covered format before any capture, so
-    no request's first prefill loads the kernels or sets their attributes.
+    """Run linear_out_prefill once per covered format and output dtype (BF16,
+    FP32) before any capture, so no request's first prefill loads the kernels
+    or sets their attributes.
     The temporary buffers are freed again. ops.ensure_extension runs this
     before it marks the library loaded, so the workspace size comes from the
     library itself: ops.linear_workspace_size would call ensure_extension."""
@@ -119,7 +120,10 @@ def _warmup(sms: int) -> None:
     rows, padded_in, padded_out = WARMUP_LAUNCH
 
     x = torch.ones((rows, padded_in), dtype=torch.bfloat16, device=device)
-    out = torch.empty((rows, padded_out), dtype=torch.bfloat16, device=device)
+    outs = [
+        torch.empty((rows, padded_out), dtype=dtype, device=device)
+        for dtype in (torch.bfloat16, torch.float32)
+    ]
     workspace = torch.empty(
         torch.ops._exl3_C.linear_workspace_size(rows, padded_in, padded_out),
         dtype=torch.float32,
@@ -133,18 +137,19 @@ def _warmup(sms: int) -> None:
             dtype=torch.int16,
             device=device,
         )
-        linear_out_prefill(
-            x,
-            trellis,
-            suh,
-            svh,
-            bits_x2,
-            VALIDATED_CODEBOOK,
-            padded_in,
-            padded_out,
-            out,
-            workspace,
-        )
+        for out in outs:
+            linear_out_prefill(
+                x,
+                trellis,
+                suh,
+                svh,
+                bits_x2,
+                VALIDATED_CODEBOOK,
+                padded_in,
+                padded_out,
+                out,
+                workspace,
+            )
     torch.cuda.synchronize(device)
 
 

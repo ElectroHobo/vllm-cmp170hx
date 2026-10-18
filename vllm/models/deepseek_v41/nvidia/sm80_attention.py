@@ -59,6 +59,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.sm80.kernels.exl3.quant import set_output_dtype
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -300,6 +301,12 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 disable_tp=True,
                 prefix=f"{c.prefix}.fused_wkv_wgate",
             )
+            if c.has_gate:
+                # Above ratio 1 the reference projects in FP32 for its FP32
+                # softmax pooling (wkv and wgate are FP32 linears applied to
+                # x.float(), exactly the BF16 x): the EXL3 linear returns its
+                # FP32 result unrounded. Ratio 1 stays BF16, as there.
+                set_output_dtype(c.fused_wkv_wgate, torch.float32)
         tp_size = self.n_heads // self.n_local_heads
         index_n_heads = getattr(config, "index_n_heads", 0)
         cand_source = self.candidate_source_layer

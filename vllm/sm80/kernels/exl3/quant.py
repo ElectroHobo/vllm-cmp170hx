@@ -26,6 +26,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sm80.kernels.exl3.layout import Exl3Layout, exl3_layout
@@ -331,6 +332,10 @@ class Exl3LinearMethod(LinearMethodBase):
         self.head_columns: tuple[int, int, int] | None = None
         # Keys of the matrices other ranks hold (grouped projections).
         self.nonlocal_keys: list[str] = []
+        # Output dtype (ops.LINEAR_OUT_DTYPES): BF16, or FP32 for a layer whose
+        # output the model keeps in FP32 (set_output_dtype; an LM head takes
+        # ModelConfig.head_dtype).
+        self.out_dtype = torch.bfloat16
 
     def create_weights(
         self,
@@ -428,6 +433,13 @@ class Exl3LinearMethod(LinearMethodBase):
         low = start // 128 * 128
         high = min(-(-end // 128) * 128, matrix.padded_out)
         self.head_columns = (start - low, end - start, partition)
+        # The logits come out in the head dtype, as LogitsProcessor computes
+        # them for an unquantized head (Exl3HeadLogitsProcessor).
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None and vllm_config.model_config is not None:
+            self.out_dtype = _linear_out_dtype(vllm_config.model_config.head_dtype)
         layer.exl3_weights = nn.ModuleList(
             [
                 Exl3PackedWeight(
@@ -466,6 +478,7 @@ class Exl3LinearMethod(LinearMethodBase):
                 weight.matrix.codebook,
                 weight.logical_out,
                 row_chunk,
+                self.out_dtype,
             )
             for weight, row_chunk in zip(layer.exl3_weights, self.row_chunks)
         ]
@@ -488,6 +501,56 @@ def _head_partition(
     if partition > width:
         return torch.nn.functional.pad(output, (0, partition - width))
     return output.contiguous()
+
+
+def _linear_out_dtype(dtype: torch.dtype) -> torch.dtype:
+    from vllm.sm80.kernels.exl3.ops import LINEAR_OUT_DTYPES
+
+    if dtype not in LINEAR_OUT_DTYPES:
+        raise ValueError(f"EXL3 linear outputs are BF16 or FP32, not {dtype}")
+    return dtype
+
+
+def set_output_dtype(layer: nn.Module, dtype: torch.dtype) -> None:
+    """Have the EXL3 linear ``layer`` return ``dtype`` (BF16 or FP32). The
+    kernels accumulate in FP32 either way; FP32 stores that result instead of
+    rounding it to BF16."""
+    method = getattr(layer, "quant_method", None)
+    if not isinstance(method, Exl3LinearMethod):
+        raise TypeError(
+            f"{type(layer).__name__} has no EXL3 linear method "
+            f"({type(method).__name__}) to set an output dtype on"
+        )
+    method.out_dtype = _linear_out_dtype(dtype)
+
+
+class Exl3HeadLogitsProcessor(LogitsProcessor):
+    """LogitsProcessor that also serves a head_dtype different from the
+    model dtype with an EXL3 LM head: the head stores its logits in the head
+    dtype (Exl3LinearMethod._create_head_weights), so it runs as it is.
+    Every other head takes the upstream path."""
+
+    @classmethod
+    def adopt(cls, processor: LogitsProcessor) -> None:
+        assert type(processor) is LogitsProcessor, type(processor)
+        processor.__class__ = cls
+
+    def _apply_head(
+        self,
+        lm_head: nn.Module,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        method = lm_head.quant_method
+        if not isinstance(method, Exl3LinearMethod):
+            return super()._apply_head(lm_head, hidden_states, embedding_bias)
+        head_dtype = self.head_dtype or hidden_states.dtype
+        if method.out_dtype != head_dtype:
+            raise ValueError(
+                f"The EXL3 LM head stores {method.out_dtype}, the head dtype is "
+                f"{head_dtype}"
+            )
+        return method.apply(lm_head, hidden_states, bias=embedding_bias)
 
 
 class Exl3GroupedLinearMethod(Exl3LinearMethod):
@@ -554,6 +617,7 @@ class Exl3GroupedLinearMethod(Exl3LinearMethod):
                 weight.matrix.codebook,
                 weight.logical_out,
                 row_chunk,
+                self.out_dtype,
             )
             for group, (weight, row_chunk) in enumerate(
                 zip(layer.exl3_weights, self.row_chunks)

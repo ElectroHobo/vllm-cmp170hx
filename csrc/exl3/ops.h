@@ -11,6 +11,7 @@ int64_t moe_workspace_size(int64_t max_rows, int64_t hidden_size,
                            int64_t intermediate_size, int64_t topk,
                            int64_t local_experts);
 
+// out is BF16, or FP32 for the unrounded result (check_linear_out).
 void linear_out(const torch::Tensor& x, const torch::Tensor& trellis,
                 const torch::Tensor& suh, const torch::Tensor& svh,
                 int64_t bits_x2, int64_t codebook, int64_t logical_in,
