@@ -101,7 +101,7 @@ def test_fp64_within_v2_of_the_torch_formulas(T, variant, fused):
         cs = cm = rs = rm = 0.0
         n = 0
         for a in calls:
-            c = family(a, CUDA, output)
+            c = family(a, CUDA, F.Source({}, {}, output))
             s, mx, k = F.abs_errors(c.cand, c.exact)
             cs, cm, n = cs + s, max(cm, mx), n + k
             ref_exact = c.exact if c.ref_exact is None else c.ref_exact

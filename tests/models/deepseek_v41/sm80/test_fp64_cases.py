@@ -112,6 +112,21 @@ def _engram(g, n=21, dim=256):
     return dict(values=values, scales=scales)
 
 
+def _mhc(g, pre_only=False):
+    """A delayed mHC call (6 tokens: one kernel A form on CUDA), fused or
+    pre-only, in the capture point's arguments."""
+    from .test_sm80_mhc_fused import make_inputs
+
+    a = make_inputs(6, 256, seed=int(torch.randint(0, 1 << 30, (1,), generator=g)))
+    if pre_only:
+        a.update(x=None, post_layer_mix=None, comb_res_mix=None)
+    return {k: v for k, v in a.items() if v is not None}
+
+
+# mHC case ids: <family>:<output> (the output the case judges)
+MHC = ("mhc_delayed:comb", "mhc_delayed:layer_input.rp", "mhc_pre_delayed:pre")
+
+
 @pytest.fixture(scope="module")
 def cases(tmp_path_factory):
     d = tmp_path_factory.mktemp("sources")
@@ -135,10 +150,14 @@ def cases(tmp_path_factory):
         ],
         "index_keys": [_source(d, "keys", "index_keys", _index_keys(g))],
         "engram_dequant": [_source(d, "engram", "engram_dequant", _engram(g))],
+        "mhc_delayed:comb": [_source(d, "mhc", "mhc_delayed", _mhc(g))],
+        "mhc_delayed:layer_input.rp": [_source(d, "mhc_li", "mhc_delayed", _mhc(g))],
+        "mhc_pre_delayed:pre": [_source(d, "mhc_pre", "mhc_pre_delayed", _mhc(g, True))],
     }
     return [
         {"id": k, "family": k.split(":")[0], "phase": "decode", "concurrency": 1,
-         "calls": len(v), "captured_sources": v}
+         "calls": len(v), "captured_sources": v,
+         **({"output": k.split(":")[1]} if k in MHC else {})}
         for k, v in sources.items()
     ]
 
@@ -171,7 +190,9 @@ def test_every_family_runs_on_cpu(tmp_path, cases):
     assert set(rows) == {c["id"] for c in cases}
     for cid, row in rows.items():
         _well_formed(row)
-        assert row["row_invariance"], cid
+        # mHC on CPU is the torch formulas, whose FP32 projection (a BLAS
+        # GEMM) takes another path for one row than for six
+        assert row["row_invariance"] or cid in MHC, cid
         e = row["fp64"]
         if cid == "sparse_attention":
             # The torch definition against the reference kernel's arithmetic:
@@ -186,6 +207,31 @@ def test_every_family_runs_on_cpu(tmp_path, cases):
         if cid in ("index_scores", "compress"):
             assert e["cand_max"] > 0, cid  # their BF16 rounding is measured
     assert rows["compress"]["family"] == "compress"
+    for cid in MHC:
+        assert rows[cid]["family"] == cid, cid
+
+
+def test_an_mhc_case_judges_the_output_it_names(tmp_path, cases, capsys):
+    """The case's output, else its family's or the cases file's suffix after
+    ':'; none, or a name that is not an output: the case gets no line and
+    the run is refused."""
+    mhc = next(c for c in cases if c["id"] == "mhc_delayed:comb")
+    bare = {k: v for k, v in mhc.items() if k != "output"}
+    rc, _, rows = _run(tmp_path, [dict(bare, family="mhc_delayed:post.rp")])
+    assert rc == 0 and rows[bare["id"]]["family"] == "mhc_delayed:post.rp"
+    assert rows[bare["id"]]["numel"] == 6 * 4
+    rc, _, rows = _run(tmp_path, [dict(bare, output="layer_input")])
+    assert rows[bare["id"]]["family"] == "mhc_delayed:layer_input"
+    assert rows[bare["id"]]["numel"] == 6 * 256
+    rc, _, rows = _run(tmp_path, [dict(bare, id="none"), dict(bare, id="typo", output="comb.x")])
+    assert rc == 1 and rows == {}
+    err = capsys.readouterr().err
+    assert "case none: ValueError: mHC cases name their output" in err
+    assert "case typo: ValueError: mHC output 'comb.x'" in err
+    pre = next(c for c in cases if c["id"] == "mhc_pre_delayed:pre")
+    rc, _, rows = _run(tmp_path, [dict(pre, output="residual")])
+    assert rc == 1 and rows == {}
+    assert "the pre-only call has no residual output" in capsys.readouterr().err
 
 
 def test_every_family_has_a_point_whose_parameters_are_its_arguments():

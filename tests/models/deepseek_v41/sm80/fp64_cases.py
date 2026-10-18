@@ -81,6 +81,25 @@ unless named in full.
   recorded ``packed_meta``. moe_out_v2 also records ``bits_x2``, the layer's
   one routed bit width, which must be the one in ``packed_meta``.
   ``moe_out`` is its own reference path.
+- ``mhc_delayed``: ``sm80_mhc:mhc_fused_post_pre_delayed`` (x, residual,
+  post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
+  hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, pre_mix, norm_weight,
+  norm_eps) and ``mhc_pre_delayed``: ``sm80_mhc:mhc_pre_delayed`` (the same
+  without x, post_layer_mix, comb_res_mix) -> the fused kernels
+  (``sm80_mhc_fused``; the torch formulas on CPU) / the torch formulas
+  (``sm80_mhc``) / :func:`mhc_delayed_fp64`. Several outputs, judged one per
+  case: the case's ``output``, else the suffix after ``:`` of the case's
+  or the file's ``family`` (e.g. ``mhc_delayed:comb``); one of residual (fused only),
+  post, comb, layer_input, pre against the FP64 op with no intermediate
+  rounding, or post.rp, comb.rp, layer_input.rp, pre.rp against the FP64 op
+  at each path's OWN BF16 rounding points (its own BF16 streams feed the
+  coefficients and the collapse, the collapse is rounded before the norm):
+  each path is judged against FP64 from the streams it produced, which
+  isolates the arithmetic after the streams from which stream elements the
+  path's BF16 rounding happened to round the other way (a single such
+  element moves the coefficients by more than their FP32 arithmetic does).
+  Row invariance holds within a kernel variant (up to 8 rows and from 9
+  rows, the two kernel A forms reduce in different orders).
 """
 
 import argparse
@@ -112,15 +131,22 @@ class Call:
     ref: torch.Tensor
     exact: torch.Tensor
     row_invariant: bool
+    # the FP64 value the reference path is judged against when it is not
+    # ``exact`` (per-path references), and the reference path's own row
+    # invariance where a family reports it
+    ref_exact: torch.Tensor | None = None
+    ref_row_invariant: bool | None = None
 
 
 @dataclass
 class Source:
-    """What a family reads besides the arguments: the call's metadata and
-    the served launch's checkpoints ({role: directory})."""
+    """What a family reads besides the arguments: the call's metadata,
+    the served launch's checkpoints ({role: directory}) and, for the
+    families with several outputs, the output the case judges."""
 
     meta: dict
     checkpoint: dict
+    output: str | None = None
 
 
 def picks(n: int) -> list[int]:
@@ -536,6 +562,176 @@ def _exl3_moe(name: str, a: dict, device: torch.device, src: Source) -> Call:
     return Call(whole, ref, exact, alone)
 
 
+# ---------------------------------------------------------------- mHC
+
+MHC_TOKEN_ARGS = ("x", "residual", "post_layer_mix", "comb_res_mix", "pre_mix")
+MHC_OUTPUTS = ("residual", "post", "comb", "layer_input", "pre")
+
+
+def mhc_delayed_fp64(
+    t: dict, rounding: bool = False, own: torch.Tensor | None = None
+) -> dict[str, torch.Tensor]:
+    """The delayed mHC of one call in FP64, from its inputs ``t`` (the
+    capture point's arguments; no ``x``: the pre-only call). ``rounding``
+    keeps the BF16 rounding points: the streams are rounded before the
+    coefficients and the collapse (to ``own``, a path's own BF16 streams,
+    when given), the collapse before the norm.
+    Returns every output of the call by name (residual only with ``x``)."""
+    res = t["residual"].double()
+    T, hc, hidden = res.shape
+    iters, eps = int(t["sinkhorn_repeat"]), float(t["hc_pre_eps"])
+    if t.get("x") is not None:
+        post = t["post_layer_mix"].double().reshape(T, hc)
+        comb = t["comb_res_mix"].double().reshape(T, hc, hc)
+        streams = post[..., None] * t["x"].double()[:, None, :] + torch.einsum(
+            "tjk,tjh->tkh", comb, res
+        )
+    else:
+        streams = res
+    if not rounding:
+        used = streams
+    elif own is None:
+        used = streams.to(BF16).double()
+    else:
+        used = own.double()
+    flat = used.reshape(T, hc * hidden)
+    rs = torch.rsqrt(flat.square().mean(-1, keepdim=True) + float(t["rms_eps"]))
+    mixes = (flat @ t["fn"].double().T) * rs
+    scale, base = t["hc_scale"].double(), t["hc_base"].double()
+    pre = torch.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + eps
+    new_post = float(t["hc_post_mult_value"]) * torch.sigmoid(
+        mixes[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc]
+    )
+    c = (mixes[:, 2 * hc :] * scale[2] + base[2 * hc :]).view(T, hc, hc)
+    c = torch.softmax(c, dim=-1) + eps
+    c = c / (c.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(iters - 1):
+        c = c / (c.sum(dim=-1, keepdim=True) + eps)
+        c = c / (c.sum(dim=-2, keepdim=True) + eps)
+    pre_mix = t.get("pre_mix")
+    if pre_mix is None:
+        w = torch.zeros(T, hc, dtype=torch.float64)
+        w[:, 0] = 1.0
+    else:
+        w = pre_mix.double().reshape(T, hc)
+    li = (w[..., None] * used).sum(dim=1)
+    if rounding:
+        li = li.to(BF16).double()
+    norm_weight = t.get("norm_weight")
+    if norm_weight is not None:
+        li = li * torch.rsqrt(li.square().mean(-1, keepdim=True) + float(t["norm_eps"]))
+        li = li * norm_weight.double()
+    out = {"post": new_post[..., None], "comb": c, "layer_input": li, "pre": pre}
+    if t.get("x") is not None:
+        out["residual"] = streams
+    return out
+
+
+def _mhc_call(a: dict, device: torch.device, rows: slice, fused: bool) -> dict:
+    """One path's outputs by name on ``device`` for the tokens ``rows``."""
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
+
+    if fused:
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused as mod
+    else:
+        mod = sm80_mhc
+    t = {
+        k: (v[rows] if k in MHC_TOKEN_ARGS and v is not None else v)
+        for k, v in a.items()
+    }
+    t = {k: _to(v, device) for k, v in t.items()}
+    common = (
+        t["fn"],
+        t["hc_scale"],
+        t["hc_base"],
+        float(t["rms_eps"]),
+        float(t["hc_pre_eps"]),
+        float(t["hc_sinkhorn_eps"]),
+        float(t["hc_post_mult_value"]),
+        int(t["sinkhorn_repeat"]),
+    )
+    kw = dict(
+        pre_mix=t.get("pre_mix"),
+        norm_weight=t.get("norm_weight"),
+        norm_eps=float(t.get("norm_eps", 1e-6)),
+    )
+    if t.get("x") is None:
+        post, comb, li, pre = mod.mhc_pre_delayed(t["residual"], *common, **kw)
+        return {"post": post, "comb": comb, "layer_input": li, "pre": pre}
+    streams, post, comb, li, pre, _ = mod.mhc_fused_post_pre_delayed(
+        t["x"], t["residual"], t["post_layer_mix"], t["comb_res_mix"], *common, **kw
+    )
+    return {"residual": streams, "post": post, "comb": comb, "layer_input": li, "pre": pre}
+
+
+def _mhc(a: dict, device: torch.device, output: str | None) -> Call:
+    if output is None:
+        raise ValueError(
+            "mHC cases name their output (case 'output', or the case's or "
+            "file's 'family' "
+            f"'<family>:<output>'): one of {MHC_OUTPUTS} or <output>.rp"
+        )
+    name, _, mode = output.partition(".")
+    if name not in MHC_OUTPUTS or mode not in ("", "rp") or (name, mode) == ("residual", "rp"):
+        raise ValueError(f"mHC output {output!r} is not one of {MHC_OUTPUTS} or <output>.rp")
+    if name == "residual" and a.get("x") is None:
+        raise ValueError("the pre-only call has no residual output")
+    fused = device.type == "cuda"
+    n = a["residual"].shape[0]
+    cand_all = _mhc_call(a, device, slice(None), fused)
+    ref_all = _mhc_call(a, device, slice(None), False)
+    whole, ref = cand_all[name], ref_all[name]
+    step = max(1, CHUNK_BYTES // max(1, 4 * a["residual"][0].numel() * 8))
+
+    def fp64(streams):
+        """FP64 output; at the rounding points of ``streams`` (a path's
+        own BF16 streams) in the .rp mode."""
+        parts = []
+        for s in range(0, n, step):
+            t = {
+                k: (v[s : s + step] if k in MHC_TOKEN_ARGS and v is not None else v)
+                for k, v in a.items()
+            }
+            own = None if streams is None else streams[s : s + step].cpu()
+            parts.append(mhc_delayed_fp64(t, rounding=mode == "rp", own=own)[name])
+        return torch.cat(parts)
+
+    if mode == "rp":
+        # each path against FP64 from its own BF16 streams (the input
+        # streams for the pre-only call, which both paths read unchanged)
+        own = (lambda p: p["residual"]) if a.get("x") is not None else (lambda p: None)
+        exact, ref_exact = fp64(own(cand_all)), fp64(own(ref_all))
+    else:
+        exact, ref_exact = fp64(None), None
+
+    def alone(is_fused, value):
+        return all(
+            bits_equal(value[i : i + 1], _mhc_call(a, device, slice(i, i + 1), is_fused)[name])
+            for i in picks(n)
+        )
+
+    return Call(
+        whole, ref, exact, alone(fused, whole), ref_exact=ref_exact,
+        ref_row_invariant=alone(False, ref),
+    )
+
+
+def mhc_delayed(a: dict, device: torch.device, src: Source) -> Call:
+    if a.get("x") is None:
+        raise ValueError("mhc_delayed: the call has no x (pre-only calls are mhc_pre_delayed)")
+    return _mhc(a, device, src.output)
+
+
+def mhc_pre_delayed(a: dict, device: torch.device, src: Source) -> Call:
+    if a.get("x") is not None:
+        raise ValueError("mhc_pre_delayed: the call has an x (fused calls are mhc_delayed)")
+    return _mhc(a, device, src.output)
+
+
+# Families with several outputs: the case names the one it judges.
+MULTI_OUTPUT = {"mhc_delayed", "mhc_pre_delayed"}
+
+
 FAMILIES = {
     "sparse_attention": sparse_attention,
     "index_scores": index_scores,
@@ -548,6 +744,8 @@ FAMILIES = {
         f"exl3_{op}": functools.partial(_exl3_moe, op)
         for op in ("moe_out", "moe_out_v2", "moe_out_prefill")
     },
+    "mhc_delayed": mhc_delayed,
+    "mhc_pre_delayed": mhc_pre_delayed,
 }
 
 
@@ -556,6 +754,9 @@ FAMILIES = {
 _CORE = "vllm.models.deepseek_v41.nvidia.ops.sm80_attn_core"
 _MOE_ARGS = ["x", "topk_ids", "topk_weights", "packed_meta", "expert_map",
              "intermediate_size", "swiglu_limit"]
+_MHC = "vllm.models.deepseek_v41.nvidia.ops.sm80_mhc"
+_MHC_ARGS = ["fn", "hc_scale", "hc_base", "rms_eps", "hc_pre_eps", "hc_sinkhorn_eps",
+             "hc_post_mult_value", "sinkhorn_repeat", "pre_mix", "norm_weight", "norm_eps"]
 POINTS = {
     "sparse_attention": (f"{_CORE}:sparse_attention",
                          ["q", "swa_cache", "swa_indices", "comp_cache",
@@ -576,16 +777,26 @@ POINTS = {
     "exl3_moe_out": ("vllm.sm80.kernels.exl3.ops:moe_out", _MOE_ARGS),
     "exl3_moe_out_v2": ("vllm.sm80.kernels.exl3.ops:moe_out_v2", _MOE_ARGS + ["bits_x2"]),
     "exl3_moe_out_prefill": ("vllm.sm80.kernels.exl3.ops:moe_out_prefill", _MOE_ARGS),
+    "mhc_delayed": (f"{_MHC}:mhc_fused_post_pre_delayed",
+                    ["x", "residual", "post_layer_mix", "comb_res_mix", *_MHC_ARGS]),
+    "mhc_pre_delayed": (f"{_MHC}:mhc_pre_delayed", ["residual", *_MHC_ARGS]),
 }
 
 
 # ---------------------------------------------------------------- driver
 
 
-def case_row(case: dict, device: torch.device, checkpoint: dict) -> dict:
+def case_row(
+    case: dict, device: torch.device, checkpoint: dict, family_output: str | None = None
+) -> dict:
+    """``family_output``: the output a multi-output family judges when
+    neither the case's ``output`` nor its ``family`` (after ``:``) names one
+    (the cases file's ``family`` suffix)."""
     sources = case.get("captured_sources")
     if not sources:
         raise ValueError("no captured_sources: the case cannot be replayed")
+    case_family, _, case_output = str(case.get("family") or "").partition(":")
+    output = case.get("output") or case_output or family_output
     cand_sum = cand_max = ref_sum = ref_max = 0.0
     count = numel = 0
     bitwise = invariant = True
@@ -597,13 +808,15 @@ def case_row(case: dict, device: torch.device, checkpoint: dict) -> dict:
         family = obj.get("family")
         if family not in FAMILIES:
             raise ValueError(f"{path}: family {family!r} is not one of {sorted(FAMILIES)}")
-        if case.get("family", family) != family:
+        if (case_family or family) != family:
             raise ValueError(f"{path}: family {family!r} in a case of {case['family']!r}")
-        families.add(family)
-        src = Source(obj.get("meta") or {}, checkpoint)
+        multi = family in MULTI_OUTPUT
+        families.add(f"{family}:{output}" if multi else family)
+        src = Source(obj.get("meta") or {}, checkpoint, output if multi else None)
         call = FAMILIES[family](obj["tensors"], device, src)
         cs, cm, n = abs_errors(call.cand, call.exact)
-        rs, rm, _ = abs_errors(call.ref, call.exact)
+        ref_exact = call.exact if call.ref_exact is None else call.ref_exact
+        rs, rm, _ = abs_errors(call.ref, ref_exact)
         cand_sum, cand_max = cand_sum + cs, max(cand_max, cm)
         ref_sum, ref_max = ref_sum + rs, max(ref_max, rm)
         count += n
@@ -654,10 +867,11 @@ def run(cases: Path, out: Path, device: torch.device) -> int:
     with Path(out).open("w") as f, torch.inference_mode():
         f.write(json.dumps({"header": header(device)}) + "\n")
         checkpoint = doc.get("checkpoint") or {}
+        family_output = str(doc.get("family") or "").partition(":")[2] or None
         failed = []
         for case in doc.get("cases") or []:
             try:
-                row = case_row(case, device, checkpoint)
+                row = case_row(case, device, checkpoint, family_output)
             except Exception as exc:  # noqa: BLE001 - reported, the other cases still run
                 print(f"case {case.get('id')}: {type(exc).__name__}: {exc}", file=sys.stderr)
                 failed.append(str(case.get("id")))
