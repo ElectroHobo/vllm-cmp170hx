@@ -19,9 +19,18 @@ import torch
 import torch.nn as nn
 
 from vllm.models.deepseek_v41.nvidia import sm80_attention as sm80
+from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
 
 from . import test_attn_layers as layers
-from .dsv41_ref import LayerSpec, PagedRun, RefArgs, make_weights
+from .dsv41_ref import (
+    LayerSpec,
+    PagedRun,
+    RefArgs,
+    core_config,
+    core_weights,
+    layer_inputs,
+    make_weights,
+)
 
 
 @pytest.mark.parametrize(
@@ -182,27 +191,37 @@ def _full_graph_padding(build, pad: int):
     block. Their input rows are the garbage rows ``run_sm80`` appends."""
 
     def padded(self, sched):
-        batch = build(self, sched)
-        dev = batch.positions.device
-        p0 = batch.positions[:1].expand(pad)
-        minus = torch.full((pad,), -1, dtype=torch.int64, device=dev)
-        batch.positions = torch.cat([batch.positions, p0])
-        batch.token_to_req = torch.cat(
-            [batch.token_to_req, torch.zeros(pad, dtype=batch.token_to_req.dtype)]
-        )
-        batch.swa_slots = torch.cat([batch.swa_slots, minus])
-        batch.swa_indices = torch.cat(
-            [batch.swa_indices, torch.full_like(batch.swa_indices[:1], -1).expand(pad, -1)]
-        )
-        for name in ("comp_slots", "idxk_slots"):
-            setattr(batch, name, torch.cat([getattr(batch, name), minus]))
-        req0 = self.last_reqs[0]
-        cap = self.ring.shape[1]
-        ring = req0.ring * cap + p0 % cap if req0.ring >= 0 else minus
-        batch.ring_slots = torch.cat([batch.ring_slots, ring])
-        return batch
+        return _pad_like_full(self, build(self, sched), pad)
 
     return padded
+
+
+def _pad_like_full(run: PagedRun, batch, pad: int):
+    """``batch`` with ``pad`` padding tokens as a FULL graph's metadata has
+    them (see :func:`_full_graph_padding`)."""
+    if pad <= 0:
+        return batch
+    dev = batch.positions.device
+    p0 = batch.positions[:1].expand(pad)
+    minus = torch.full((pad,), -1, dtype=torch.int64, device=dev)
+    batch.positions = torch.cat([batch.positions, p0])
+    batch.token_to_req = torch.cat(
+        [
+            batch.token_to_req,
+            torch.zeros(pad, dtype=batch.token_to_req.dtype, device=dev),
+        ]
+    )
+    batch.swa_slots = torch.cat([batch.swa_slots, minus])
+    batch.swa_indices = torch.cat(
+        [batch.swa_indices, torch.full_like(batch.swa_indices[:1], -1).expand(pad, -1)]
+    )
+    for name in ("comp_slots", "idxk_slots"):
+        setattr(batch, name, torch.cat([getattr(batch, name), minus]))
+    req0 = run.last_reqs[0]
+    cap = run.ring.shape[1]
+    ring = req0.ring * cap + p0 % cap if req0.ring >= 0 else minus
+    batch.ring_slots = torch.cat([batch.ring_slots, ring])
+    return batch
 
 
 @pytest.mark.parametrize(
@@ -238,3 +257,80 @@ def test_full_graph_padding_rows_change_nothing(monkeypatch, specs) -> None:
         [run_b.comp, run_b.idxk, run_b.ring, run_b.swa_caches[0]],
     ):
         assert torch.equal(a, b), name
+
+
+_STACKS = [
+    [LayerSpec(0)],
+    [LayerSpec(2, kv_source=True, index_source=True), LayerSpec(2)],
+    [
+        LayerSpec(1, kv_source=True, index_source=True, candidate_source=True),
+        LayerSpec(1),
+        LayerSpec(1, index_source=True, uses_candidates=True),
+    ],
+]
+_DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+    ),
+]
+
+
+def _decode_run(args, specs, weights, live: int, rows: int, full: bool, device):
+    """Prefill ``live`` requests, then decode them one token a step with the
+    layer's input padded to ``rows`` rows. ``full``: the metadata covers the
+    padding tokens too, as in a FULL graph; else only the live tokens, as in
+    a piecewise step. Returns the live outputs and the caches."""
+    run = PagedRun(args, specs, device=device)
+    cfgs = [core_config(args, s) for s in specs]
+    cws = [core_weights(args, s, w, device) for s, w in zip(specs, weights)]
+    h = args.n_heads // args.world_size
+    g = torch.Generator().manual_seed(3)
+    prefill = [(r, 40 + 9 * r) for r in range(live)]
+    schedule = [prefill] + [[(r, 1) for r in range(live)] for _ in range(12)]
+    outs = []
+    for step, sched in enumerate(schedule):
+        batch = run.build(sched)
+        T = batch.num_tokens
+        n = T if step == 0 else rows
+        if full:
+            batch = _pad_like_full(run, batch, n - T)
+        for li, spec in enumerate(specs):
+            x = torch.randn(n, args.dim, generator=g).to(torch.bfloat16)
+            qr_kv, kv_score, iw = layer_inputs(args, spec, weights[li], x)
+            out = torch.full((n, h, args.head_dim), 3.0, dtype=torch.bfloat16)
+            core.forward_layer(
+                cfgs[li],
+                cws[li],
+                run.caches(li),
+                batch,
+                qr_kv.to(device),
+                None if kv_score is None else kv_score.to(device),
+                None if iw is None else iw.to(device),
+                out_dev := out.to(device),
+            )
+            outs.append(out_dev[:T].cpu())
+        run.after_step()
+    caches = [run.comp, run.idxk, run.ring, run.topk, *run.swa_caches]
+    return outs, [c.cpu() for c in caches]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("live,rows", [(3, 4), (5, 8)])
+@pytest.mark.parametrize("specs", _STACKS)
+def test_full_and_piecewise_row_counts_agree(device, live, rows, specs) -> None:
+    """A decode step of ``live`` requests replayed by a FULL graph of
+    ``rows`` tokens (metadata over the padded tokens) gives the outputs and
+    caches of the piecewise step (metadata over the live tokens, input
+    padded to ``rows``), bit for bit."""
+    args = RefArgs()
+    weights = [make_weights(args, s, 300 + i) for i, s in enumerate(specs)]
+    pw_out, pw_caches = _decode_run(args, specs, weights, live, rows, False, device)
+    full_out, full_caches = _decode_run(args, specs, weights, live, rows, True, device)
+    for i, (a, b) in enumerate(zip(pw_out, full_out)):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16)), i
+    for i, (a, b) in enumerate(zip(pw_caches, full_caches)):
+        if i == 3:  # top-k buffer: the live rows of the last index source
+            a, b = a[:live], b[:live]
+        assert torch.equal(a, b), i

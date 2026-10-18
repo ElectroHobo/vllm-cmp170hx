@@ -49,6 +49,7 @@ Only the CPU fallbacks of the Triton kernels (``index_scores_torch``,
 ``sparse_attention_torch``) still index by data.
 """
 
+import dataclasses
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -700,6 +701,38 @@ def output_qdq(
 # ---------------------------------------------------------------------------
 
 
+def pad_batch(batch: Sm80AttnBatch, num_rows: int) -> Sm80AttnBatch:
+    """``batch`` extended to ``num_rows`` tokens with padding tokens that
+    write nothing and attend to nothing: position 0, request 0 (past every
+    request's query), PAD slots and window rows.
+
+    The layer runs every row-wise op (norms, ``wq_b``, the compressor, the
+    index projections, qdq) on the padded row count of its input, whatever
+    the metadata covers: a FULL graph's metadata covers the padded tokens, a
+    piecewise step's only the scheduled ones, and kernels such as reductions
+    and GEMMs may pick their configuration from the row count, which would
+    change the live rows' last bits between the two."""
+    extra = num_rows - batch.num_tokens
+    if extra <= 0:
+        return batch
+
+    def ext(t: torch.Tensor | None, value: int) -> torch.Tensor | None:
+        if t is None:
+            return None
+        return torch.cat([t, t.new_full((extra,) + tuple(t.shape[1:]), value)])
+
+    return dataclasses.replace(
+        batch,
+        positions=ext(batch.positions, 0),
+        token_to_req=ext(batch.token_to_req, 0),
+        swa_slots=ext(batch.swa_slots, -1),
+        swa_indices=ext(batch.swa_indices, -1),
+        comp_slots=ext(batch.comp_slots, -1),
+        idxk_slots=ext(batch.idxk_slots, -1),
+        ring_slots=ext(batch.ring_slots, -1),
+    )
+
+
 def prepare_layer(
     cfg: Sm80AttnConfig,
     weights: Sm80AttnWeights,
@@ -779,7 +812,9 @@ def forward_layer(
     chunk_bytes: int = DEFAULT_SCORE_CHUNK_BYTES,
 ) -> None:
     """One attention layer from the ``wq_a | wkv`` output to the ``wo_a``
-    input: :func:`prepare_layer` then :func:`attend_layer`."""
+    input: :func:`prepare_layer` then :func:`attend_layer`, on the batch
+    padded to ``qr_kv``'s rows (:func:`pad_batch`)."""
+    batch = pad_batch(batch, qr_kv.shape[0])
     q = prepare_layer(
         cfg, weights, caches, batch, qr_kv, kv_score, index_weights, chunk_bytes
     )

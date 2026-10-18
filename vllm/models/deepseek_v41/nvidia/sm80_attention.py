@@ -487,7 +487,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                     3 * self._sm80_chunk_bytes, dtype=torch.uint8, device=out.device
                 )
             return
-        batch = self._sm80_batch(attn_metadata, positions)
+        batch = core.pad_batch(
+            self._sm80_batch(attn_metadata, positions), qr_kv.shape[0]
+        )
         q = core.prepare_layer(
             self.sm80_cfg,
             self._sm80_weights(out.device),
@@ -515,7 +517,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         if not isinstance(attn_metadata, dict):
             output.zero_()
             return
-        self._sm80_attend(self._sm80_batch(attn_metadata, positions), q, output)
+        batch = core.pad_batch(self._sm80_batch(attn_metadata, positions), q.shape[0])
+        self._sm80_attend(batch, q, output)
 
     def _sm80_attend(self, batch, q: torch.Tensor, out: torch.Tensor) -> None:
         core.attend_layer(
