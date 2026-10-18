@@ -50,7 +50,7 @@ class Exl3ModelLoader(DefaultModelLoader):
 
             offload = vllm_config.offload_config
             if offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size:
-                raise ValueError("EXL3 permits runtime offload only for compressed PLE")
+                raise ValueError("EXL3 does not support runtime weight offload")
             if vllm_config.parallel_config.pipeline_parallel_size != 1:
                 raise ValueError("EXL3 requires pipeline parallel size one")
             if vllm_config.lora_config is not None:
@@ -202,10 +202,9 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     require_cuda_parameters(model)
     counts = Counter(disposition for disposition, _ in ledger.entries.values())
     logger.info(
-        "EXL3 packed format, BF16 activations; %s model; PLE placement=%s; "
+        "EXL3 packed format, BF16 activations; %s model; "
         "TP rank=%d/%d, EP=%s; sources: %d consumed, %d file-backed, %d unused",
         "draft" if is_draft else "target",
-        quant.ple_placement,
         get_tensor_model_parallel_rank(),
         config.parallel_config.tensor_parallel_size,
         config.parallel_config.enable_expert_parallel,

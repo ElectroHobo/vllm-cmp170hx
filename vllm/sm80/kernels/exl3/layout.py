@@ -6,7 +6,9 @@ Exl3Config picks one layout per checkpoint from the HF ``model_type``
 (:data:`LAYOUTS`, resolved lazily so no model code is imported until a
 checkpoint of that family is loaded). The base :class:`Exl3Layout` keeps the
 checkpoint names as module names and gives no tensor another owner; a model
-family overrides only what its checkpoint does differently.
+family overrides only what its checkpoint does differently. The shared EXL3
+config, manifest and loader reach model-specific behaviour only through
+these hooks.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ if TYPE_CHECKING:
     from torch import nn
 
     from vllm.sm80.kernels.exl3.quant import Exl3Config
-    from vllm.sm80.kernels.exl3.utils import Exl3LoadLedger
+    from vllm.sm80.kernels.exl3.utils import Exl3LoadLedger, Exl3Manifest
 
 # HF model_type -> "<module>:<class>" of the layout its checkpoints use.
 LAYOUTS = {
@@ -34,11 +36,17 @@ LAYOUTS = {
 class Exl3Layout:
     """Checkpoint names are module names; every tensor has a runtime owner."""
 
-    # Exl3Manifest validates the Qwen4Exp auxiliary files (PLE, MTP mixer).
-    requires_qwen_aux = False
+    # Layout attributes the family's own model code looks up on its
+    # quantization config with getattr (Exl3Config.__getattr__ answers them),
+    # such as the embedding methods of file-backed tables.
+    config_hooks: frozenset[str] = frozenset()
 
     def __init__(self, hf_config=None):
         self.hf_config = hf_config
+
+    def check_manifest(self, manifest: Exl3Manifest) -> None:
+        """Refuse a checkpoint that lacks the auxiliary files or tensors this
+        family needs beyond the EXL3 matrices."""
 
     def source_prefix(self, config: Exl3Config, prefix: str) -> str:
         """Checkpoint module name of a construction prefix that the model's

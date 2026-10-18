@@ -170,7 +170,7 @@ def block_shard(logical: int, padded: int, rank: int, size: int) -> slice:
 
 
 class Exl3Manifest:
-    def __init__(self, directory: str | Path, *, require_qwen_aux: bool = False):
+    def __init__(self, directory: str | Path):
         self.directory = Path(directory)
         self.tensors: dict[str, TensorHeader] = {}
         self.matrices: dict[str, PackedMatrix] = {}
@@ -178,13 +178,6 @@ class Exl3Manifest:
         paths = sorted(self.directory.glob("*.safetensors"))
         if not paths:
             raise ValueError("EXL3 requires local safetensors checkpoint files")
-        if require_qwen_aux:
-            for name in (
-                "ngram_embedding.safetensors",
-                "mtp_hyper_connection_mixer_patch.safetensors",
-            ):
-                if self.directory / name not in paths:
-                    raise ValueError(f"Missing required EXL3 auxiliary file: {name}")
         for path in paths:
             for name, tensor in read_headers(path).items():
                 if name in self.tensors:
@@ -232,31 +225,8 @@ class Exl3Manifest:
                             f"Missing independent vision QKV biases: {root}"
                         )
                     self.unused[name] = "redundant fused vision QKV"
-        if require_qwen_aux:
-            patch = "mtp_hyper_connection_mixer_patch.safetensors"
-            down = self.tensors.get(
-                "mtp.hyper_connection_mixer.input_mix_weight_down.weight"
-            )
-            if down is None or len(down.shape) != 2 or min(down.shape) <= 0:
-                raise ValueError("Invalid EXL3 MTP mixer down projection")
-            rank, hidden = down.shape
-            expected = {
-                "mtp.hyper_connection_mixer.hc_norm.weight": (hidden,),
-                "mtp.hyper_connection_mixer.input_mix_weight_down.weight": (
-                    rank,
-                    hidden,
-                ),
-                "mtp.hyper_connection_mixer.input_mix_weight_up.weight": (hidden, rank),
-            }
-            actual = {k for k, h in self.tensors.items() if h.path.name == patch}
-            if actual != expected.keys():
-                raise ValueError("Unexpected EXL3 MTP mixer patch keys")
-            for name, shape in expected.items():
-                self._expect(name, "F16", shape)
-            if not self.ple_tables:
-                raise ValueError("Missing compressed EXL3 PLE table")
 
-    def _expect(self, name: str, dtype: str, shape: tuple[int, ...]):
+    def expect(self, name: str, dtype: str, shape: tuple[int, ...]):
         tensor = self.tensors.get(name)
         if tensor is None or tensor.dtype != dtype or tensor.shape != shape:
             raise ValueError(f"Missing or incompatible EXL3 tensor: {name}")
@@ -269,14 +239,14 @@ class Exl3Manifest:
         k, n = k * 16, n * 16
         if k <= 0 or n <= 0 or k % 128 or n % 128 or stride % 8:
             raise ValueError(f"Invalid EXL3 tile geometry: {prefix}")
-        self._expect(f"{prefix}.suh", "F16", (k,))
-        self._expect(f"{prefix}.svh", "F16", (n,))
+        self.expect(f"{prefix}.suh", "F16", (k,))
+        self.expect(f"{prefix}.svh", "F16", (n,))
         markers = [m for m in _MARKERS if f"{prefix}.{m}" in self.tensors]
         if len(markers) != 1:
             raise ValueError(f"Missing/conflicting EXL3 codebook: {prefix}")
         marker = markers[0]
         codebook, value = _MARKERS[marker]
-        header = self._expect(f"{prefix}.{marker}", "I32", ())
+        header = self.expect(f"{prefix}.{marker}", "I32", ())
         if struct.unpack("<I", header.read_bytes())[0] != value:
             raise ValueError(f"Unsupported EXL3 codebook multiplier: {prefix}")
         bits_x2 = stride // 8

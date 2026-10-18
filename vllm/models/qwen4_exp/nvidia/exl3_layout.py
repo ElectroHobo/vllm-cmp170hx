@@ -18,10 +18,75 @@ from vllm.sm80.kernels.exl3.utils import PLE_AUXILIARIES
 # four-output fused one, and the target, MTP and LoRA packed mappings disagree
 # on the indexer, so each layer's output count selects its members.
 _QSA_QKV_MEMBERS = ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
+_MIXER_PATCH = "mtp_hyper_connection_mixer_patch.safetensors"
+_AUXILIARY_FILES = ("ngram_embedding.safetensors", _MIXER_PATCH)
+_MIXER = "mtp.hyper_connection_mixer"
 
 
 class Qwen4ExpExl3Layout(Exl3Layout):
-    requires_qwen_aux = True
+    # Read by common/ngram_embedding.py, nvidia/ngram_embedding.py and
+    # nvidia/mtp.py.
+    config_hooks = frozenset(
+        {
+            "get_ple_embedding_method",
+            "ple_embedding_cls",
+            "set_mtp_start_layer_idx",
+            "mtp_shares_target_embeddings",
+        }
+    )
+
+    def __init__(self, hf_config=None):
+        super().__init__(hf_config)
+        text = getattr(hf_config, "text_config", hf_config)
+        self.mtp_start_layer_idx = getattr(text, "num_hidden_layers", 0)
+
+    def check_manifest(self, manifest):
+        """Both auxiliary files, the MTP mixer patch tensors and a compressed
+        PLE table."""
+        for name in _AUXILIARY_FILES:
+            if not (manifest.directory / name).is_file():
+                raise ValueError(f"Missing required EXL3 auxiliary file: {name}")
+        down = manifest.tensors.get(f"{_MIXER}.input_mix_weight_down.weight")
+        if down is None or len(down.shape) != 2 or min(down.shape) <= 0:
+            raise ValueError("Invalid EXL3 MTP mixer down projection")
+        rank, hidden = down.shape
+        expected = {
+            f"{_MIXER}.hc_norm.weight": (hidden,),
+            f"{_MIXER}.input_mix_weight_down.weight": (rank, hidden),
+            f"{_MIXER}.input_mix_weight_up.weight": (hidden, rank),
+        }
+        actual = {
+            k for k, h in manifest.tensors.items() if h.path.name == _MIXER_PATCH
+        }
+        if actual != expected.keys():
+            raise ValueError("Unexpected EXL3 MTP mixer patch keys")
+        for name, shape in expected.items():
+            manifest.expect(name, "F16", shape)
+        if not manifest.ple_tables:
+            raise ValueError("Missing compressed EXL3 PLE table")
+
+    def get_ple_embedding_method(self):
+        """PLE method (vllm/models/qwen4_exp/common/ngram_embedding.py)."""
+        from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLEEmbeddingMethod
+
+        return Exl3PLEEmbeddingMethod()
+
+    @property
+    def ple_embedding_cls(self):
+        """PLE table (vllm/models/qwen4_exp/nvidia/ngram_embedding.py)."""
+        from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLEEmbedding
+
+        return Exl3PLEEmbedding
+
+    def set_mtp_start_layer_idx(self, index: int) -> None:
+        """MTP draft layers are numbered after the target's (nvidia/mtp.py)."""
+        self.mtp_start_layer_idx = index
+
+    @staticmethod
+    def mtp_shares_target_embeddings(config) -> bool:
+        """Whether the MTP draft reuses the target embedding and head
+        (nvidia/mtp.py builds PPMissingLayer placeholders for them)."""
+        return not getattr(config, "mtp_use_dedicated_embeddings", False)
 
     def source_prefix(self, config, prefix):
         if prefix.startswith("model.language_model.model."):
@@ -43,8 +108,8 @@ class Qwen4ExpExl3Layout(Exl3Layout):
             match = re.match(r"mtp.layers.(\d+)\.(.*)", prefix)
             assert match is not None
             index = int(match[1])
-            if index >= config.mtp_start_layer_idx:
-                prefix = f"mtp.layers.{index - config.mtp_start_layer_idx}.{match[2]}"
+            if index >= self.mtp_start_layer_idx:
+                prefix = f"mtp.layers.{index - self.mtp_start_layer_idx}.{match[2]}"
         return prefix
 
     def members(self, config, leaf, source, outputs):
@@ -60,7 +125,7 @@ class Qwen4ExpExl3Layout(Exl3Layout):
     def assign_owners(self, model, config, ledger, model_config, is_draft):
         manifest = config.manifest
         shared: set[str] = set()
-        if is_draft and config.mtp_shares_target_embeddings(
+        if is_draft and self.mtp_shares_target_embeddings(
             model_config.hf_text_config
         ):
             # The draft reuses the target's embedding and head: no draft owner.

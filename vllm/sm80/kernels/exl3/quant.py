@@ -86,18 +86,18 @@ class Exl3Config(QuantizationConfig):
     """Registered as "exl3" by vllm/sm80/plugin.py.
 
     Upstream model code consults the attributes and methods below through
-    getattr, so they apply only to this config.
+    getattr, so they apply only to this config. The checkpoint's model family
+    adds those its own model code reads (Exl3Layout.config_hooks).
     """
 
     min_transform_size = 128
-    # Qwen3-Next shared experts: TP shards keep whole transform blocks.
+    # Shared experts of the models that read this: TP shards keep whole
+    # transform blocks.
     shared_expert_shard_group_size = min_transform_size
 
     def __init__(self):
         super().__init__()
-        self.ple_placement = envs.VLLM_EXL3_PLE_PLACEMENT
         self.manifest: Exl3Manifest | None = None
-        self.mtp_start_layer_idx = 0
         self.mapped_prefixes: dict[str, str] = {}
         # The checkpoint's model family (vllm/sm80/kernels/exl3/layout.py),
         # chosen from the HF config by maybe_update_config.
@@ -143,11 +143,8 @@ class Exl3Config(QuantizationConfig):
         if not Path(model_name).is_dir():
             raise ValueError("Download the EXL3 safetensors checkpoint before loading")
         self.layout = exl3_layout(hf_config)
-        self.manifest = Exl3Manifest(
-            model_name, require_qwen_aux=self.layout.requires_qwen_aux
-        )
-        text = getattr(hf_config, "text_config", hf_config)
-        self.mtp_start_layer_idx = getattr(text, "num_hidden_layers", 0)
+        self.manifest = Exl3Manifest(model_name)
+        self.layout.check_manifest(self.manifest)
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
         if self.manifest is None:
@@ -163,28 +160,15 @@ class Exl3Config(QuantizationConfig):
             mapped_prefixes[mapped] = source
         self.mapped_prefixes = mapped_prefixes
 
-    def get_ple_embedding_method(self):
-        """Qwen4Exp PLE method (vllm/models/qwen4_exp/common/ngram_embedding.py)."""
-        from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLEEmbeddingMethod
-
-        return Exl3PLEEmbeddingMethod(self)
-
-    @property
-    def ple_embedding_cls(self):
-        """Qwen4Exp PLE table (vllm/models/qwen4_exp/nvidia/ngram_embedding.py)."""
-        from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLEEmbedding
-
-        return Exl3PLEEmbedding
-
-    def set_mtp_start_layer_idx(self, index: int) -> None:
-        """MTP draft layers are numbered after the target's (nvidia/mtp.py)."""
-        self.mtp_start_layer_idx = index
-
-    @staticmethod
-    def mtp_shares_target_embeddings(config) -> bool:
-        """Whether the Qwen4Exp MTP draft reuses the target embedding and head
-        (nvidia/mtp.py builds PPMissingLayer placeholders for them)."""
-        return not getattr(config, "mtp_use_dedicated_embeddings", False)
+    def __getattr__(self, name: str):
+        """The layout hooks the model family's own code looks up with getattr
+        (Exl3Layout.config_hooks); reached only for names the config lacks."""
+        layout = self.__dict__.get("layout")
+        if layout is not None and name in layout.config_hooks:
+            return getattr(layout, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
 
     def release_manifest(self) -> None:
         """Drop the checkpoint inventory once this config's model is loaded."""
