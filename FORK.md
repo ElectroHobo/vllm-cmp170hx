@@ -565,8 +565,8 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES` | `int` | `262144` | `'262144'` |
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S` | `float` | `60.0` | `'60'` |
 | `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P` | `bool` | `False` | `'0'` |
+| `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
-| `VLLM_DSV41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
 | `VLLM_ENGRAM_TELEMETRY_STEPS` | `int` | `0` | `'0'` |

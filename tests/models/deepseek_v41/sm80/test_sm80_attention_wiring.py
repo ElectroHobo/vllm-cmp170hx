@@ -252,7 +252,7 @@ class _FakeComm:
     ],
 )
 def test_wo_b_bf16_allreduce_switch(monkeypatch, switch, comm, bf16_message) -> None:
-    """VLLM_DSV41_WO_B_BF16_ALLREDUCE sends the BF16 partial to the all-reduce
+    """VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE sends the BF16 partial to the all-reduce
     only when the custom all-reduce's own predicate takes it; otherwise, and
     with the switch off, today's FP32 sum rounded once."""
     seen = []
@@ -277,7 +277,7 @@ def test_wo_b_bf16_allreduce_switch(monkeypatch, switch, comm, bf16_message) -> 
 def test_wo_b_bf16_allreduce_default_off(monkeypatch) -> None:
     import vllm.envs as envs
 
-    monkeypatch.delenv("VLLM_DSV41_WO_B_BF16_ALLREDUCE", raising=False)
-    assert envs.VLLM_DSV41_WO_B_BF16_ALLREDUCE is False
-    monkeypatch.setenv("VLLM_DSV41_WO_B_BF16_ALLREDUCE", "1")
-    assert envs.VLLM_DSV41_WO_B_BF16_ALLREDUCE is True
+    monkeypatch.delenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", raising=False)
+    assert envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE is False
+    monkeypatch.setenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", "1")
+    assert envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE is True

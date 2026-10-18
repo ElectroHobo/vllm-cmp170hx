@@ -15,7 +15,7 @@ the wo_b output shape ``[rows, 5120]``, this compares
 * ``exact``: the FP64 sum of the four gathered partials rounded to BF16;
 
 * ``switched``: ``wo_b_all_reduce(partial, True)``, the layer's own path
-  with VLLM_DSV41_WO_B_BF16_ALLREDUCE on (BF16 only where the custom
+  with VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE on (BF16 only where the custom
   all-reduce takes the message);
 
 reports which backend each message takes, bitwise equality, mismatch counts

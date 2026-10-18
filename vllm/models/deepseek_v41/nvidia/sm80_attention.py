@@ -346,12 +346,12 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 self.sm80_cfg.index_head_dim,
                 self.sm80_cfg.index_heads_per_rank,
             )
-        self._wo_b_bf16_allreduce = bool(envs.VLLM_DSV41_WO_B_BF16_ALLREDUCE)
+        self._wo_b_bf16_allreduce = bool(envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE)
         if self._wo_b_bf16_allreduce:
             logger.info_once(
                 "DeepSeek-V4.1 sm_80: wo_b partials are all-reduced in BF16 "
                 "when the custom all-reduce takes the message, else in FP32 "
-                "rounded once (VLLM_DSV41_WO_B_BF16_ALLREDUCE=1; set 0 to "
+                "rounded once (VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE=1; set 0 to "
                 "all-reduce every wo_b partial in FP32)",
                 scope="global",
             )
@@ -573,7 +573,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         weight) on the already inverse-RoPE'd, FP8-qdq'd output, then
         ``wo_b``; with TP the ``wo_b`` partials are summed in fp32 and rounded
         once, as the reference's RowParallelLinear does (in BF16 by a kernel
-        that does exactly that, with VLLM_DSV41_WO_B_BF16_ALLREDUCE; see
+        that does exactly that, with VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE; see
         :func:`wo_b_all_reduce`)."""
         T = attn_out.shape[0]
         o = attn_out.view(T, self.n_local_groups, -1)

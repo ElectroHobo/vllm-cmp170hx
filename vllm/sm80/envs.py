@@ -92,7 +92,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
-    VLLM_DSV41_WO_B_BF16_ALLREDUCE: bool = False
+    VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -779,8 +779,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # all-reduce at half the bytes; every other message keeps the FP32 sum
     # rounded once. Default OFF: unset, every wo_b partial is all-reduced in
     # FP32. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
-    "VLLM_DSV41_WO_B_BF16_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_DSV41_WO_B_BF16_ALLREDUCE", "0"))
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", "0"))
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
