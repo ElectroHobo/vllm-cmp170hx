@@ -188,7 +188,11 @@ def check(args, specs, run, outs, topks, ref_layers, ref_outs, ref_topks):
                             got.view(torch.int16), want.view(torch.int16)
                         ), f"index key req {r} pos {j}"
     # wo_a inputs: the same values except where a BF16 probability rounding
-    # moved an element across an FP8 rounding boundary.
+    # changed the pre-quant output. That change is one BF16 step relative to
+    # the terms being summed, which have the magnitude of the element's FP8
+    # block, not of the element: near-zero elements may move by one BF16
+    # ulp of their block's amax. Larger elements may cross one FP8 rounding
+    # boundary (an E4M3 step, at most 12.5 % of the element).
     n_diff = n_total = 0
     for key, want in ref_outs.items():
         got = outs[key]
@@ -196,8 +200,18 @@ def check(args, specs, run, outs, topks, ref_layers, ref_outs, ref_topks):
         diff = got.float() != want.float()
         n_diff += int(diff.sum())
         n_total += diff.numel()
-        # A flipped element moves by at most one E4M3 step of its block.
-        torch.testing.assert_close(got.float(), want.float(), rtol=0.13, atol=1e-3)
+        w = want.float().flatten()
+        amax = w.view(-1, 32).abs().amax(-1, keepdim=True)
+        bf16_ulp = torch.where(
+            amax > 0, torch.exp2(torch.floor(torch.log2(amax)) - 7), 0.0
+        )
+        tol = bf16_ulp.expand(-1, 32).flatten() + 0.13 * w.abs()
+        err = (got.float().flatten() - w).abs()
+        worst = int(torch.argmax(err - tol))
+        assert bool((err <= tol).all()), (
+            f"{key} element {worst}: |diff| {err[worst].item():.4g} > "
+            f"{tol[worst].item():.4g} (block amax {amax[worst // 32].item():.4g})"
+        )
     assert n_diff <= 0.02 * n_total, f"{n_diff}/{n_total} wo_a input elements differ"
     nonzero = sum(int((v != 0).sum()) for v in outs.values())
     assert nonzero > 0.9 * n_total, "outputs are mostly zero"
