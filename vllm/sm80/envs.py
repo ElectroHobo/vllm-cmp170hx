@@ -103,7 +103,6 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_HOSTFN_READ: bool = False
     VLLM_ENGRAM_PLACEMENT: str = "ssd"
     VLLM_ENGRAM_ROW_CACHE_GIB: float = 1.0
-    VLLM_ENGRAM_NATIVE_READ: bool = False
     VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
@@ -855,14 +854,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ENGRAM_ROW_CACHE_GIB": lambda: float(
         os.getenv("VLLM_ENGRAM_ROW_CACHE_GIB", "1")
     ),
-    # Read the Engram SSD rows that miss the row cache in one native call
-    # that releases the GIL (csrc/exl3/ple_read.cpp, the PLE reader core)
-    # instead of per-row Python reads. Same rows and bytes; page-cache and
-    # storage reads are then counted together as unclassified. Off by
-    # default.
-    "VLLM_ENGRAM_NATIVE_READ": lambda: bool(
-        int(os.getenv("VLLM_ENGRAM_NATIVE_READ", "0"))
-    ),
     # Diagnostic: log the counters of each sm_80 Engram table (rows, cache
     # hits and misses, page-cache and storage bytes, host read and wait
     # time) every N lookups of that table, one lookup per step, and at
@@ -1067,6 +1058,10 @@ RETIRED_ENV_VARS: dict[str, str] = {
     ),
     "VLLM_EXL3": (
         "removed; an EXL3 checkpoint always loads with the EXL3 method"
+    ),
+    "VLLM_ENGRAM_NATIVE_READ": (
+        "removed; the sm_80 Engram rows are always fetched by one native host "
+        "function (csrc/exl3/engram_fetch.cpp)"
     ),
 }
 _warned_retired_env_vars: set[str] = set()

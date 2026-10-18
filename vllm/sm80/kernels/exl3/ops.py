@@ -114,7 +114,7 @@ _OPERATORS = (
     "moe_workspace_size_prefill",
 )
 # Classes this tree constructs; a library without one of them is refused.
-_CLASSES = ("PleHostReader",)
+_CLASSES = ("PleHostReader", "EngramHostFetch")
 
 
 def _runtime_build_info() -> dict:
@@ -672,6 +672,45 @@ def ple_host_reader(
         owner_hi,
         head_offsets,
         head_vocab_sizes,
+        retries,
+        max_threads,
+        slots,
+    )
+
+
+def engram_host_fetch(
+    fd: int,
+    base: int,
+    row_bytes: int,
+    owner_lo: int,
+    owner_hi: int,
+    scales: torch.Tensor,
+    table: torch.Tensor,
+    ids: torch.Tensor,
+    values: torch.Tensor,
+    scales_out: torch.Tensor,
+    cache_bytes: int,
+    ways: int,
+    retries: int,
+    max_threads: int,
+    slots: int,
+):
+    """The native fetch of one rank's DeepSeek V4.1 Engram rows into the
+    values/scales staging (csrc/exl3/engram_fetch.cpp, EngramHostFetch)."""
+    ensure_extension()
+    return torch.classes._exl3_C.EngramHostFetch(
+        fd,
+        base,
+        row_bytes,
+        owner_lo,
+        owner_hi,
+        scales,
+        table,
+        ids,
+        values,
+        scales_out,
+        cache_bytes,
+        ways,
         retries,
         max_threads,
         slots,

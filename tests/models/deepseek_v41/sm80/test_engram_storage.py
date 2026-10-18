@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The sm_80 Engram table storage: SSD row reads at int64 offsets, the host
-row cache, TP head ownership, the native reader and its startup check,
+"""The sm_80 Engram table storage: the native row fetch (int64 offsets, the
+host row cache and its LRU semantics, TP head ownership, failed rows),
 telemetry, dequantization against the reference formula, the real shards
-(VLLM_ENGRAM_TEST_TABLE_DIR, Python and native readers) and CUDA graph
-replay with changing ids (GPU only)."""
+(VLLM_ENGRAM_TEST_TABLE_DIR) and CUDA graph replay with changing ids (GPU
+only)."""
 
-import errno
 import json
 import os
 import struct
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -27,8 +24,6 @@ from vllm.models.deepseek_v41.nvidia.ops.sm80_engram_dequant import (
     dequant_engram_rows_reference,
 )
 from vllm.models.deepseek_v41.nvidia.sm80_engram import (
-    EngramRowCache,
-    EngramRowSource,
     EngramRowStore,
     Sm80EngramEmbedding,
     engram_owner_range,
@@ -175,14 +170,6 @@ def _independent_rows(path, layer, rows):
     return torch.cat(values).numpy(), torch.cat(scales).numpy()
 
 
-def _fetch(store, ids):
-    ids = np.asarray(ids, dtype=np.int64)
-    values = np.full((len(ids), DIM), 0xAA, dtype=np.uint8)
-    scales = np.full((len(ids), SCALE_DIM), 0xAA, dtype=np.uint8)
-    store.fetch(ids, values, scales)
-    return values, scales
-
-
 def _expected(files, layer, ids, lo, hi):
     ids = np.asarray(ids, dtype=np.int64)
     values = np.zeros((len(ids), DIM), dtype=np.uint8)
@@ -243,14 +230,25 @@ def test_owner_ranges_match_upstream_head_sharding():
 
 
 # ---------------------------------------------------------------------------
-# Reader parity
+# Native fetch: parity, cache, telemetry
 # ---------------------------------------------------------------------------
 
 
+def _store(files, lo, hi, cache_bytes=1 << 20, placement="ssd", capacity=4096):
+    return EngramRowStore(
+        files, lo, hi, placement=placement, cache_bytes=cache_bytes, capacity=capacity
+    )
+
+
+def _fetch(store, ids):
+    values, scales = store.fetch(np.asarray(ids, dtype=np.int64))
+    return values.copy(), scales.copy()
+
+
 @pytest.mark.parametrize("rank", range(TP))
-def test_reader_row_parity_per_rank(tables, rank):
+def test_fetch_row_parity_per_rank(tables, rank):
     _, _, lo, hi = engram_owner_range(BIG_HEADS, rank, TP)
-    store = EngramRowStore(tables.big, lo, hi, placement="ssd", cache_bytes=1 << 20)
+    store = _store(tables.big, lo, hi)
     try:
         written = tables.big_written
         mine = written[(written >= lo) & (written < hi)]
@@ -262,62 +260,28 @@ def test_reader_row_parity_per_rank(tables, rank):
             want_values, want_scales = _expected(tables.big, BIG_LAYER, ids, lo, hi)
             np.testing.assert_array_equal(values, want_values)
             np.testing.assert_array_equal(scales, want_scales)
-        counts = store.telemetry.snapshot()
+        counts = store.counters()
         assert counts["cache_hits"] > 0
         assert counts["rows_unowned"] == 2 * (len(others) + 2)
     finally:
         store.close()
 
 
-def test_reader_reads_past_int32_offsets(tables):
+def test_fetch_reads_past_int32_offsets(tables):
     rows = np.array(
         [2**23 - 1, 2**23, 2**23 + 1, 2**24 - 1, 2**24, 2**24 + 1, BIG_ROWS - 1]
     )
-    source = EngramRowSource(
-        tables.big.values_path, tables.big.values_offset, DIM, 0, BIG_ROWS
-    )
+    store = _store(tables.big, 0, BIG_ROWS, cache_bytes=0)
     try:
-        dest = np.empty((len(rows), DIM), dtype=np.uint8)
-        source.read(rows, dest)
-        want, _ = _independent_rows(tables.big.values_path, BIG_LAYER, rows)
-        np.testing.assert_array_equal(dest, want)
-        assert dest.any()
-        with pytest.raises(ValueError, match="outside"):
-            source.read(np.array([BIG_ROWS]), np.empty((1, DIM), dtype=np.uint8))
-    finally:
-        source.close()
-
-
-def _require_native():
-    try:
-        from vllm.sm80.kernels.exl3.ops import ensure_extension
-
-        ensure_extension()
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"native EXL3 extension unavailable: {exc}")
-
-
-def test_native_reader_parity(tables):
-    _require_native()
-    assert sm80_engram._native_reader_schema() == sm80_engram.PLE_READ_ROWS_SCHEMA
-    _, _, lo, hi = engram_owner_range(BIG_HEADS, 2, TP)
-    store = EngramRowStore(
-        tables.big, lo, hi, placement="ssd", cache_bytes=0, native_read=True
-    )
-    try:
-        written = tables.big_written
-        ids = written[(written >= lo) & (written < hi)]
-        values, scales = _fetch(store, ids)
-        want_values, want_scales = _expected(tables.big, BIG_LAYER, ids, lo, hi)
+        values, scales = _fetch(store, rows)
+        want_values, want_scales = _independent_rows(
+            tables.big.values_path, BIG_LAYER, rows
+        )
         np.testing.assert_array_equal(values, want_values)
         np.testing.assert_array_equal(scales, want_scales)
-        assert store.telemetry.snapshot()["unclassified_rows"] == len(ids)
+        assert values.any()
     finally:
         store.close()
-
-
-def _open_fds():
-    return len(os.listdir("/proc/self/fd"))
 
 
 @contextmanager
@@ -329,22 +293,17 @@ def _default_device_set(device):
         torch.set_default_device(None)
 
 
-@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("context", [torch.device, _default_device_set])
-def test_reader_ignores_the_default_device(tables, native, context):
+def test_fetch_ignores_the_default_device(tables, context):
     """Model construction runs under a default device (CUDA when served):
-    the reader's tensors must stay on the CPU. The meta device reproduces a
+    the fetch's tensors must stay on the CPU. The meta device reproduces a
     non-CPU default without a GPU."""
-    if native:
-        _require_native()
     _, _, lo, hi = engram_owner_range(BIG_HEADS, 1, TP)
     written = tables.big_written
     ids = np.concatenate([written[(written >= lo) & (written < hi)], [lo - 1]])
     with context("meta"):
         assert torch.empty(1).device.type == "meta"
-        store = EngramRowStore(
-            tables.big, lo, hi, placement="ssd", cache_bytes=0, native_read=native
-        )
+        store = _store(tables.big, lo, hi, cache_bytes=0)
         try:
             values, scales = _fetch(store, ids)
         finally:
@@ -354,42 +313,131 @@ def test_reader_ignores_the_default_device(tables, native, context):
     np.testing.assert_array_equal(scales, want_scales)
 
 
-def test_native_reader_checked_at_startup(tables, monkeypatch):
-    from vllm.sm80.kernels.exl3 import ops
+def test_ram_placement_matches_ssd(tables):
+    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 1, TP)
+    ssd = _store(tables.small, lo, hi, cache_bytes=1 << 16)
+    ram = _store(tables.small, lo, hi, cache_bytes=1 << 30, placement="ram")
+    try:
+        ids = np.random.default_rng(3).integers(-5, SMALL_ROWS + 5, 3000)
+        for a, b in zip(_fetch(ssd, ids), _fetch(ram, ids)):
+            np.testing.assert_array_equal(a, b)
+        assert ram.cache_bytes == 0 and ram.table.shape == (hi - lo, DIM)
+    finally:
+        ssd.close()
+        ram.close()
 
-    path, base = tables.small.values_path, tables.small.values_offset
-    before = _open_fds()
 
-    def missing():
-        raise RuntimeError("no vllm._exl3_C")
+class _LruModel:
+    """The row cache semantics the native fetch keeps: Fibonacci-hashed
+    sets, one clock tick per probe with hits and per insert, a set takes at
+    most `ways` new rows per insert, in LRU order of its stamps."""
 
-    monkeypatch.setattr(sm80_engram, "_native_reader_schema", missing)
-    with pytest.raises(RuntimeError, match="VLLM_ENGRAM_NATIVE_READ=1 needs"):
-        EngramRowSource(path, base, DIM, 0, SMALL_ROWS, native=True)
-    with pytest.raises(RuntimeError, match="VLLM_ENGRAM_NATIVE_READ=1 needs"):
-        EngramRowStore(
-            tables.small, 0, 600, placement="ssd", cache_bytes=0, native_read=True
+    def __init__(self, num_sets, ways):
+        self.num_sets, self.ways, self.clock = num_sets, ways, 0
+        self.tags = np.full((num_sets, ways), -1, dtype=np.int64)
+        self.stamps = np.zeros((num_sets, ways), dtype=np.int64)
+
+    def set_of(self, rows):
+        mixed = (rows.astype(np.uint64) * np.uint64(0x9E3779B97F4A7C15)) >> np.uint64(
+            32
         )
-    # An extension built before ple_read_rows took max_threads.
-    old = sm80_engram.PLE_READ_ROWS_SCHEMA.replace(", int max_threads", "")
-    monkeypatch.setattr(sm80_engram, "_native_reader_schema", lambda: old)
-    with pytest.raises(RuntimeError, match="rebuild the native extension"):
-        EngramRowSource(path, base, DIM, 0, SMALL_ROWS, native=True)
-    # The right schema, but the operator refuses the call.
-    monkeypatch.setattr(
-        sm80_engram, "_native_reader_schema", lambda: sm80_engram.PLE_READ_ROWS_SCHEMA
-    )
+        return (mixed % np.uint64(self.num_sets)).astype(np.int64)
 
-    def refuse(*args):
-        raise RuntimeError("bad call")
+    def fetch(self, local):
+        unique = np.unique(local)
+        sets = self.set_of(unique)
+        match = self.tags[sets] == unique[:, None]
+        hit = match.any(axis=1)
+        if hit.any():
+            self.clock += 1
+            self.stamps[sets[hit], match.argmax(axis=1)[hit]] = self.clock
+        miss, miss_sets = unique[~hit], sets[~hit]
+        inserted = evicted = overflow = 0
+        if len(miss):
+            order = np.argsort(miss_sets, kind="stable")
+            self.clock += 1
+            lru = {}
+            ranks = {}
+            for m in order:
+                s = int(miss_sets[m])
+                if s not in lru:
+                    lru[s] = np.argsort(self.stamps[s], kind="stable")
+                rank = ranks.get(s, 0)
+                ranks[s] = rank + 1
+                if rank >= self.ways:
+                    overflow += 1
+                    continue
+                way = lru[s][rank]
+                evicted += int(self.tags[s, way] >= 0)
+                self.tags[s, way] = miss[m]
+                self.stamps[s, way] = self.clock
+                inserted += 1
+        return int(hit.sum()), len(miss), inserted, evicted, overflow
 
-    monkeypatch.setattr(ops, "ple_read_rows", refuse)
-    with pytest.raises(RuntimeError, match="refused an empty read"):
-        EngramRowSource(path, base, DIM, 0, SMALL_ROWS, native=True)
-    assert _open_fds() == before
-    # The Python reader needs no extension.
-    EngramRowSource(path, base, DIM, 0, SMALL_ROWS).close()
-    assert _open_fds() == before
+
+def test_cache_semantics_match_the_lru_model(tables):
+    """Per-fetch hits, misses, inserts and evictions of a tiny cache equal
+    the LRU model's over random batches with collisions and overflow."""
+    lo, hi = 0, 600
+    num_sets, ways = 5, 8
+    store = _store(tables.small, lo, hi, cache_bytes=num_sets * ways * (DIM + 16))
+    model = _LruModel(num_sets, ways)
+    rng = np.random.default_rng(11)
+    seen = {"evicted": 0, "overflow": 0}
+    try:
+        assert store.fetcher.cache_rows() == num_sets * ways
+        previous = store.counters()
+        for _ in range(300):
+            ids = rng.integers(lo - 20, lo + 180, int(rng.integers(1, 120)))
+            values, _ = _fetch(store, ids)
+            want, _ = _expected(tables.small, SMALL_LAYER, ids, lo, hi)
+            np.testing.assert_array_equal(values, want)
+            owned = ids[(ids >= lo) & (ids < hi)] - lo
+            hits, misses, inserted, evicted, overflow = model.fetch(owned)
+            counts = store.counters()
+            delta = {k: counts[k] - previous[k] for k in counts}
+            previous = counts
+            assert (
+                delta["cache_hits"],
+                delta["cache_misses"],
+                delta["cache_inserts"],
+                delta["cache_evictions"],
+            ) == (hits, misses, inserted, evicted)
+            seen["evicted"] += evicted
+            seen["overflow"] += overflow
+        assert seen["evicted"] > 0 and seen["overflow"] > 0
+    finally:
+        store.close()
+
+
+def test_cache_bound(tables):
+    for cache_bytes in (0, 1000, 1 << 20, (1 << 20) + 12345):
+        store = _store(tables.small, 0, 600, cache_bytes=cache_bytes)
+        try:
+            rows = cache_bytes // (8 * (DIM + 16)) * 8
+            assert store.fetcher.cache_rows() == rows
+            assert store.cache_bytes == rows * (DIM + 16) <= cache_bytes
+            assert store.prefault() >= 0
+            ids = np.arange(0, 64)
+            _fetch(store, ids)
+            _fetch(store, ids)
+            assert store.counters()["cache_hits"] == (64 if rows >= 64 else 0)
+        finally:
+            store.close()
+
+
+def test_page_cache_classification(tables):
+    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 3, TP)
+    store = _store(tables.small, lo, hi, cache_bytes=0)
+    try:
+        resident, total = store.page_cache_residency()
+        assert 0 <= resident <= total
+        _fetch(store, np.arange(lo, lo + 64))
+        counts = store.counters()
+        assert counts["page_cache_rows"] + counts["storage_rows"] == 64
+        assert counts["read_ns"] > 0 and counts["fetch_ns"] >= counts["read_ns"]
+    finally:
+        store.close()
 
 
 def test_telemetry_readable_and_logged(tables, monkeypatch):
@@ -420,9 +468,10 @@ def test_telemetry_readable_and_logged(tables, monkeypatch):
         assert counts["host_ns"] >= counts["fetch_ns"] > 0
         assert counts["cache_hits"] + counts["cache_misses"] == counts["rows_unique"]
         assert counts["cache_misses"] == (
-            counts["page_cache_rows"]
-            + counts["storage_rows"]
-            + counts["unclassified_rows"]
+            counts["page_cache_rows"] + counts["storage_rows"]
+        )
+        assert counts["page_cache_bytes"] + counts["storage_bytes"] == (
+            counts["cache_misses"] * DIM
         )
         assert len(lines) == 2
         assert all(
@@ -433,159 +482,6 @@ def test_telemetry_readable_and_logged(tables, monkeypatch):
         table.close()
     assert lines[-1].startswith("sm_80 Engram layer 14 telemetry at close: lookups 5 ")
     assert "; last lookups 1 " in lines[-1]
-    table.reset_telemetry()
-    assert table.telemetry()["lookups"] == 0
-
-
-def test_ram_placement_matches_ssd(tables):
-    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 1, TP)
-    ssd = EngramRowStore(tables.small, lo, hi, placement="ssd", cache_bytes=1 << 16)
-    ram = EngramRowStore(tables.small, lo, hi, placement="ram", cache_bytes=0)
-    try:
-        ids = np.random.default_rng(3).integers(-5, SMALL_ROWS + 5, 3000)
-        for a, b in zip(_fetch(ssd, ids), _fetch(ram, ids)):
-            np.testing.assert_array_equal(a, b)
-        assert ram.cache is None and ram.table.shape == (hi - lo, DIM)
-    finally:
-        ssd.close()
-        ram.close()
-
-
-# ---------------------------------------------------------------------------
-# Row cache
-# ---------------------------------------------------------------------------
-
-
-def _small_cache(num_sets, ways):
-    cache = EngramRowCache(num_sets * ways * (DIM + 16), DIM, ways=ways)
-    assert cache.num_sets == num_sets
-    cache.set_of = lambda rows: rows % num_sets
-    return cache
-
-
-def _data(rows):
-    return _row_bytes(np.asarray(rows), DIM, 9)
-
-
-def test_cache_lru_eviction_and_collisions():
-    cache = _small_cache(num_sets=2, ways=2)
-    out = np.empty((8, DIM), dtype=np.uint8)
-    assert cache.insert(np.array([0, 2]), _data([0, 2])) == (2, 0)
-    assert cache.lookup(np.array([0]), out[:1]).tolist() == [True]
-    # Set 0 is full: 4 evicts the least recently used row, 2.
-    assert cache.insert(np.array([4]), _data([4])) == (1, 1)
-    hit = cache.lookup(np.array([0, 2, 4, 1]), out[:4])
-    assert hit.tolist() == [True, False, True, False]
-    np.testing.assert_array_equal(out[[0, 2]], _data([0, 4]))
-    # Three colliding rows in one batch: only two ways, the third is skipped.
-    assert cache.insert(np.array([6, 8, 10]), _data([6, 8, 10])) == (2, 2)
-    hit = cache.lookup(np.array([6, 8, 10]), out[:3])
-    assert hit.tolist() == [True, True, False]
-    np.testing.assert_array_equal(out[:2], _data([6, 8]))
-    # A row already present is not inserted twice.
-    assert cache.insert(np.array([6, 1]), _data([6, 1])) == (1, 0)
-
-
-def test_cache_disabled_and_bound():
-    cache = EngramRowCache(0, DIM)
-    assert cache.capacity_rows == 0
-    assert not cache.lookup(np.array([1]), np.empty((1, DIM), np.uint8)).any()
-    assert cache.insert(np.array([1]), _data([1])) == (0, 0)
-    bounded = EngramRowCache(1 << 20, DIM)
-    assert bounded.nbytes <= 1 << 20
-    assert bounded.capacity_rows == (1 << 20) // (8 * (DIM + 16)) * 8
-
-
-def test_store_cache_warm_hits_and_eviction(tables):
-    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 0, TP)
-    # 64 sets x 8 ways: fewer entries than the owned rows.
-    store = EngramRowStore(
-        tables.small, lo, hi, placement="ssd", cache_bytes=64 * 8 * (DIM + 16)
-    )
-    try:
-        ids = np.arange(lo, lo + 16)
-        _fetch(store, ids)
-        first = store.telemetry.snapshot()
-        assert first["cache_misses"] == 16 and first["cache_hits"] == 0
-        values, _ = _fetch(store, np.concatenate([ids, ids]))
-        second = store.telemetry.snapshot()
-        assert second["cache_hits"] - first["cache_hits"] == 16
-        assert second["rows_requested"] == 48 and second["rows_unique"] == 32
-        want, _ = _expected(
-            tables.small, SMALL_LAYER, np.concatenate([ids, ids]), lo, hi
-        )
-        np.testing.assert_array_equal(values, want)
-        # Overflow every set: rows still arrive, entries are evicted.
-        many = np.arange(lo, hi)
-        values, scales = _fetch(store, many)
-        want_values, want_scales = _expected(tables.small, SMALL_LAYER, many, lo, hi)
-        np.testing.assert_array_equal(values, want_values)
-        np.testing.assert_array_equal(scales, want_scales)
-        third = store.telemetry.snapshot()
-        assert third["cache_evictions"] > 0
-        assert third["cache_inserts"] <= store.cache.capacity_rows + 16
-        read = third["cache_misses"]
-        assert read == (
-            third["page_cache_rows"]
-            + third["storage_rows"]
-            + third["unclassified_rows"]
-        )
-        assert (
-            third["page_cache_bytes"]
-            + third["storage_bytes"]
-            + third["unclassified_bytes"]
-            == read * DIM
-        )
-    finally:
-        store.close()
-
-
-def test_page_cache_classification(tables):
-    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 3, TP)
-    store = EngramRowStore(tables.small, lo, hi, placement="ssd", cache_bytes=0)
-    try:
-        resident, total = store.source.page_cache_residency()
-        assert 0 <= resident <= total
-        # Freshly written rows sit in the page cache.
-        _fetch(store, np.arange(lo, lo + 64))
-        counts = store.telemetry.snapshot()
-        if sm80_engram._preadv2() is not None and store.source._nowait:
-            assert counts["unclassified_rows"] == 0
-            assert counts["page_cache_rows"] + counts["storage_rows"] == 64
-        else:
-            assert counts["unclassified_rows"] == 64
-    finally:
-        store.close()
-
-
-def test_concurrent_callers(tables):
-    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 2, TP)
-    store = EngramRowStore(
-        tables.small, lo, hi, placement="ssd", cache_bytes=16 * 8 * (DIM + 16)
-    )
-    everything = np.arange(SMALL_ROWS)
-    all_values, all_scales = _expected(tables.small, SMALL_LAYER, everything, lo, hi)
-    barrier = threading.Barrier(8)
-
-    def worker(seed):
-        rng = np.random.default_rng(seed)
-        barrier.wait()
-        for _ in range(40):
-            ids = rng.integers(lo - 50, hi + 50, 300)
-            ids = np.concatenate([ids, ids[:30]])
-            values, scales = _fetch(store, ids)
-            np.testing.assert_array_equal(values, all_values[ids])
-            np.testing.assert_array_equal(scales, all_scales[ids])
-        return True
-
-    try:
-        with ThreadPoolExecutor(8) as pool:
-            assert all(pool.map(worker, range(8)))
-        counts = store.telemetry.snapshot()
-        assert counts["lookups"] == 320
-        assert counts["cache_hits"] > 0 and counts["cache_evictions"] > 0
-    finally:
-        store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -735,28 +631,22 @@ def test_create_embedding_hook_dispatch(monkeypatch):
     assert calls == [("upstream", 0)]
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_unreadable_rows_fail_only_their_requests(tmp_path, native):
-    """A short read (both readers) and EIO (Python reader) on chosen rows:
-    the owners' tokens come out zero and are reported on rank 0, the other
-    tokens stay byte-exact, nothing raises."""
+def test_unreadable_rows_fail_only_their_requests(tmp_path):
+    """A short read on a chosen row: its owner's token comes out zero and is
+    reported on rank 0, the other tokens stay byte-exact, nothing raises."""
     from vllm.sm80.failed_inputs import failed_request_ids, take_failed_tokens
 
-    if native:
-        _require_native()
     heads, rows, layer, tokens = (300,) * 8, 2400, 14, 12
     _write_table(tmp_path, layer, rows, np.arange(rows), "model.safetensors")
     files = locate_engram_table(tmp_path, layer, rows, DIM)
-    short_row, eio_row = 2397, 700  # rank 3 (head 7), rank 1 (head 2)
-    good = np.arange(rows)
-    good = good[(good < 2396) & (good != eio_row)]
+    short_row = 2397  # rank 3 (head 7)
+    good = np.arange(2396)
     # A table row whose first value dequantizes to NaN (an E4M3 NaN value or
     # an E8M0 NaN scale) would fail its token too.
     good = good[(_row_bytes(good, DIM, 1)[:, 0] & 0x7F) != 0x7F]
     good = good[_row_bytes(good, SCALE_DIM, 2)[:, 0] != 0xFF]
     indices = _hash_like_indices(heads, good, tokens, seed=5)
     indices[5, 7] = short_row  # request b
-    indices[9, 2] = eio_row  # request c
     want = torch.cat(
         [_reference_lookup(files, layer, heads, r, indices) for r in range(TP)], 1
     )
@@ -771,26 +661,12 @@ def test_unreadable_rows_fail_only_their_requests(tmp_path, native):
             max_tokens=tokens,
             placement="ssd",
             cache_bytes=1 << 20,
-            native_read=native,
         )
         for rank in range(TP)
     ]
     try:
         # Cut the file inside row 2396: rows from there on read short.
         os.truncate(files.values_path, files.values_offset + 2396 * DIM + 100)
-        failed_reqs = {"b"}
-        if not native:
-            source = tables[1].store.source
-            source._nowait = False
-            read = source._pread_exact_into
-
-            def eio(fd, target, offset):
-                if offset == files.values_offset + eio_row * DIM:
-                    raise OSError(errno.EIO, os.strerror(errno.EIO))
-                read(fd, target, offset)
-
-            source._pread_exact_into = eio
-            failed_reqs.add("c")
         outs = []
         for table in tables:
             outs.append(torch.empty(tokens, 2, DIM, dtype=torch.bfloat16))
@@ -798,20 +674,22 @@ def test_unreadable_rows_fail_only_their_requests(tmp_path, native):
         engram = SimpleNamespace(embed=lambda ids: torch.cat(outs, dim=1))
         sm80_engram.mask_failed_after_gather(engram, tables[0])
         got = engram.embed(indices)
-        failed = [5] + ([] if native else [9])
-        keep = [t for t in range(tokens) if t not in failed]
-        assert not got[failed].any()
+        keep = [t for t in range(tokens) if t != 5]
+        assert not got[5].any()
         assert torch.equal(got[keep].view(torch.int16), want[keep].view(torch.int16))
         model = nn.Module()
         model.table = tables[0]
         query_start_loc, req_ids = np.array([0, 4, 8, 12]), ["a", "b", "c"]
         mask = take_failed_tokens(model).numpy()
-        assert failed_request_ids(mask, query_start_loc, req_ids) == failed_reqs
+        assert failed_request_ids(mask, query_start_loc, req_ids) == {"b"}
         # Taking clears the mask.
         mask = take_failed_tokens(model).numpy()
         assert failed_request_ids(mask, query_start_loc, req_ids) == set()
         assert tables[3].telemetry()["rows_failed"] == 1
-        assert tables[1].telemetry()["rows_failed"] == (0 if native else 1)
+        assert sum(t.telemetry()["rows_failed"] for t in tables[:3]) == 0
+        # A failed row is never cached: the next lookup reads it again.
+        tables[3].lookup(indices, outs[3])
+        assert tables[3].telemetry()["rows_failed"] == 2
     finally:
         for table in tables:
             table.close()
@@ -862,13 +740,13 @@ def _real_head_sizes():
     return [tuple(p for order in layer for p in order) for layer in layout.primes]
 
 
-def _real_samples():
-    """(layer, files, lo, hi, rows) per layer and rank: 1024 random owned
-    rows plus the rank's first and last rows (the table's first and last
-    rows among them), 8192 random rows in all. Seeded, so every test reads
-    the same rows."""
+def test_real_shards_parity():
+    """1024 seeded random rows plus the rank's first and last rows (the
+    table's first and last among them), per layer and rank, cold and then
+    through the cache, against the safetensors read."""
     directory = _real_dir()
     rng = np.random.default_rng(1017)
+    checked = 0
     for (layer, rows), heads in zip(_REAL_LAYERS.items(), _real_head_sizes()):
         files = locate_engram_table(directory, layer, rows, DIM)
         assert sum(heads) == rows
@@ -877,51 +755,23 @@ def _real_samples():
             sample = np.concatenate([rng.integers(lo, hi, 1024), [lo, hi - 1]])
             assert rank or lo == 0
             assert rank < TP - 1 or hi == rows
-            yield layer, files, lo, hi, sample
-
-
-def _real_fetch(files, lo, hi, sample, native):
-    store = EngramRowStore(
-        files, lo, hi, placement="ssd", cache_bytes=0, native_read=native
-    )
-    try:
-        values, scales = _fetch(store, sample)
-        return values, scales, store.telemetry.snapshot()
-    finally:
-        store.close()
-
-
-def test_real_shards_parity():
-    checked = 0
-    for layer, files, lo, hi, sample in _real_samples():
-        values, scales, _ = _real_fetch(files, lo, hi, sample, native=False)
-        want_values, want_scales = _independent_rows(files.values_path, layer, sample)
-        np.testing.assert_array_equal(values, want_values)
-        np.testing.assert_array_equal(scales, want_scales)
-        got = dequant_engram_rows_reference(
-            torch.from_numpy(values), torch.from_numpy(scales)
-        )
-        assert not got.isnan().any()
-        checked += len(sample)
-    assert checked == 2 * TP * 1026
-
-
-def test_real_shards_native_parity():
-    _real_dir()
-    _require_native()
-    checked = 0
-    for layer, files, lo, hi, sample in _real_samples():
-        values, scales, counts = _real_fetch(files, lo, hi, sample, native=True)
-        want_values, want_scales = _independent_rows(files.values_path, layer, sample)
-        np.testing.assert_array_equal(values, want_values)
-        np.testing.assert_array_equal(scales, want_scales)
-        assert counts["unclassified_rows"] == len(np.unique(sample))
-        python_values, python_scales, _ = _real_fetch(
-            files, lo, hi, sample, native=False
-        )
-        np.testing.assert_array_equal(values, python_values)
-        np.testing.assert_array_equal(scales, python_scales)
-        checked += len(sample)
+            want_values, want_scales = _independent_rows(
+                files.values_path, layer, sample
+            )
+            store = _store(files, lo, hi, cache_bytes=64 << 20)
+            try:
+                for _ in range(2):
+                    values, scales = _fetch(store, sample)
+                    np.testing.assert_array_equal(values, want_values)
+                    np.testing.assert_array_equal(scales, want_scales)
+                assert store.counters()["cache_hits"] >= len(np.unique(sample))
+            finally:
+                store.close()
+            got = dequant_engram_rows_reference(
+                torch.from_numpy(values), torch.from_numpy(scales)
+            )
+            assert not got.isnan().any()
+            checked += len(sample)
     assert checked == 2 * TP * 1026
 
 
