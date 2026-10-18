@@ -567,7 +567,12 @@ def _kernel_decode_emulation(value_bytes, scale_bytes):
     scale = np.where(s == 0xFF, np.float32(np.nan), scale)
     with np.errstate(over="ignore", invalid="ignore"):
         product = (value * scale).astype(np.float32)
-    return torch.from_numpy(product).to(torch.bfloat16)
+    # Round to nearest even on the bits, as the kernel's conversion does;
+    # every NaN is written as 0xFFFF.
+    bits = product.view(np.uint32).astype(np.uint64)
+    bits = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+    bits = np.where(np.isnan(product), 0xFFFF, bits).astype(np.uint16)
+    return torch.from_numpy(bits.view(np.int16)).view(torch.bfloat16)
 
 
 def _assert_bitwise(got, want):
@@ -592,7 +597,10 @@ def test_kernel_decode_formula_matches_reference_exhaustively():
         torch.from_numpy(values), torch.from_numpy(scales)
     )
     got = _kernel_decode_emulation(values, np.repeat(scales, 32, axis=1))
-    _assert_bitwise(got, want)
+    # Every bit, NaN outputs included: the reference writes NaN as 0xFFFF.
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    nan = want.isnan()
+    assert nan.sum() == 2 * 256 + 2 * 127 and (want.view(torch.int16)[nan] == -1).all()
     # Denormal products, the 2**-127 scale and saturation are all exercised.
     assert (want[0] != 0).any() and want.isinf().any()
 
@@ -989,7 +997,8 @@ def test_gpu_dequant_kernel_bitwise_exhaustive():
     want = dequant_engram_rows_reference(
         torch.from_numpy(values), torch.from_numpy(scales)
     )
-    _assert_bitwise(out.cpu(), want)
+    # Every bit, NaN outputs (0xFFFF) included.
+    assert torch.equal(out.cpu().view(torch.int16), want.view(torch.int16))
     # Odd row counts take the masked tail.
     tail = torch.empty(37, DIM, dtype=torch.bfloat16, device="cuda")
     dequant_engram_rows(values_t[:37].contiguous(), scales_t[:37].contiguous(), tail)
