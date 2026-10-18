@@ -274,6 +274,36 @@ def compress(
     norm_weight: torch.Tensor,
     ring: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`compress_rows` of one layer's step."""
+    assert batch.comp_slots is not None
+    return compress_rows(
+        kv_score,
+        norm_weight,
+        ring,
+        batch.positions,
+        batch.token_to_req,
+        batch.query_start_loc,
+        batch.comp_slots,
+        batch.ring_slots,
+        cfg.compress_ratio,
+        cfg.head_dim,
+        cfg.eps,
+    )
+
+
+def compress_rows(
+    kv_score: torch.Tensor,
+    norm_weight: torch.Tensor,
+    ring: torch.Tensor | None,
+    positions: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    comp_slots: torch.Tensor,
+    ring_slots: torch.Tensor | None,
+    compress_ratio: int,
+    head_dim: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference ``Compressor.forward`` for every group a token closes.
 
     Returns ``(closes, latent)``, both over all T tokens: whether the token
@@ -284,27 +314,27 @@ def compress(
     this chunk, or from the request's state ring when the chunk starts on
     the second token of a group -- by an fp32 softmax over the gate, rounds
     the pooled row to BF16 and normalizes it; then the last ``capacity`` raw
-    ``[kv | score]`` rows of each request go to the ring.
+    ``[kv | score]`` rows of each request go to the ring. The arguments are
+    plain tensors and numbers so that a call can be recorded and replayed as
+    it ran.
     """
-    ratio = cfg.compress_ratio
-    d = cfg.head_dim
-    assert batch.comp_slots is not None
-    pos = batch.positions
+    d = head_dim
+    pos = positions
     T = pos.shape[0]
-    if ratio == 1:
+    if compress_ratio == 1:
         kv = kv_score[:T, :d].to(torch.bfloat16)
-        return batch.comp_slots >= 0, rms_norm(kv, norm_weight, cfg.eps)
+        return comp_slots >= 0, rms_norm(kv, norm_weight, eps)
 
-    assert ratio == 2 and ring is not None and batch.ring_slots is not None
+    assert compress_ratio == 2 and ring is not None and ring_slots is not None
     assert kv_score.dtype == torch.float32 and kv_score.shape[1] == 2 * d
-    closes = (batch.comp_slots >= 0) & ((pos + 1) % 2 == 0)
+    closes = (comp_slots >= 0) & ((pos + 1) % 2 == 0)
     t = torch.arange(T, device=pos.device)
-    req = batch.token_to_req.to(torch.int64)
-    qsl = batch.query_start_loc.to(torch.int64)
+    req = token_to_req.to(torch.int64)
+    qsl = query_start_loc.to(torch.int64)
     capacity = ring.shape[1]
     # A group a chunk's first token closes started in an earlier step: its
     # first row is in the ring (a closing token always has a ring slot).
-    ring_slot = batch.ring_slots.to(torch.int64).clamp_min(0)
+    ring_slot = ring_slots.to(torch.int64).clamp_min(0)
     from_ring = ring[ring_slot // capacity, (pos - 1) % capacity]
     first = (t == qsl[req]).unsqueeze(-1)
     prev = torch.where(first, from_ring, kv_score[(t - 1).clamp_min(0)])
@@ -312,15 +342,15 @@ def compress(
     kv = torch.stack((prev[:, :d], cur[:, :d]), dim=1)
     score = torch.stack((prev[:, d:], cur[:, d:]), dim=1)
     pooled = (kv * score.softmax(dim=1)).sum(dim=1)
-    latent = rms_norm(pooled.to(torch.bfloat16), norm_weight, cfg.eps)
+    latent = rms_norm(pooled.to(torch.bfloat16), norm_weight, eps)
 
     # Ring tail: only the last `capacity` tokens of each request, so no two
     # writes land on one ring row. A FULL graph's padding tokens lie past the
     # last request's query and map to request 0 with a ring slot of its block;
     # they are not in any request's query and write nothing.
     end = qsl[req + 1]
-    tail = (batch.ring_slots >= 0) & (t >= end - capacity) & (t < end)
-    store_rows(ring, torch.where(tail, batch.ring_slots, -1), kv_score[:T])
+    tail = (ring_slots >= 0) & (t >= end - capacity) & (t < end)
+    store_rows(ring, torch.where(tail, ring_slots, -1), kv_score[:T])
     return closes, latent
 
 
@@ -333,8 +363,22 @@ def index_keys(
     """Reference index-K append: ``k_norm(wk(latent))``, RoPE at the group's
     first position, FP4 (32, E8M0) qdq."""
     assert weights.wk is not None and weights.k_norm is not None
-    k = rms_norm(weights.wk(latent), weights.k_norm, cfg.eps)
-    return qdq_fp4(rope(k, group_pos, weights.freqs), 32, "e8m0")
+    return index_key_rows(
+        weights.wk(latent), weights.k_norm, weights.freqs, group_pos, cfg.eps
+    )
+
+
+def index_key_rows(
+    k: torch.Tensor,
+    k_norm: torch.Tensor,
+    freqs: torch.Tensor,
+    group_pos: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """:func:`index_keys` after ``wk``: ``k_norm``, RoPE at ``group_pos``,
+    FP4 (32, E8M0) qdq (plain arguments, recordable as a call)."""
+    k = rms_norm(k, k_norm, eps)
+    return qdq_fp4(rope(k, group_pos, freqs), 32, "e8m0")
 
 
 def compressed_kv(
