@@ -23,13 +23,14 @@
 // the totals of every finished fetch (see vllm/models/deepseek_v41/nvidia/
 // sm80_engram.py NATIVE_COUNTERS). prefault() touches every cache page and
 // returns the time it took in ns. At most `slots` fetches are queued or not
-// yet taken. For CUDA graphs, add_fixed(ids, values, scales_out) adds a
-// fixed staging of exactly ids.numel() rows (one graph size) and returns its
-// index; enqueue_fixed(index, dev_ids, dev_values, dev_scales) queues, also
-// under capture, the copy of the ids to that staging, the fetch on it as a
-// host function and the copies of its rows to the device, every argument
-// fixed; run_fixed(index) runs that fetch on the calling thread; take_fixed()
-// returns [failed rows, first failed row id, errno, offset, stopped
+// yet taken. For CUDA graphs, add_fixed(ids, values, scales_out, published)
+// adds the one fixed staging of up to ids.numel() rows and a CPU int64 the
+// fixed fetches add their failed rows to; enqueue_fixed(count, dev_ids,
+// dev_values, dev_scales) queues, also under capture, a fetch of `count`
+// rows on it: the copy of the ids, the fetch as a host function and the
+// copies of its rows to the device, every argument fixed; run_fixed(count)
+// runs that fetch on the calling thread; take_fixed() returns [failed rows,
+// first failed row id, errno, offset, stopped
 // fetches] of the fixed fetches since the last call. The fetch keeps its own
 // duplicate of fd and the tensors; one dropped while a fetch is still queued,
 // or after a fixed fetch was ever queued, is left allocated.
