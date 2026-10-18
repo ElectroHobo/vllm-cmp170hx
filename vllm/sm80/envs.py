@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
+    VLLM_CUDAGRAPH_ESTIMATE_SPLIT: bool = False
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_KV_PLAN_LOG: bool = False
     VLLM_THIN_GEMM_MAX_TOKENS: int = 32
@@ -517,6 +518,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # cache is sized. Logging only; the KV cache size is unchanged.
     "VLLM_MEM_ATTRIBUTION": lambda: bool(
         int(os.getenv("VLLM_MEM_ATTRIBUTION", "0"))
+    ),
+    # CUDA-graph memory estimate as the bytes the real capture keeps: the
+    # throwaway graph pool, the graph objects, the buffers the capture creates
+    # and what profiling leaves allocated, instead of the profiling capture's
+    # whole free-memory drop (which also holds one-time costs of the first
+    # capture and the warmups' allocator cache). Logs the split once per rank,
+    # and after the real capture what it keeps against the estimate. Runs the
+    # fork GPU worker (vllm/sm80/worker/graph_mem_worker.py, V2 model runner
+    # only; vllm/sm80/worker/cudagraph_mem.py). Default OFF.
+    "VLLM_CUDAGRAPH_ESTIMATE_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_CUDAGRAPH_ESTIMATE_SPLIT", "0"))
     ),
     # Align-mode Mamba KV reservation under async scheduling or pipeline
     # parallelism: also reserve the state blocks a request holds for the
