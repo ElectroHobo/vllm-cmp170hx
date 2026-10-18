@@ -69,6 +69,15 @@ def _index_scores_kernel(
     tile = tl.program_id(1)
     cols = tile * BLOCK_N + tl.arange(0, BLOCK_N)
     n_vis = tl.load(nvis_ptr + t).to(tl.int32)
+    if tile * BLOCK_N >= n_vis:
+        # Nothing visible in this tile: in a fixed-width (graph) launch most
+        # tiles are past the context, so skip their keys and the MMA.
+        tl.store(
+            out_ptr + t * stride_ot + cols,
+            tl.full([BLOCK_N], float("-inf"), tl.float32),
+            mask=cols < n_cols,
+        )
+        return
     valid = cols < n_vis
     req = tl.load(req_ptr + t).to(tl.int64)
     blk = tl.load(bt_ptr + req * stride_bt + cols // ENTRIES, mask=valid, other=0)
