@@ -5,11 +5,12 @@
 
 namespace exl3 {
 
-// moe_out on the tensor cores for one served shape (moe_v2.cu): padded hidden
-// 2560, padded intermediate 640, every routed matrix bits_x2 10 / codebook 2,
-// at most 1024 routed assignments per call. Same arguments and output as
-// moe_out; results differ from it in the last bits (FP64 side stages, hi/lo
-// FP16 MMAs).
+// moe_out on the tensor cores for the served shapes (moe_v2.cu): padded hidden
+// 2560 with intermediate 640 (bits_x2 10) and padded hidden 5120 with
+// intermediate 2304 (bits_x2 6 or 4), codebook 2, at most 1024 routed
+// assignments per call. moe_out's arguments plus bits_x2, the one bit width of
+// every routed matrix of the layer; same output, which differs from moe_out's
+// in the last bits (FP64 side stages, hi/lo FP16 MMAs).
 int64_t moe_workspace_size_v2(int64_t max_rows, int64_t hidden_size,
                               int64_t intermediate_size, int64_t topk,
                               int64_t local_experts);
@@ -18,6 +19,7 @@ void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
                 const torch::Tensor& packed_ptrs,
                 const torch::Tensor& packed_meta,
                 const torch::Tensor& expert_map, int64_t intermediate_size,
-                torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit);
+                int64_t bits_x2, torch::Tensor& out, torch::Tensor& workspace,
+                double swiglu_limit);
 
 }  // namespace exl3

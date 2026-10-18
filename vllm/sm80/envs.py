@@ -863,16 +863,18 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ENGRAM_TELEMETRY_STEPS", "0")
     ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
-    # of at most 64 rows when every local expert matrix is bits_x2 10 /
-    # codebook 2 with hidden 2560, intermediate 640, top-10 and 256 of 512
-    # experts local, on sm_80 (vllm/sm80/kernels/exl3/quant.py). Results
-    # differ from the default kernels in the last bits. Default OFF: unset,
-    # every call takes moe_out.
+    # of at most 64 rows of the layers ops.MOE_V2_CONFIGS lists (hidden 2560,
+    # intermediate 640, top-10, 256 of 512 experts local, bits_x2 10; hidden
+    # 5120, intermediate 2304, top-6, 96 of 384 experts local, bits_x2 6 or 4),
+    # every local expert matrix of a layer with one bits_x2 and codebook 2, on
+    # sm_80 (vllm/sm80/kernels/exl3/quant.py). Results differ from the default
+    # kernels in the last bits. Default OFF: unset, every call takes moe_out.
     "VLLM_EXL3_MOE_V2": lambda: bool(int(os.getenv("VLLM_EXL3_MOE_V2", "0"))),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_prefill.cu) for
     # calls of 65..3460 rows in prefill steps (some request scheduled more
-    # than 1 + num_speculative_tokens tokens), with the configuration
-    # VLLM_EXL3_MOE_V2 covers and 16-byte-aligned expert trellis bases
+    # than 1 + num_speculative_tokens tokens), with the hidden-2560
+    # configuration VLLM_EXL3_MOE_V2 covers (ops.MOE_PREFILL_CONFIGS) and
+    # 16-byte-aligned expert trellis bases
     # (vllm/sm80/kernels/exl3/quant.py). Other calls
     # and every call of a decode step keep their kernels. Results
     # differ from moe_out in the last bits. Default OFF: unset, prefill calls

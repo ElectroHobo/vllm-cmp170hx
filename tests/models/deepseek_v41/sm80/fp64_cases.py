@@ -71,7 +71,8 @@ Families: capture point (arguments) -> candidate / reference path / FP64.
   moe_out_prefill), checkpoint (the EXL3 checkpoint directory) and matrices
   (per local expert its gate, up and down matrix names) -> the operator /
   moe_out / the routed experts in FP64 from the decoded checkpoint weights
-  (``exl3_real_cases.moe_fp64`` with the SwiGLU clamp).
+  (``exl3_real_cases.moe_fp64`` with the SwiGLU clamp). moe_out_v2 runs at the
+  layer's one routed bits_x2, read from packed_meta.
 """
 
 import argparse
@@ -475,6 +476,8 @@ def exl3_moe(a: dict, device: torch.device) -> Call:
     weights, pointers, meta = expert_set(
         a["checkpoint"], a["matrices"], a["packed_meta"], device
     )
+    # moe_out_v2 runs at the layer's one routed bits_x2 (its gate checks it).
+    extra = {"bits_x2": int(a["packed_meta"][0][0][2])} if name == "moe_out_v2" else {}
 
     def run(op, rows):
         xr = x[rows]
@@ -486,6 +489,7 @@ def exl3_moe(a: dict, device: torch.device) -> Call:
         getattr(ops, op)(
             xr, ids[rows], tw[rows], pointers, meta, emap, inter, out, workspace,
             swiglu_limit=limit,
+            **(extra if op == name else {}),
         )
         return out
 

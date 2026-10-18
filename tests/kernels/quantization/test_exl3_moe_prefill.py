@@ -93,6 +93,7 @@ def _method(monkeypatch, warmed, num_speculative_tokens=3):
     method.intermediate_size = INTERMEDIATE
     method.local_experts = LOCAL
     method.global_expert_ids = list(range(0, GLOBAL, 2))
+    method.swiglu_limit = 0.0
     layer = SimpleNamespace(
         exl3_ptrs=torch.zeros(LOCAL, 3, 3, dtype=torch.int64),
         exl3_meta=torch.tensor(SERVED_META),
@@ -279,7 +280,9 @@ def _experts(
     experts.workspace_elements = workspace
     experts.max_rows = max_rows
     experts.moe_v2_rows = moe_v2_rows
+    experts.moe_v2_bits_x2 = 10
     experts.prefill_decode_len = prefill_decode_len
+    experts.swiglu_limit = 0.0
     return experts
 
 
@@ -305,7 +308,9 @@ def test_apply_dispatches_by_rows_and_scheduler_phase(
         monkeypatch.setattr(
             exl3_ops,
             name,
-            lambda *args, _name=name: calls.append((_name, args[0].shape[0], args)),
+            lambda *args, _name=name, **kwargs: calls.append(
+                (_name, args[0].shape[0], args)
+            ),
         )
     _phase(monkeypatch, phase)
     experts = _experts(moe_v2_rows, prefill_decode_len)

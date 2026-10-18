@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EXL3 packed linear and whole-expert inference with BF16 activations."""
 
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -689,9 +689,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.top_k,
             self.local_experts,
         )
-        moe_v2_rows = 0
+        moe_v2_rows = moe_v2_bits_x2 = 0
         if envs.VLLM_EXL3_MOE_V2:
-            moe_v2_rows, workspace = self._moe_v2(layer, metadata, max_rows, workspace)
+            moe_v2_rows, moe_v2_bits_x2, workspace = self._moe_v2(
+                layer, metadata, max_rows, workspace
+            )
         prefill_decode_len = 0
         if envs.VLLM_EXL3_MOE_PREFILL_TC:
             prefill_decode_len, workspace = self._moe_prefill(
@@ -704,15 +706,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_expert_map,
             workspace,
             max_rows,
-            moe_v2_rows,
-            prefill_decode_len,
-            self.swiglu_limit,
+            moe_v2_rows=moe_v2_rows,
+            moe_v2_bits_x2=moe_v2_bits_x2,
+            prefill_decode_len=prefill_decode_len,
+            swiglu_limit=self.swiglu_limit,
         )
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
 
     def _moe_v2(self, layer, metadata, max_rows: int, workspace: int):
-        """Rows up to which this layer's calls take moe_out_v2, and a workspace
-        size that fits both operators (0 rows: the gate is closed)."""
+        """Rows up to which this layer's calls take moe_out_v2, the bits_x2
+        of its routed matrices, and a workspace size that fits both operators
+        (0 rows: the gate is closed)."""
         from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
         device = layer.exl3_ptrs.device
@@ -732,7 +736,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "layers keep moe_out.",
                 reason,
             )
-            return 0, workspace
+            return 0, 0, workspace
+        # One bit width for every routed matrix of the layer (the gate checked).
+        bits_x2 = metadata[0][0][2]
         rows = min(max_rows, exl3_ops.MOE_V2_MAX_ROWS)
         workspace = max(
             workspace,
@@ -752,14 +758,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.hidden_size,
             self.intermediate_size,
             layer.top_k,
+            bits_x2,
             self.swiglu_limit,
         )
         logger.info_once(
             "EXL3 MoE v2 kernel active (VLLM_EXL3_MOE_V2): tensor-core routed "
-            "experts for MoE calls of 1..%d rows; larger calls keep moe_out.",
+            "experts (bits_x2 %d) for MoE calls of 1..%d rows; larger calls keep "
+            "moe_out.",
+            bits_x2,
             rows,
         )
-        return rows, workspace
+        return rows, bits_x2, workspace
 
     def _moe_prefill(self, layer, metadata, max_rows: int, workspace: int):
         """The most tokens one request has in a decode step, above which a
@@ -771,8 +780,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len
 
         device = layer.exl3_ptrs.device
-        # moe_out_prefill covers the configuration moe_out_v2 covers.
-        reason = exl3_ops.moe_v2_closed_reason(
+        reason = exl3_ops.moe_prefill_closed_reason(
             tuple(torch.cuda.get_device_capability(device)),
             self.moe.in_dtype,
             self.hidden_size,
@@ -868,6 +876,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         workspace,
         max_rows,
         moe_v2_rows=0,
+        moe_v2_bits_x2=0,
         prefill_decode_len=0,
         swiglu_limit=0.0,
     ):
@@ -876,8 +885,10 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.expert_map = expert_map
         self.workspace_elements = workspace
         self.max_rows = max_rows
-        # Calls of 1..moe_v2_rows rows take moe_out_v2 (VLLM_EXL3_MOE_V2).
+        # Calls of 1..moe_v2_rows rows take moe_out_v2 (VLLM_EXL3_MOE_V2) with
+        # the layer's routed-matrix bits_x2.
         self.moe_v2_rows = moe_v2_rows
+        self.moe_v2_bits_x2 = moe_v2_bits_x2
         # Nonzero (VLLM_EXL3_MOE_PREFILL_TC with its gate open): calls of more
         # than 64 rows in a step that schedules some request more than this
         # many tokens take moe_out_prefill.
@@ -970,7 +981,10 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             or a2_scale is not None
         ):
             raise ValueError("EXL3 MoE requires unquantized, unweighted BF16 inputs")
-        operator = moe_out_v2 if 0 < rows <= self.moe_v2_rows else moe_out
+        if 0 < rows <= self.moe_v2_rows:
+            operator = partial(moe_out_v2, bits_x2=self.moe_v2_bits_x2)
+        else:
+            operator = moe_out
         if self.prefill_decode_len:
             operator = self._prefill_operator(rows, operator)
         operator(

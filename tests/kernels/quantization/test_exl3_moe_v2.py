@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""EXL3 MoE v2 (VLLM_EXL3_MOE_V2, csrc/exl3/moe_v2.cu).
+"""EXL3 MoE v2 (VLLM_EXL3_MOE_V2, csrc/exl3/moe_v2.cu), hidden-2560 configuration
+(test_exl3_moe_v2_hidden5120.py holds the hidden-5120 one).
 
 CPU: the switch default, the configuration gate and its log lines (through
 vLLM's own logger), the row dispatch in Exl3Experts.apply with the switch off
@@ -16,6 +17,7 @@ without any allocator event.
 """
 
 import logging
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,7 +31,7 @@ needs_sm80 = pytest.mark.skipif(
     reason="EXL3 kernels are built for SM 8.0",
 )
 
-HIDDEN, INTERMEDIATE, TOPK = 2560, 640, 10
+HIDDEN, INTERMEDIATE, TOPK, BITS_X2 = 2560, 640, 10, 10
 LOCAL, GLOBAL = 256, 512
 SERVED_META = [[[2560, 640, 10, 2], [2560, 640, 10, 2], [640, 2560, 10, 2]]] * LOCAL
 
@@ -105,6 +107,7 @@ def _method(monkeypatch, warmed):
     method.intermediate_size = INTERMEDIATE
     method.local_experts = LOCAL
     method.global_expert_ids = list(range(0, GLOBAL, 2))
+    method.swiglu_limit = 0.0
     layer = SimpleNamespace(
         exl3_ptrs=torch.zeros(LOCAL, 3, 3, dtype=torch.int64),
         exl3_meta=torch.tensor(SERVED_META),
@@ -135,14 +138,16 @@ def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
     caplog.set_level(logging.INFO, logger="vllm")
     try:
         vllm_logger._print_info_once.cache_clear()
-        # Open: rows capped at the validated maximum, workspace = max(v1, v2).
-        assert method._moe_v2(layer, SERVED_META, 3200, 7) == (64, 64000)
-        assert method._moe_v2(layer, SERVED_META, 3200, 10**9) == (64, 10**9)
-        assert method._moe_v2(layer, SERVED_META, 16, 7) == (16, 16000)
+        # Open: rows capped at the validated maximum, the layer's bits_x2,
+        # workspace = max(v1, v2).
+        assert method._moe_v2(layer, SERVED_META, 3200, 7) == (64, 10, 64000)
+        assert method._moe_v2(layer, SERVED_META, 3200, 10**9) == (64, 10, 10**9)
+        assert method._moe_v2(layer, SERVED_META, 16, 7) == (16, 10, 16000)
         assert len(warmed) == 3 and warmed[0][3] == method.global_expert_ids
+        assert warmed[0][7] == BITS_X2
         # Closed: one line saying why; nothing sized or warmed.
         wrong = _meta_with(3, 0, [2560, 640, 8, 2])
-        assert method._moe_v2(layer, wrong, 3200, 7) == (0, 7)
+        assert method._moe_v2(layer, wrong, 3200, 7) == (0, 0, 7)
         assert len(warmed) == 3
     finally:
         root.removeHandler(caplog.handler)
@@ -151,7 +156,8 @@ def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
         logging.INFO,
         quant.__name__,
         "EXL3 MoE v2 kernel active (VLLM_EXL3_MOE_V2): tensor-core routed "
-        "experts for MoE calls of 1..64 rows; larger calls keep moe_out.",
+        "experts (bits_x2 10) for MoE calls of 1..64 rows; larger calls keep "
+        "moe_out.",
     ) in lines
     # One distinct line (caplog may also see it through the root logger).
     closed = sorted({m for _, _, m in lines if "gate is closed" in m})
@@ -171,7 +177,9 @@ def _experts(moe_v2_rows, max_rows=4096, workspace=0, expert_map="layer map"):
     experts.workspace_elements = workspace
     experts.max_rows = max_rows
     experts.moe_v2_rows = moe_v2_rows
+    experts.moe_v2_bits_x2 = BITS_X2
     experts.prefill_decode_len = 0
+    experts.swiglu_limit = 0.0
     return experts
 
 
@@ -202,7 +210,9 @@ def test_apply_dispatches_by_rows(monkeypatch, moe_v2_rows):
         monkeypatch.setattr(
             exl3_ops,
             name,
-            lambda *args, _name=name: calls.append((_name, args[0].shape[0], args)),
+            lambda *args, _name=name, **kwargs: calls.append(
+                (_name, args[0].shape[0], args, kwargs)
+            ),
         )
     experts = _experts(moe_v2_rows)
     workspace2 = torch.zeros(8, dtype=torch.bfloat16)
@@ -213,12 +223,17 @@ def test_apply_dispatches_by_rows(monkeypatch, moe_v2_rows):
         ("moe_out_v2" if moe_v2_rows and rows <= 64 else "moe_out", rows)
         for rows in (1, 4, 63, 64, 65, 3200)
     ]
-    assert [(name, rows) for name, rows, _ in calls] == expected
-    for _, _, args in calls:
+    assert [(name, rows) for name, rows, _, _ in calls] == expected
+    for name, _, args, kwargs in calls:
         # Same arguments for both operators: layer map, FP32 view of workspace2.
         assert args[1:6] == ("ids", "weights", "ptrs", "meta", "layer map")
         assert args[6] == INTERMEDIATE and args[7] == "out"
         assert args[8].dtype == torch.float32
+        # moe_out_v2 also gets the layer's bits_x2.
+        expected_kwargs = {"swiglu_limit": 0.0}
+        if name == "moe_out_v2":
+            expected_kwargs["bits_x2"] = BITS_X2
+        assert kwargs == expected_kwargs
 
 
 def test_operator_list_and_workspace_contract():
@@ -360,7 +375,12 @@ def _v1(served, x, ids, weights):
 
 def _v2(served, x, ids, weights):
     return _run(
-        exl3_ops.moe_out_v2, served, x, ids, weights, exl3_ops.moe_workspace_size_v2
+        partial(exl3_ops.moe_out_v2, bits_x2=BITS_X2),
+        served,
+        x,
+        ids,
+        weights,
+        exl3_ops.moe_workspace_size_v2,
     )
 
 
@@ -515,6 +535,7 @@ def test_v2_refuses_shapes_outside_its_configuration(served):
             512,
             out,
             workspace,
+            bits_x2=BITS_X2,
         )
     with pytest.raises(RuntimeError, match="1024 routed assignments"):
         big = x.new_zeros(103, HIDDEN)
@@ -528,6 +549,20 @@ def test_v2_refuses_shapes_outside_its_configuration(served):
             INTERMEDIATE,
             torch.empty_like(big),
             workspace,
+            bits_x2=BITS_X2,
+        )
+    with pytest.raises(RuntimeError, match="no bits_x2 6 kernels"):
+        exl3_ops.moe_out_v2(
+            x,
+            ids,
+            weights,
+            served.pointers,
+            served.meta,
+            served.expert_map,
+            INTERMEDIATE,
+            out,
+            workspace,
+            bits_x2=6,
         )
 
 
@@ -546,6 +581,7 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
         HIDDEN,
         INTERMEDIATE,
         TOPK,
+        BITS_X2,
     )
     x, ids, weights = _case(served, "uniform", rows, 11)
     out = torch.empty_like(x)
@@ -556,7 +592,7 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     args = (served.pointers, served.meta, served.expert_map, INTERMEDIATE)
 
     def call():
-        exl3_ops.moe_out_v2(x, ids, weights, *args, out, workspace)
+        exl3_ops.moe_out_v2(x, ids, weights, *args, out, workspace, bits_x2=BITS_X2)
 
     torch.cuda.synchronize()
     before = _allocations()
