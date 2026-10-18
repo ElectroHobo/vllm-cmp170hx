@@ -61,6 +61,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
+    VLLM_CUDAGRAPH_ESTIMATE_SPLIT: int = 0
+    VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB: int = 0
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_KV_PLAN_LOG: bool = False
     VLLM_THIN_GEMM_MAX_TOKENS: int = 32
@@ -517,6 +519,28 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # cache is sized. Logging only; the KV cache size is unchanged.
     "VLLM_MEM_ATTRIBUTION": lambda: bool(
         int(os.getenv("VLLM_MEM_ATTRIBUTION", "0"))
+    ),
+    # CUDA-graph memory estimate as the bytes the real capture keeps: the
+    # throwaway graph pool, the graph objects, the buffers the capture creates
+    # and what profiling leaves allocated, instead of the profiling capture's
+    # whole free-memory drop (which also holds one-time costs of the first
+    # capture and the warmups' allocator cache). The profiling capture captures
+    # every FULL graph rather than vLLM's two largest plus a linear
+    # extrapolation. Logs the split once per rank,
+    # and after the real capture what it keeps against the estimate. Runs the
+    # fork GPU worker (vllm/sm80/worker/graph_mem_worker.py, V2 model runner
+    # only; vllm/sm80/worker/cudagraph_mem.py). 2 also records the allocation
+    # history of the profiling run and lists what it leaves allocated by
+    # call stack (diagnostics; slower capture). Default 0 (OFF).
+    "VLLM_CUDAGRAPH_ESTIMATE_SPLIT": lambda: int(
+        os.getenv("VLLM_CUDAGRAPH_ESTIMATE_SPLIT", "0")
+    ),
+    # With VLLM_CUDAGRAPH_ESTIMATE_SPLIT: the allocator's max_split_size_mb
+    # for the length of each CUDA-graph capture (profiling and real), so a
+    # small long-lived allocation made during a capture cannot keep a large
+    # free segment from being released. Default 0 (unchanged).
+    "VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB": lambda: int(
+        os.getenv("VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB", "0")
     ),
     # Align-mode Mamba KV reservation under async scheduling or pipeline
     # parallelism: also reserve the state blocks a request holds for the

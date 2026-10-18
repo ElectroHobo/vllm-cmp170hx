@@ -42,7 +42,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 720 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 978 |
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
-| `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 355 |
+| `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 349 |
 | `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 141 |
 | `vllm/models/glm5next/nvidia/model_state.py` | 113 |
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
@@ -51,7 +51,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **12 files** | **4,440** |
+| **12 files** | **4,434** |
 
 ### `vllm/sm80/kernels/`
 
@@ -125,7 +125,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 1,124 |
+| `vllm/sm80/envs.py` | 1,148 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -140,7 +140,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/layers/moe/runner.py` | 177 |
 | `vllm/sm80/layers/moe/shared_experts.py` | 134 |
 | `vllm/sm80/model_registry.py` | 78 |
-| `vllm/sm80/platform.py` | 139 |
+| `vllm/sm80/platform.py` | 153 |
 | `vllm/sm80/plugin.py` | 324 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
@@ -149,11 +149,13 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/lilicorr_model.py` | 31 |
 | `vllm/sm80/spec_decode/warmup.py` | 170 |
 | `vllm/sm80/worker/__init__.py` | 2 |
+| `vllm/sm80/worker/cudagraph_mem.py` | 464 |
+| `vllm/sm80/worker/graph_mem_worker.py` | 57 |
 | `vllm/sm80/worker/mem_attribution.py` | 276 |
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **36 files** | **9,484** |
+| **38 files** | **10,043** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -340,7 +342,6 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_no_host_sync.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_official_reference.py` | 1,402 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 283 |
-| `tests/models/deepseek_v41/sm80/test_sm80_decoder_replay.py` | 37 |
 | `tests/models/deepseek_v41/sm80/test_sm80_kernels_gpu.py` | 312 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused.py` | 299 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused_gpu.py` | 173 |
@@ -374,7 +375,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/test_native_checkpoint_wrapper_meta.py` | 256 |
 | `tests/parser/engine/test_glm47_tool_choice_none.py` | 265 |
 | `tests/plugins_tests/conftest.py` | 17 |
-| `tests/sm80/seams.yaml` | 1,239 |
+| `tests/sm80/seams.yaml` | 1,281 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
 | `tests/sm80/test_exl3_platform_verification.py` | 65 |
 | `tests/sm80/test_exl3_plugin.py` | 110 |
@@ -420,8 +421,9 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_draft_tail.py` | 1,204 |
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
+| `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **173 files** | **86,755** |
+| **173 files** | **87,317** |
 
 #### `tools/`
 
@@ -571,6 +573,8 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_AMPERE_MARLIN_PREFILL_WIDE` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE` | `bool` | `False` | `'0'` |
+| `VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB` | `int` | `0` | `'0'` |
+| `VLLM_CUDAGRAPH_ESTIMATE_SPLIT` | `int` | `0` | `'0'` |
 | `VLLM_CUSTOM_ALLREDUCE_ALGO` | `str` | `''` | `None` |
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS` | `bool` | `False` | `'0'` |
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES` | `int` | `262144` | `'262144'` |
@@ -652,7 +656,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **95 variables** | | | |
+| **97 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -670,12 +674,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 146 |
-| Fork-added product lines | 45,697 |
+| Fork-added product files | 148 |
+| Fork-added product lines | 46,250 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 49,252 |
-| Fork environment variables (flags) | 95 |
+| Product lines added (new files and patches) | 49,805 |
+| Fork environment variables (flags) | 97 |
 | Unreferenced fork definitions | 2 (23 lines) |

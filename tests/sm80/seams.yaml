@@ -1237,3 +1237,45 @@ seams:
   why: the EXL3 construction test replaces it with a parameter-free table; the fork loader expects no engram.embed tensors in the EXL3 directory
   sha256: d331ec38811b076c1c742aac125343024fae5ca6ec097bd0811ab8384d4f87ab
   signature: '(self, layout: vllm.models.deepseek_v41.common.engram.EngramLayout, layer_hash_index: int) -> vllm.models.deepseek_v41.common.engram.ParallelEngramEmbedding'
+
+- id: graphmem-worker-make-model-runner
+  kind: method
+  target: vllm.v1.worker.gpu_worker:Worker._make_model_runner
+  why: the CUDA-graph estimate split worker overrides it to build the V2 runner subclass; it must stay the one place the worker builds its model runner (V2 unless use_v2_model_runner is off or the model is encoder-only)
+  sha256: 3d6601a9b9f755ec6324cd20ced5d604be27b48fe48cb8d34cbd8432621000d1
+  signature: (self) -> 'GPUModelRunner'
+
+- id: graphmem-profile-cudagraph-memory
+  kind: function
+  target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
+  why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
+  sha256: ffdd4cd7ba6c9cc949864294bdac6dc7f54f6f0e95b41fbfd53b85292eba43ef
+  signature: '(runner: ''GPUModelRunner'') -> int'
+
+- id: graphmem-runner-capture-model
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model
+  why: the estimate split runner overrides it (keyword-only profile_only, returns the free-memory drop in bytes); the worker calls it once for the real capture after the KV cache is sized
+  sha256: 14f78e5a457fc366b63170a7b0e87868dda176c2e6dbe541ef30c750307c4158
+  signature: '(self, *, profile_only: bool = False) -> int'
+
+- id: graphmem-runner-profile-cudagraph-memory
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.profile_cudagraph_memory
+  why: the estimate split runner overrides it and calls it unbound; the worker subtracts its return value from the KV cache
+  sha256: 7a895d562c9a9408e0feedc1359862e16b800ded2529cb480895243379a9163e
+  signature: (self) -> int
+
+- id: graphmem-manager-capture
+  kind: method
+  target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture
+  why: the estimate split sets _max_full_descs_to_capture and _capture_mem_samples to None in the profiling capture; None must mean every FULL graph is captured and no per-graph sample is taken
+  sha256: 7ab498e2e81ba4c4b05bc7e77eb3a9598db97293d10f62fda2473c4cc4e9ca6d
+  signature: '(self, create_forward_fn: vllm.v1.worker.gpu.cudagraph_utils.CreateForwardFn, progress_bar_desc: str = ''Capturing CUDA graphs'') -> None'
+
+- id: graphmem-extrapolate-full
+  kind: function
+  target: vllm.v1.worker.gpu.cudagraph_utils:_extrapolate_full_graph_memory
+  why: with no FULL samples it must return 0, so profile_cudagraph_memory returns the measured drop of a capture that took every FULL graph
+  sha256: 5707fc144c9fce97ff7875a6ecc30297db36546c3efa191a094c708ae3f03339
+  signature: '(mem_samples: list[int], total_graphs: int) -> int'
