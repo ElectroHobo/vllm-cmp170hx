@@ -321,13 +321,13 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
 | `tests/models/deepseek_v41/sm80/fixtures/exl3_headers.json` | 25,297 |
 | `tests/models/deepseek_v41/sm80/fp64_cases.py` | 607 |
-| `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,406 |
+| `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,510 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,112 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 322 |
-| `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 101 |
+| `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 122 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 280 |
 | `tests/models/deepseek_v41/sm80/test_sm80_kernels_gpu.py` | 312 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
@@ -406,7 +406,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **161 files** | **81,789** |
+| **161 files** | **81,914** |
 
 #### `tools/`
 

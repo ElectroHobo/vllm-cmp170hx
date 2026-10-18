@@ -28,12 +28,15 @@ rows after a cache eviction or an early staging reuse.
   for that position, written after its block was last allocated; blocks are
   freed behind the window, recycled, shared by prefix hits, at ids whose
   element offsets pass 2**31.
-* ``engram_staging`` -- ``Sm80EngramEmbedding`` lookups of every TP rank with
-  the device side emulated by an in-order queue (copies, dequant and the
-  consumer run when the queue reaches them; the host only waits through the
-  layer's events): the host id and row staging is refilled only after the
-  device read it, and rows the set-associative cache evicted come back as
-  the table's rows.
+* ``engram_staging`` -- ``Sm80EngramEmbedding`` lookups of every TP rank,
+  eager and captured (the fixed staging of a graph size), with the device
+  side emulated by an in-order queue: the copies, the native host fetch
+  (``EngramHostFetch``, queued as a host function) and the dequant run when
+  the queue reaches them; the host only waits through the layer's events.
+  Every staging (device ids, host ids, host rows, device rows) is read only
+  while it holds the reading lookup's data, the native row cache follows the
+  set-associative LRU (hits, misses, inserts, evictions per fetch) and serves
+  the table's bytes, and rows it evicted come back as the table's rows.
 
 The attention groups run the history's requests through the real sm_80
 attention core (``sm80_attn_core.forward_layer``), with the ring slot mapping
@@ -82,6 +85,7 @@ from tests.models.deepseek_v41.sm80.test_engram_storage import (  # noqa: E402
     DIM as ENGRAM_DIM,
 )
 from tests.models.deepseek_v41.sm80.test_engram_storage import (  # noqa: E402
+    _LruModel,
     _write_table,
 )
 from vllm.models.deepseek_v41 import compressor as compressor_mod  # noqa: E402
@@ -144,6 +148,7 @@ ENGRAM_COVERAGE = (
     "set_conflicts",
     "refetch_after_eviction",
     "staging_waits",
+    "captured_lookups",
 )
 
 
@@ -271,6 +276,7 @@ CODE_FILES = (
     "vllm/models/deepseek_v41/nvidia/ops/sm80_act_quant.py",
     "vllm/v1/attention/backends/mla/sparse_swa.py",
     "vllm/models/deepseek_v41/nvidia/sm80_engram.py",
+    "csrc/exl3/engram_fetch.cpp",
     "vllm/models/deepseek_v41/nvidia/ops/sm80_engram_dequant.py",
 )
 
@@ -1101,6 +1107,8 @@ ENGRAM_LAYER = 3
 ENGRAM_TP = 4
 ENGRAM_MAX_TOKENS = 12
 ENGRAM_CACHE_SETS = 2
+ENGRAM_CACHE_WAYS = 8
+ENGRAM_GRAPH_SIZES = (3, 7, 12)
 ENGRAM_LOOKUPS = 40
 
 
@@ -1173,7 +1181,7 @@ class DeviceMode(TorchFunctionMode):
             dst = args[0]
             kind = self.kinds.get(dst.untyped_storage().data_ptr())
             non_blocking = kwargs.get("non_blocking") or (len(args) > 2 and args[2])
-            if kind is not None and (kind.startswith("dev") or non_blocking):
+            if kind is not None and (kind.split(":")[-1].startswith("dev") or non_blocking):
                 lookup = self.state.lookup
                 self.queue.enqueue(
                     lambda: self.state.on_device_op(kind, lookup, func, args, kwargs),
@@ -1183,97 +1191,172 @@ class DeviceMode(TorchFunctionMode):
         return func(*args, **kwargs)
 
 
+class FetchProxy:
+    """The native fetch with its queued work on the emulated device queue:
+    ``enqueue`` (eager) queues the host function, ``enqueue_fixed``
+    (captured) its id copy, host function and row copies, as the stream would
+    run them. Everything else is the real ``EngramHostFetch``."""
+
+    def __init__(self, rank: "EngramRank", fetcher):
+        self.rank, self.fetcher = rank, fetcher
+
+    def __getattr__(self, name):
+        return getattr(self.fetcher, name)
+
+    def enqueue(self, count: int) -> None:
+        rank, lookup = self.rank, self.rank.lookup
+        rank.queue.enqueue(
+            lambda: rank.host_fetch("eager", lookup, count,
+                                    lambda: self.fetcher.run(count)),
+            "host_fetch", lookup,
+        )
+
+    def enqueue_fixed(self, index, dev_ids, dev_values, dev_scales) -> None:
+        rank, lookup = self.rank, self.rank.lookup
+        fixed = rank.emb.store.fixed[index]
+        staging = f"f{index}"
+
+        def ids_to_host():
+            rank.read(staging, "dev_ids", lookup)
+            fixed.ids.copy_(dev_ids)
+            rank.writer[(staging, "host_ids")] = lookup
+
+        def rows_to_device():
+            rank.read(staging, "host_rows", lookup)
+            dev_values.copy_(fixed.values)
+            dev_scales.copy_(fixed.scales)
+            rank.writer[(staging, "dev_values")] = lookup
+
+        rank.queue.enqueue(ids_to_host, "host_ids", lookup)
+        rank.queue.enqueue(
+            lambda: rank.host_fetch(staging, lookup, fixed.count,
+                                    lambda: self.fetcher.run_fixed(index)),
+            "host_fetch", lookup,
+        )
+        rank.queue.enqueue(rows_to_device, "dev_values", lookup)
+
+
 class EngramRank:
     """One TP rank's ``Sm80EngramEmbedding`` driven through a history of
-    lookups with the device stream emulated."""
+    eager and captured lookups with the device stream emulated."""
 
     def __init__(self, files, rank, table_values, table_scales, rng, rec: Record):
         self.rec, self.rng, self.rank = rec, rng, rank
         self.values, self.scales = table_values, table_scales
-        cache_bytes = ENGRAM_CACHE_SETS * sm80_engram.CACHE_WAYS * (
-            ENGRAM_DIM + sm80_engram.CACHE_ENTRY_OVERHEAD
-        )
+        cache_bytes = ENGRAM_CACHE_SETS * ENGRAM_CACHE_WAYS * (ENGRAM_DIM + 16)
         emb = sm80_engram.Sm80EngramEmbedding(
             ENGRAM_ROWS, ENGRAM_DIM, ENGRAM_HEADS, files, tp_rank=rank, tp_size=ENGRAM_TP,
             max_tokens=ENGRAM_MAX_TOKENS, placement="ssd", cache_bytes=cache_bytes,
-            device="cpu",
+            device="cpu", graph_sizes=ENGRAM_GRAPH_SIZES,
         )
+        assert emb.store.fetcher.cache_rows() == ENGRAM_CACHE_SETS * ENGRAM_CACHE_WAYS
         self.emb = emb
         self.queue = DeviceQueue(rng)
         cap = emb.capacity_rows
         emb._dev_ids = torch.empty(cap, dtype=torch.int64)
         emb._dev_values = torch.empty(cap, ENGRAM_DIM, dtype=torch.uint8)
         emb._dev_scales = torch.empty(cap, ENGRAM_DIM // 32, dtype=torch.uint8)
-        emb._ids_ready = QueueEvent(self.queue)
-        emb._staged = QueueEvent(self.queue, self.on_staged_wait)
+        emb._staged = QueueEvent(self.queue)
         emb._consumed = QueueEvent(self.queue)
         emb.device = torch.device("cuda")
+        emb.store.fetcher = FetchProxy(self, emb.store.fetcher)
         self.out = torch.empty(ENGRAM_MAX_TOKENS, emb.part_n_hash_cols, ENGRAM_DIM, dtype=BF16)
+        store = emb.store
+
+        def ptr(t):
+            return t.untyped_storage().data_ptr()
+
         self.kinds = {
-            emb._dev_ids.untyped_storage().data_ptr(): "dev_ids",
-            emb._dev_values.untyped_storage().data_ptr(): "dev_values",
-            emb._dev_scales.untyped_storage().data_ptr(): "dev_scales",
-            emb._host_ids.untyped_storage().data_ptr(): "host_ids",
-            self.out.untyped_storage().data_ptr(): "dev_out",
+            ptr(emb._dev_ids): "eager:dev_ids",
+            ptr(emb._dev_values): "eager:dev_values",
+            ptr(emb._dev_scales): "eager:dev_scales",
+            ptr(store.ids): "eager:host_ids",
+            ptr(self.out): "out:dev_out",
         }
+        for fixed, (dev_ids, dev_values, dev_scales) in emb._graph_staging.values():
+            staging = f"f{fixed.index}"
+            self.kinds[ptr(dev_ids)] = f"{staging}:dev_ids"
+            self.kinds[ptr(dev_values)] = f"{staging}:dev_values"
+            self.kinds[ptr(dev_scales)] = f"{staging}:dev_scales"
         self.lookup = -1
-        self.ids_writer = -1
-        self.host_writer = -1
+        # (staging, buffer) -> the lookup whose data the buffer holds.
+        self.writer: dict = {}
+        self.model = _LruModel(ENGRAM_CACHE_SETS, ENGRAM_CACHE_WAYS)
         self.results: dict = {}
         self.expected: dict = {}
+        self.hit_rows: dict = {}
         self.refetched: dict = {}
         self.evicted_ids: set = set()
-        self.real_fetch = emb.store.fetch
-        emb.store.fetch = self.fetch
+        self.transition: dict = {}
+        # lookup -> the staging it used.
+        self.staged_by: dict = {}
+        self.counters = store.counters()
         lo = emb.vocab_start_idx
         hot = [rng.randrange(emb.part_num_embeddings) for _ in range(6)]
         self.hot = [lo + h for h in hot]
 
     # -- device side ------------------------------------------------------
 
-    def on_device_op(self, kind, lookup, func, args, kwargs) -> None:
-        if kind in ("dev_values", "dev_scales"):
-            self.rec.expect(self.host_writer == lookup, "staging_reuse_ordered",
-                            rank=self.rank, lookup=lookup, staging_holds=self.host_writer)
-        func(*args, **kwargs)
-        if kind == "host_ids":
-            self.ids_writer = lookup
+    def read(self, staging: str, buffer: str, lookup: int) -> None:
+        holds = self.writer.get((staging, buffer), -1)
+        self.rec.expect(holds == lookup, "staging_reuse_ordered", rank=self.rank,
+                        lookup=lookup, staging=staging, buffer=buffer, holds=holds)
 
-    def on_staged_wait(self, ran) -> None:
-        self.rec.coverage["staging_waits"] += sum(
-            1 for kind, lookup in ran if kind == "dev_values" and lookup < self.lookup
-        )
+    def on_device_op(self, kind, lookup, func, args, kwargs) -> None:
+        staging, buffer = kind.split(":")
+        if buffer == "host_ids":
+            self.read(staging, "dev_ids", lookup)
+        elif buffer in ("dev_values", "dev_scales"):
+            self.read(staging, "host_rows", lookup)
+        func(*args, **kwargs)
+        self.writer[(staging, buffer)] = lookup
+
+    def host_fetch(self, staging: str, lookup: int, count: int, run) -> None:
+        """The host function: the native fetch of the staged ids, checked
+        against the LRU model of the row cache."""
+        rec, store = self.rec, self.emb.store
+        self.read(staging, "host_ids", lookup)
+        ids = (store.ids if staging == "eager" else store.fixed[int(staging[1:])].ids)
+        ids = ids.numpy()[:count].copy()
+        lo, hi = store.owner_lo, store.owner_hi
+        local = np.unique(ids[(ids >= lo) & (ids < hi)] - lo)
+        tags_before = set(self.model.tags[self.model.tags >= 0].tolist())
+        hits, misses, inserted, evicted, overflow = self.model.fetch(local)
+        run()
+        self.writer[(staging, "host_rows")] = lookup
+        tags_after = set(self.model.tags[self.model.tags >= 0].tolist())
+        counters = store.counters()
+        delta = {k: counters[k] - self.counters[k] for k in counters}
+        self.counters = counters
+        want = dict(cache_hits=hits, cache_misses=misses, cache_inserts=inserted,
+                    cache_evictions=evicted)
+        got = {k: delta[k] for k in want}
+        rec.expect(got == want, "cache_entries_match_table", rank=self.rank,
+                   lookup=lookup, native=got, lru=want)
+        gone = tags_before - tags_after
+        unique = set(local.tolist())
+        self.hit_rows[lookup] = {lo + r for r in unique & tags_before}
+        refetch = len(unique & self.evicted_ids)
+        self.evicted_ids = (self.evicted_ids | gone) - tags_after
+        self.refetched[lookup] = refetch
+        cov = rec.coverage
+        cov["evictions"] += evicted
+        cov["set_conflicts"] += overflow
+        cov["refetch_after_eviction"] += refetch
+        self.transition = dict(cache_hits=hits, cache_misses=misses,
+                               evicted=evicted, refetched=refetch)
+
+    def deferred_dequant(self, values, scales, out) -> None:
+        real, lookup = DEQUANT, self.lookup
+        staging = self.kinds[values.untyped_storage().data_ptr()].split(":")[0]
+
+        def dequant():
+            self.read(staging, "dev_values", lookup)
+            real(values, scales, out)
+
+        self.queue.enqueue(dequant, "dequant", lookup)
 
     # -- host side --------------------------------------------------------
-
-    def fetch(self, ids, values, scales) -> None:
-        rec, emb = self.rec, self.emb
-        rec.expect(self.ids_writer == self.lookup, "staging_reuse_ordered", rank=self.rank,
-                   lookup=self.lookup, ids_staging_holds=self.ids_writer)
-        self.host_writer = self.lookup
-        cache = emb.store.cache
-        tags_before = set(cache._tags[cache._tags >= 0].tolist())
-        self.real_fetch(ids, values, scales)
-        tags_after = set(cache._tags[cache._tags >= 0].tolist())
-        lo = emb.store.owner_lo
-        unique = set((ids - lo).tolist())
-        misses = len(unique - tags_before)
-        evicted = tags_before - tags_after
-        refetch = len(unique & self.evicted_ids)
-        self.evicted_ids = (self.evicted_ids | evicted) - tags_after
-        self.refetched[self.lookup] = refetch
-        for s, w in zip(*np.nonzero(cache._tags >= 0)):
-            tag = int(cache._tags[s, w])
-            rec.expect(
-                np.array_equal(cache._data[s * cache.ways + w], self.values[lo + tag]),
-                "cache_entries_match_table", rank=self.rank, lookup=self.lookup, row=lo + tag,
-            )
-        cov = rec.coverage
-        cov["evictions"] += len(evicted)
-        cov["set_conflicts"] += misses - len(tags_after - tags_before)
-        cov["refetch_after_eviction"] += refetch
-        self.fetch_transition = dict(cache_misses=misses, evicted=len(evicted),
-                                     refetched=refetch)
 
     def expected_rows(self, cols: np.ndarray) -> torch.Tensor:
         lo, hi = self.emb.vocab_start_idx, self.emb.vocab_end_idx
@@ -1309,46 +1392,67 @@ class EngramRank:
     def run(self) -> None:
         rec, emb, q = self.rec, self.emb, self.queue
         mode = DeviceMode(q, self.kinds, self)
+        cols_of: dict = {}
         for lookup in range(ENGRAM_LOOKUPS):
             q.progress()
             self.lookup = lookup
-            n = self.rng.randint(1, ENGRAM_MAX_TOKENS)
+            captured = self.rng.random() < 0.4
+            if captured:
+                n = self.rng.choice(ENGRAM_GRAPH_SIZES)
+            else:
+                n = self.rng.randint(1, ENGRAM_MAX_TOKENS)
+            staging = "eager"
+            if captured:
+                fixed = emb._graph_staging[n * emb.part_n_hash_cols][0]
+                staging = f"f{fixed.index}"
+            # The device ordering, not a host wait, protects a staging that
+            # an earlier lookup's queued work still uses.
+            rec.coverage["staging_waits"] += any(
+                kind != "consume" and lk < lookup and self.staged_by.get(lk) == staging
+                for _, kind, lk in q.ops
+            )
             idx = self.ids(n)
             cols = idx[:, emb.head_start : emb.head_start + emb.part_n_hash_cols].numpy()
+            cols_of[lookup] = cols
             self.expected[lookup] = self.expected_rows(cols)
             pending = len(q.ops)
             out = self.out[:n]
             with mock.patch.object(torch.cuda, "current_stream", lambda: QueueStream()), \
-                    mock.patch.object(torch.cuda, "is_current_stream_capturing", lambda: False), \
+                    mock.patch.object(torch.cuda, "is_current_stream_capturing",
+                                      lambda c=captured: c), \
                     mock.patch.object(sm80_engram_dequant, "dequant_engram_rows",
                                       self.deferred_dequant), mode:
                 emb.lookup(idx, out)
+            self.staged_by[lookup] = staging
             q.enqueue(lambda lk=lookup, o=out: self.results.__setitem__(lk, o.clone()),
                       "consume", lookup)
             rec.coverage["lookups"] += 1
+            rec.coverage["captured_lookups"] += captured
             rec.event(
                 {"op": "lookup", "rank": self.rank, "lookup": lookup, "tokens": n,
-                 "unique_rows": len(np.unique(cols))},
-                {**self.fetch_transition, "device_ops_pending_before": pending,
-                 "device_ops_pending_after": len(q.ops)},
+                 "staging": staging, "unique_rows": len(np.unique(cols))},
+                {"device_ops_pending_before": pending, "device_ops_pending_after": len(q.ops)},
             )
         q.drain()
         emb.close()
-        # A lookup of rows the cache had evicted returns the table's rows.
         for lookup, want in self.expected.items():
+            got = self.results.get(lookup)
+            if got is None:
+                rec.fail("no_stale_row_after_eviction", rank=self.rank, lookup=lookup,
+                         consumed=False)
+                continue
+            same = (got.view(torch.int16) == want.view(torch.int16)).all(-1).numpy()
+            # Rows served from the row cache are the table's rows.
+            hit = np.isin(cols_of[lookup], list(self.hit_rows.get(lookup, ())))
+            rec.expect(bool(same[hit].all()), "cache_entries_match_table",
+                       rank=self.rank, lookup=lookup, rows=int(hit.sum()))
+            # A lookup of rows the cache had evicted returns the table's rows.
             if self.refetched.get(lookup):
-                got = self.results.get(lookup)
-                ok = got is not None and torch.equal(got.view(torch.int16),
-                                                     want.view(torch.int16))
-                rec.expect(ok, "no_stale_row_after_eviction", rank=self.rank, lookup=lookup)
+                rec.expect(bool(same.all()), "no_stale_row_after_eviction",
+                           rank=self.rank, lookup=lookup)
         rec.event({"op": "drain", "rank": self.rank},
-                  {"lookups_consumed": len(self.results), "device_ops_left": len(q.ops)})
-
-    def deferred_dequant(self, values, scales, out) -> None:
-        real = DEQUANT
-        lookup = self.lookup
-        self.queue.enqueue(lambda: real(values, scales, out), "dequant", lookup)
-
+                  {"lookups_consumed": len(self.results), "device_ops_left": len(q.ops),
+                   **self.transition})
 
 DEQUANT = sm80_engram_dequant.dequant_engram_rows
 

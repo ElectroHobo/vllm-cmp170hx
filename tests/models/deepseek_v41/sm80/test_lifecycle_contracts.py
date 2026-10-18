@@ -79,13 +79,34 @@ MUTATIONS = {
         ),
         {"compressed_reads_owned"},
     ),
-    # The host reads the id staging before the device has copied the ids.
-    "ids_read_unguarded": (
+    # The host fetch is queued before the copy of the ids to the host: it
+    # fetches the previous lookup's ids.
+    "ids_copied_after_fetch": (
         "engram_staging",
         (
             "vllm.models.deepseek_v41.nvidia.sm80_engram",
-            "        self._staged.synchronize()\n        self._ids_ready.synchronize()",
-            "        self._staged.synchronize()",
+            "        store.ids[:count].copy_(self._dev_ids[:count], non_blocking=True)\n"
+            "        store.enqueue(count)\n",
+            "        store.enqueue(count)\n"
+            "        store.ids[:count].copy_(self._dev_ids[:count], non_blocking=True)\n",
+        ),
+        {"staging_reuse_ordered"},
+    ),
+    # The rows are copied to the device before the host fetch fills them.
+    "rows_copied_before_fetch": (
+        "engram_staging",
+        (
+            "vllm.models.deepseek_v41.nvidia.sm80_engram",
+            "        store.enqueue(count)\n"
+            "        dev_values = self._dev_values[:count]\n"
+            "        dev_scales = self._dev_scales[:count]\n"
+            "        dev_values.copy_(store.values[:count], non_blocking=True)\n"
+            "        dev_scales.copy_(store.scales_out[:count], non_blocking=True)\n",
+            "        dev_values = self._dev_values[:count]\n"
+            "        dev_scales = self._dev_scales[:count]\n"
+            "        dev_values.copy_(store.values[:count], non_blocking=True)\n"
+            "        dev_scales.copy_(store.scales_out[:count], non_blocking=True)\n"
+            "        store.enqueue(count)\n",
         ),
         {"staging_reuse_ordered"},
     ),
