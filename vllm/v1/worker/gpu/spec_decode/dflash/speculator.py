@@ -11,6 +11,7 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.sm80.spec_decode.zero_draft import draft_context_only
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -533,6 +534,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+        if draft_context_only(self, num_speculative_tokens, num_target_tokens):
+            return self.draft_tokens[:num_reqs]
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(
