@@ -5,23 +5,35 @@
 
 An export (EXL3 or any safetensors re-encode) may store unquantised tensors at
 a dtype that cannot hold every source value (an FP32 router bias as FP16, a
-BF16 gate as FP16). This tool copies those tensors' bytes from the pinned
-source checkpoint into one safetensors sidecar and writes a manifest beside
-it; the loader (VLLM_EXL3_OVERRIDE, pinned by VLLM_EXL3_OVERRIDE_SHA256)
-verifies the manifest and every tensor's sha256 and loads the source bytes in
-place of the export's.
+BF16 gate as FP16). This tool compares every plain export tensor with the
+pinned source checkpoint and classifies it:
+
+    EXACT       the export holds the source values exactly
+                (export cast to the source dtype equals the source bitwise);
+    RESTORABLE  the export is the source cast to the export dtype, bitwise,
+                and that cast lost values: a precision-only difference;
+    DIFFERENT   neither (changed values, or another shape): reported with
+                its largest absolute difference, never restored;
+    UNMAPPED    no source tensor of that name: reported, never restored.
+
+The RESTORABLE tensors' source bytes go into one safetensors sidecar, and a
+manifest beside it records, per tensor, the source shard and dtype, the
+export dtype, the cast check and the sha256 of the bytes. A report lists every
+classified tensor. The loader (VLLM_EXL3_OVERRIDE, pinned by
+VLLM_EXL3_OVERRIDE_SHA256) verifies the manifest, the hashes and the cast
+check again, and loads the source bytes in place of the export's.
 
     python tools/sm80/build_override_sidecar.py \\
         --repo ORG/NAME --revision COMMIT --export EXPORT_DIR --out OUT_DIR \\
-        (--rule lossy-dtype | --names NAMES_FILE) [--source-dir LOCAL_SOURCE]
+        [--names NAMES_FILE] [--map MAP_JSON] [--source-dir LOCAL_SOURCE]
 
---rule lossy-dtype selects every unquantised tensor present under the same
-name and shape in both checkpoints whose export dtype differs from the source
-dtype and does not represent every source value. --names takes one tensor name
-per line instead. The source is read from the repository's resolve URL at the
-pinned revision with HTTP Range requests (only headers and selected tensors),
-or from --source-dir, a local copy of that revision. Only the standard
-library is used.
+--names restricts the classification to the listed export tensors (one per
+line); by default every plain export tensor is classified. --map is a JSON
+object of export tensor name -> source tensor name for exports that rename
+tensors; unlisted names map to themselves. The source is read from the
+repository's resolve URL at the pinned revision with HTTP Range requests
+(only headers and the compared tensors), or from --source-dir, a local copy of
+that revision.
 """
 
 from __future__ import annotations
@@ -34,34 +46,43 @@ import sys
 import urllib.request
 from pathlib import Path
 
-FORMAT = "override-sidecar/1"
+import torch
+
+FORMAT = "override-sidecar/2"
+REPORT_FORMAT = "override-report/1"
 SIDECAR = "override.safetensors"
 MANIFEST = "override.json"
-DTYPE_BYTES = {
-    "BOOL": 1,
-    "U8": 1,
-    "I8": 1,
-    "F8_E4M3": 1,
-    "F8_E5M2": 1,
-    "F8_E8M0": 1,
-    "I16": 2,
-    "F16": 2,
-    "BF16": 2,
-    "I32": 4,
-    "F32": 4,
-    "I64": 8,
-    "F64": 8,
-}
-# (source, export) dtype pairs whose export holds every source value exactly.
-EXACT = {
-    ("F16", "F32"),
-    ("BF16", "F32"),
-    ("F16", "F64"),
-    ("BF16", "F64"),
-    ("F32", "F64"),
+REPORT = "override-report.json"
+CLASSES = ("EXACT", "RESTORABLE", "DIFFERENT", "UNMAPPED")
+DTYPES = {
+    "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "I16": torch.int16,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I32": torch.int32,
+    "F32": torch.float32,
+    "I64": torch.int64,
+    "F64": torch.float64,
 }
 # Quantised-tensor parts: never plain tensors.
 PACKED_SUFFIXES = (".trellis", ".suh", ".svh", ".mcg", ".mul1")
+
+
+def as_tensor(dtype: str, shape: list[int], data: bytes) -> torch.Tensor:
+    if not data:
+        return torch.empty(shape, dtype=DTYPES[dtype])
+    return torch.frombuffer(bytearray(data), dtype=DTYPES[dtype]).reshape(shape)
+
+
+def same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.dtype == b.dtype and torch.equal(
+        a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+    )
 
 
 class Source:
@@ -114,66 +135,67 @@ class Source:
         header, start = self.header(filename)
         entry = header[name]
         begin, end = entry["data_offsets"]
-        data = self.read(filename, start + begin, start + end)
-        size = DTYPE_BYTES[entry["dtype"]]
-        for dim in entry["shape"]:
-            size *= dim
-        if len(data) != size:
-            raise ValueError(f"{name}: extent does not match dtype and shape")
+        return entry, self.read(filename, start + begin, start + end)
+
+
+class Export:
+    """Every tensor of a local safetensors checkpoint."""
+
+    def __init__(self, directory: Path):
+        self.tensors: dict[str, tuple[Path, dict, int]] = {}
+        for path in sorted(directory.glob("*.safetensors")):
+            with path.open("rb") as file:
+                length = struct.unpack("<Q", file.read(8))[0]
+                header = json.loads(file.read(length))
+            for name, entry in header.items():
+                if name == "__metadata__":
+                    continue
+                if name in self.tensors:
+                    raise ValueError(f"Duplicate export tensor: {name}")
+                self.tensors[name] = (path, entry, 8 + length)
+        if not self.tensors:
+            raise ValueError(f"No safetensors files in {directory}")
+
+    def plain(self) -> list[str]:
+        return sorted(n for n in self.tensors if not n.endswith(PACKED_SUFFIXES))
+
+    def tensor(self, name: str) -> tuple[dict, bytes]:
+        path, entry, start = self.tensors[name]
+        begin, end = entry["data_offsets"]
+        with path.open("rb") as file:
+            file.seek(start + begin)
+            data = file.read(end - begin)
+        if len(data) != end - begin:
+            raise ValueError(f"{name}: short read")
         return entry, data
 
 
-def export_headers(directory: Path) -> dict[str, tuple[str, dict]]:
-    """Every tensor of a local safetensors checkpoint: name -> (file, entry)."""
-    tensors = {}
-    for path in sorted(directory.glob("*.safetensors")):
-        with path.open("rb") as file:
-            length = struct.unpack("<Q", file.read(8))[0]
-            header = json.loads(file.read(length))
-        for name, entry in header.items():
-            if name == "__metadata__":
-                continue
-            if name in tensors:
-                raise ValueError(f"Duplicate export tensor: {name}")
-            tensors[name] = (path.name, entry)
-    if not tensors:
-        raise ValueError(f"No safetensors files in {directory}")
-    return tensors
-
-
-def select(
-    rule: str | None,
-    names: list[str] | None,
-    source_map: dict[str, str],
-    export: dict[str, tuple[str, dict]],
-    source: Source,
-) -> list[str]:
-    if names is not None:
-        for name in names:
-            if name not in source_map or name not in export:
-                raise ValueError(f"{name}: not in both checkpoints")
-            if name.endswith(PACKED_SUFFIXES):
-                raise ValueError(f"{name}: a quantised part, not a plain tensor")
-        return sorted(set(names))
-    if rule != "lossy-dtype":
-        raise ValueError(f"Unknown rule: {rule}")
-    chosen = []
-    for name in sorted(source_map.keys() & export.keys()):
-        if name.endswith(PACKED_SUFFIXES):
-            continue
-        entry = source.header(source_map[name])[0][name]
-        exported = export[name][1]
-        if entry["dtype"] == exported["dtype"]:
-            continue
-        if (entry["dtype"], exported["dtype"]) in EXACT:
-            continue
-        if entry["shape"] != exported["shape"]:
-            raise ValueError(
-                f"{name}: lossy dtype {entry['dtype']} -> {exported['dtype']} "
-                f"with a different shape {entry['shape']} -> {exported['shape']}"
-            )
-        chosen.append(name)
-    return chosen
+def classify(official: torch.Tensor, exported: torch.Tensor) -> dict:
+    """The class of one export tensor against its source tensor."""
+    row = {"numel": exported.numel()}
+    if list(official.shape) != list(exported.shape):
+        row.update(cls="DIFFERENT", reason="shape", source_shape=list(official.shape))
+        return row
+    if same_bits(exported.to(official.dtype), official):
+        row["cls"] = "EXACT"
+        return row
+    cast = official.to(exported.dtype)
+    if same_bits(cast, exported):
+        row["cls"] = "RESTORABLE"
+        row["cast_check"] = {
+            "export_dtype": None,
+            "equal": True,
+            "compared_elems": exported.numel(),
+        }
+        return row
+    diff = (exported.double() - official.double()).abs()
+    row.update(
+        cls="DIFFERENT",
+        reason="values",
+        n_diff=int((cast.view(torch.uint8) != exported.view(torch.uint8)).sum()),
+        max_abs=float(diff.nan_to_num(nan=float("inf")).max()) if diff.numel() else 0.0,
+    )
+    return row
 
 
 def write_safetensors(path: Path, tensors: dict[str, tuple[dict, bytes]], meta) -> None:
@@ -205,40 +227,81 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build(args: argparse.Namespace) -> dict:
+def build(args: argparse.Namespace) -> tuple[dict, dict]:
     source = Source(args.repo, args.revision, args.source_dir)
     source_map = source.index()
-    export = export_headers(args.export)
-    names = None
+    export = Export(args.export)
+    mapping = json.loads(args.map.read_text()) if args.map is not None else {}
+    names = export.plain()
     if args.names is not None:
-        names = [
-            line.strip()
-            for line in args.names.read_text().splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-    chosen = select(args.rule, names, source_map, export, source)
-    if not chosen:
-        raise ValueError("No tensor selected")
-    tensors = {}
-    records = []
-    for name in chosen:
-        entry, data = source.tensor(source_map[name], name)
-        exported = export[name][1]
-        if entry["shape"] != exported["shape"]:
-            raise ValueError(f"{name}: source and export shapes differ")
+        listed = sorted(
+            {
+                line.strip()
+                for line in args.names.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            }
+        )
+        unknown = [n for n in listed if n not in names]
+        if unknown:
+            raise ValueError(f"Not plain export tensors: {unknown[:8]}")
+        names = listed
+    rows, tensors, records = [], {}, []
+    for name in names:
+        source_name = mapping.get(name, name)
+        exported_entry, exported_data = export.tensor(name)
+        row = {
+            "name": name,
+            "source_name": source_name,
+            "export_dtype": exported_entry["dtype"],
+            "shape": exported_entry["shape"],
+        }
+        if source_name not in source_map:
+            row.update(cls="UNMAPPED", numel=None)
+            rows.append(row)
+            continue
+        shard = source_map[source_name]
+        entry, data = source.tensor(shard, source_name)
+        row.update(source_shard=shard, source_dtype=entry["dtype"])
+        row.update(
+            classify(
+                as_tensor(entry["dtype"], entry["shape"], data),
+                as_tensor(
+                    exported_entry["dtype"], exported_entry["shape"], exported_data
+                ),
+            )
+        )
+        rows.append(row)
+        if row["cls"] != "RESTORABLE":
+            continue
+        row["cast_check"]["export_dtype"] = exported_entry["dtype"]
+        sha256 = hashlib.sha256(data).hexdigest()
         tensors[name] = (entry, data)
         records.append(
             {
                 "name": name,
+                "source_name": source_name,
                 "shape": entry["shape"],
-                "source_shard": source_map[name],
+                "source_shard": shard,
                 "source_dtype": entry["dtype"],
-                "export_shard": export[name][0],
-                "export_dtype": exported["dtype"],
-                "sha256": hashlib.sha256(data).hexdigest(),
+                "export_shard": export.tensors[name][0].name,
+                "export_dtype": exported_entry["dtype"],
+                "cast_check": row["cast_check"],
+                "sha256": sha256,
             }
         )
+        row["sha256"] = sha256
+    counts = {cls: sum(r["cls"] == cls for r in rows) for cls in CLASSES}
     args.out.mkdir(parents=True, exist_ok=True)
+    report = {
+        "format": REPORT_FORMAT,
+        "source": {"repo": args.repo, "revision": args.revision},
+        "export": args.export.name,
+        "counts": counts,
+        "tensors": rows,
+    }
+    (args.out / REPORT).write_text(json.dumps(report, indent=1) + "\n")
+    if not records:
+        raise ValueError(f"No RESTORABLE tensor; report in {args.out / REPORT}")
     sidecar = args.out / SIDECAR
     write_safetensors(
         sidecar,
@@ -249,13 +312,14 @@ def build(args: argparse.Namespace) -> dict:
         "format": FORMAT,
         "source": {"repo": args.repo, "revision": args.revision},
         "export": args.export.name,
-        "selection": args.rule or f"names:{args.names.name}",
         "sidecar": SIDECAR,
         "sidecar_sha256": sha256_file(sidecar),
+        "report": REPORT,
+        "report_sha256": sha256_file(args.out / REPORT),
         "tensors": records,
     }
     (args.out / MANIFEST).write_text(json.dumps(manifest, indent=1) + "\n")
-    return manifest
+    return manifest, report
 
 
 def main(argv=None) -> int:
@@ -264,21 +328,26 @@ def main(argv=None) -> int:
     parser.add_argument("--revision", required=True, help="source commit")
     parser.add_argument("--export", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    how = parser.add_mutually_exclusive_group(required=True)
-    how.add_argument("--rule", choices=["lossy-dtype"])
-    how.add_argument("--names", type=Path, help="file with one tensor name per line")
+    parser.add_argument("--names", type=Path, help="export tensors to classify")
+    parser.add_argument("--map", type=Path, help="JSON export name -> source name")
     parser.add_argument(
         "--source-dir", type=Path, help="local copy of the source at --revision"
     )
     args = parser.parse_args(argv)
-    manifest = build(args)
-    for record in manifest["tensors"]:
+    manifest, report = build(args)
+    for row in report["tensors"]:
+        if row["cls"] == "EXACT":
+            continue
+        detail = row.get("sha256") or row.get("reason") or ""
+        if row.get("max_abs") is not None:
+            detail += f" max_abs={row['max_abs']:.6g} n_diff={row['n_diff']}"
         print(
-            f"{record['name']}\t{record['source_dtype']} (export "
-            f"{record['export_dtype']})\t{record['sha256']}"
+            f"{row['cls']}\t{row['name']}\t{row.get('source_dtype')} -> "
+            f"{row['export_dtype']}\t{detail}"
         )
-    print(f"{len(manifest['tensors'])} tensors")
+    print(" ".join(f"{cls}={n}" for cls, n in report["counts"].items()))
     print(f"{SIDECAR} sha256 {manifest['sidecar_sha256']}")
+    print(f"{REPORT} sha256 {manifest['report_sha256']}")
     print(f"{MANIFEST} sha256 {sha256_file(args.out / MANIFEST)}")
     return 0
 
