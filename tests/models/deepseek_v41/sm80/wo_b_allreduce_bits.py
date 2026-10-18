@@ -14,9 +14,10 @@ the wo_b output shape ``[rows, 5120]``, this compares
 * ``fp32``: ``all_reduce(partial.float()).bfloat16()`` (today's path);
 * ``exact``: the FP64 sum of the four gathered partials rounded to BF16;
 
-* ``switched``: ``wo_b_all_reduce(partial, True)``, the layer's own path
-  with VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE on (BF16 only where the custom
-  all-reduce takes the message);
+* ``switched``: ``wo_b_all_reduce(partial, switch)``, the layer's own call
+  with ``switch`` = VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE as the process
+  environment sets it (on: BF16 only where the custom all-reduce takes the
+  message); the JSON records the switch;
 
 reports which backend each message takes, bitwise equality, mismatch counts
 and the largest BF16-ulp distance, and the median time of each all-reduce.
@@ -25,7 +26,8 @@ Rank 0 prints a table and writes JSON to ``--out``. The exit code is 0 when
 every case ran; the verdict line says whether ``bf16`` equals ``fp32``.
 
 Not a pytest module: it needs four peer-connected sm_80 GPUs, one process
-each, under the served all-reduce switches. It loads the plugins and puts the
+each, under the served all-reduce switches (test_wo_b_allreduce_bits_gpu.py
+runs it and judges its JSON). It loads the plugins and puts the
 interpreter's ``bin`` on PATH as the engine has them, and exits 2 without
 measuring when the communicator is not the served one (with
 VLLM_CUSTOM_ALLREDUCE_FLAGS=1: the flags-in-data kernel must be up)::
@@ -147,6 +149,9 @@ def main() -> None:
     )
 
     _engine_like_setup()
+    import vllm.envs as envs
+
+    switch = bool(envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE)
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -185,7 +190,7 @@ def main() -> None:
 
             bf16 = tensor_model_parallel_all_reduce(partial.clone())
             fp32 = tensor_model_parallel_all_reduce(partial.float()).to(torch.bfloat16)
-            switched = wo_b_all_reduce(partial.clone(), True)
+            switched = wo_b_all_reduce(partial.clone(), switch)
             gathered = [torch.empty_like(partial) for _ in range(world)]
             dist.all_gather(gathered, partial)
             exact = torch.stack(gathered).double().sum(0).to(torch.bfloat16)
@@ -195,7 +200,7 @@ def main() -> None:
                 "seed": seed,
                 "backend_bf16": _backend(comm, partial),
                 "backend_fp32": _backend(comm, partial.float()),
-                "switched_bf16": custom_all_reduce_takes(partial),
+                "switched_bf16": switch and custom_all_reduce_takes(partial),
                 "switched_eq_fp32": bool(torch.equal(switched, fp32)),
                 "bf16_eq_fp32": bool(torch.equal(bf16, fp32)),
                 "bf16_ne_fp32": int((bf16.view(torch.int16) != fp32.view(torch.int16)).sum()),
@@ -258,6 +263,7 @@ def main() -> None:
             json.dump(
                 {
                     "verdict": verdict,
+                    "switch": switch,
                     "equal": equal,
                     "switched_equal": switched_ok,
                     "cases": results,
