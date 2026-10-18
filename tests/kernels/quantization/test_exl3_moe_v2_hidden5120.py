@@ -19,8 +19,9 @@ GPU (SM 8.0), each at bits_x2 6 and 4:
 - synthetic experts (random trellis; one of the four weight sets has trellis
   bases that are only 2-byte aligned): moe_out_v2 holds moe_out's error
   against an FP64 reference (test_exl3_moe_v2._Fp64Pool: pooled mean <= 1.10x,
-  max <= 1.25x, BF16 rounding ties forgiven, exact where moe_out is exact)
-  over 1..64 rows and awkward routings, with the clamp reached; rows without
+  max <= 1.25x with no element excused, exact where moe_out is exact; the
+  ratios are printed and recorded as junit properties) over 1..64 rows and
+  awkward routings, with the clamp reached; rows without
   local routes are exact zero; calls repeat bitwise; a row's output is the
   same bits in a call of any size up to 64 rows (one K-slice layout); a
   captured call replays bitwise like the eager one without allocator
@@ -416,12 +417,14 @@ def _pool_rule(experts, cases, name):
 
 
 @needs_sm80
-def test_v2_meets_the_fp64_gate_of_moe_out(synthetic):
+def test_v2_meets_the_fp64_gate_of_moe_out(synthetic, record_property):
     cases = [
         _case(scenario, rows, 200 + index, scale)
         for index, (scenario, rows, scale) in enumerate(SCENARIOS)
     ]
     mean, worst = _pool_rule(synthetic, cases, f"bits_x2={synthetic.bits_x2}").check()
+    record_property("mean_ratio", mean)
+    record_property("max_ratio", worst)
     print(
         f"synthetic bits_x2={synthetic.bits_x2}: mean x{mean:.3f} "
         f"max x{worst:.3f} of moe_out"
@@ -567,7 +570,7 @@ def _real_layer(layer, bits_x2):
 
 @needs_sm80
 @pytest.mark.parametrize("layer", sorted(REAL_LAYERS))
-def test_v2_holds_moe_outs_error_on_real_layer_weights(layer):
+def test_v2_holds_moe_outs_error_on_real_layer_weights(layer, record_property):
     experts, norm_weight = _real_layer(layer, REAL_LAYERS[layer])
     cases = []
     for rows in REAL_ROWS:
@@ -578,6 +581,8 @@ def test_v2_holds_moe_outs_error_on_real_layer_weights(layer):
         x = (h.cuda().float() * norm_weight).to(torch.bfloat16)
         cases.append((x, ids.cuda(), weights.cuda()))
     mean, worst = _pool_rule(experts, cases, f"layer {layer}").check()
+    record_property("mean_ratio", mean)
+    record_property("max_ratio", worst)
     print(
         f"layer {layer} bits_x2={experts.bits_x2} rows {REAL_ROWS}: "
         f"mean x{mean:.3f} max x{worst:.3f} of moe_out"

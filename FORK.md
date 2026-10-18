@@ -21,7 +21,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | Path | Lines |
 |---|---:|
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_act_quant.py` | 259 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 830 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 786 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_engram_dequant.py` | 112 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 209 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
@@ -30,7 +30,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **10 files** | **4,878** |
+| **10 files** | **4,834** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -271,8 +271,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_prefill.py` | 534 |
 | `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
 | `tests/kernels/quantization/test_exl3_moe_swiglu_clamp.py` | 83 |
-| `tests/kernels/quantization/test_exl3_moe_v2.py` | 634 |
-| `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 585 |
+| `tests/kernels/quantization/test_exl3_moe_v2.py` | 614 |
+| `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 590 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 85 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
@@ -322,14 +322,14 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/exl3_fixture.py` | 284 |
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
 | `tests/models/deepseek_v41/sm80/fixtures/exl3_headers.json` | 25,297 |
-| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 688 |
+| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 614 |
 | `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,511 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
 | `tests/models/deepseek_v41/sm80/test_boot_warmup.py` | 289 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,121 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
-| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 525 |
+| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 322 |
 | `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 240 |
 | `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 126 |
 | `tests/models/deepseek_v41/sm80/test_no_host_sync.py` | 117 |
@@ -411,7 +411,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **165 files** | **83,488** |
+| **165 files** | **83,196** |
 
 #### `tools/`
 
@@ -645,7 +645,7 @@ Functions, methods and classes in fork-added product files whose name occurs now
 
 | Path | Line | Name | Lines | Used by tests |
 |---|---:|---|---:|---|
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 814 | `forward_layer` | 17 | yes |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 770 | `forward_layer` | 17 | yes |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 256 | `engram_telemetry` | 4 | yes |
 | **2 definitions** | | | **21** | |
 
@@ -656,11 +656,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 144 |
-| Fork-added product lines | 44,656 |
+| Fork-added product lines | 44,612 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 48,211 |
+| Product lines added (new files and patches) | 48,167 |
 | Fork environment variables (flags) | 91 |
 | Unreferenced fork definitions | 2 (21 lines) |
