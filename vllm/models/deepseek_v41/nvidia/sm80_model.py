@@ -17,8 +17,9 @@ What changes on sm_80:
   the TileLang/DeepGEMM kernels: the decoder layers' forward, the backbone's
   final post and the DSpark drafter's forward call them. With
   ``VLLM_DSV41_FUSED_MHC`` the decoder layers' delayed pre and fused post +
-  pre run as two kernels per call instead (``ops/sm80_mhc_fused.py``, same
-  contracts and rounding points; :func:`mhc_ops`);
+  pre run through the sm_80 mHC kernel A instead, with the finish in torch or,
+  with ``VLLM_DSV41_FUSED_MHC_FINISH``, as a second kernel
+  (``ops/sm80_mhc_fused.py``, same contracts and rounding points; :func:`mhc_ops`);
 - each MoE keeps the upstream modules and EXL3 experts, with an FP32 gate and
   the reference routing (``sm80_moe.adopt_moe``);
 - the drafter holds no embedding or LM head of its own (the DSpark loader
@@ -69,8 +70,10 @@ def mhc_ops(config):
     if reason is not None:
         raise ValueError(f"VLLM_DSV41_FUSED_MHC: {reason}")
     logger.info_once(
-        "DeepSeek-V4.1 sm_80: the decoder layers' delayed mHC runs as two "
-        "kernels per call (VLLM_DSV41_FUSED_MHC=1)",
+        "DeepSeek-V4.1 sm_80: the decoder layers' delayed mHC runs through the "
+        "sm_80 mHC kernel A (VLLM_DSV41_FUSED_MHC=1), finish %s",
+        "kernel (VLLM_DSV41_FUSED_MHC_FINISH=1)" if sm80_mhc_fused.FINISH_KERNEL
+        else "in torch",
         scope="global",
     )
     return sm80_mhc_fused

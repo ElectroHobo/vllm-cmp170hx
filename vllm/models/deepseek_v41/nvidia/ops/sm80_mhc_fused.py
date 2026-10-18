@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1 delayed mHC on sm_80 in two kernels per call.
+"""DeepSeek-V4.1 delayed mHC on sm_80 with the sm_80 mHC kernel A.
 
 The same contracts, arguments and BF16 rounding points as ``ops/sm80_mhc.py``
 (the reference's FP32 formulas in torch, about 155 kernels per call, 134 of
 them the Sinkhorn loop), selected with ``VLLM_DSV41_FUSED_MHC`` in
-``sm80_model.py``:
+``sm80_model.py``. Kernel A (below) always runs; the finish after it is the
+Triton kernel B with ``VLLM_DSV41_FUSED_MHC_FINISH`` (two kernels per call),
+else the reference's torch formulas on kernel A's partials
+(:func:`_torch_finish`: ``hc_split_sinkhorn``, ``hc_collapse``,
+``rms_norm`` of ``ops/sm80_mhc.py``). The two switches are separate so that
+kernel B, a new kernel, is judged on its own. Ops:
 
 - ``mhc_fused_post_pre_delayed``: the previous sublayer's post, then the
   delayed pre of the new streams;
@@ -54,6 +59,8 @@ import os
 import torch
 from triton.language.extra import libdevice
 
+import vllm.envs as envs
+from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
 from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
 from vllm.sm80.kernels.mhc.decode import HB_GLU, post_prenorm
 from vllm.triton_utils import tl, triton
@@ -62,6 +69,9 @@ __all__ = ["mhc_fused_post_pre_delayed", "mhc_post", "mhc_pre_delayed", "support
 
 HC = 4
 NOUT = (2 + HC) * HC
+# Kernel B for the finish (VLLM_DSV41_FUSED_MHC_FINISH), read once per
+# process; the tests set it directly.
+FINISH_KERNEL = bool(envs.VLLM_DSV41_FUSED_MHC_FINISH)
 # Hidden chunk of the collapse CTA (two passes over the streams: the norm's
 # statistic, then the scaled output).
 _BH = 1024
@@ -216,6 +226,36 @@ def _delayed_finish_kernel(
             tl.store(li_row + h, _bf16(ob).to(tl.bfloat16), mask=hm)
 
 
+def _torch_finish(
+    mix: torch.Tensor,
+    sqr: torch.Tensor,
+    streams: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+):
+    """The finish in the reference's torch formulas on kernel A's partials:
+    the projection and the squared sum reduced over the hidden slices, then
+    ``Block.hc_mixes``' scaling and ``hc_split_sinkhorn``, the collapse with
+    the carried pre-mix and the RMSNorm (``ops/sm80_mhc.py``)."""
+    T, hc, hidden = streams.shape
+    rsqrt = torch.rsqrt(sqr.sum(dim=0) / (hc * hidden) + rms_eps)
+    mixes = mix.sum(dim=0) * rsqrt.unsqueeze(-1)
+    pre, post, comb = sm80_mhc.hc_split_sinkhorn(
+        mixes, hc_scale, hc_base, hc, sinkhorn_repeat, hc_eps, hc_post_mult_value
+    )
+    layer_input = sm80_mhc.hc_collapse(streams, pre_mix)
+    if norm_weight is not None:
+        layer_input = sm80_mhc.rms_norm(layer_input, norm_weight, norm_eps)
+    return post.unsqueeze(-1), comb, layer_input, pre
+
+
 def _delayed(
     x: torch.Tensor | None,
     residual: torch.Tensor,
@@ -284,6 +324,24 @@ def _delayed(
             round_mix=True,
         )
         streams = rc
+    if not FINISH_KERNEL:
+        return (
+            streams,
+            *_torch_finish(
+                mix,
+                sqr,
+                rc,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                pre_mix,
+                norm_weight,
+                norm_eps,
+            ),
+        )
     if pre_mix is not None:
         assert pre_mix.dtype == torch.float32, pre_mix.dtype
         pre_in = pre_mix.reshape(T, hc).contiguous()

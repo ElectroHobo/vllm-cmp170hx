@@ -10,9 +10,11 @@
   (``fp64_cases.mhc_delayed_fp64``) within the V2 bounds of the torch
   formulas (``ops/sm80_mhc.py``) on the same inputs, at a hidden size that
   is not a multiple of the collapse chunk.
+- The torch finish (kernel A only, ``VLLM_DSV41_FUSED_MHC_FINISH`` off) on
+  the same stand-in, in process, within the same bounds.
 - The FP64 reference against the torch formulas at FP32 accuracy.
 - ``mhc_ops``: the switch picks the module the layers call, refuses shapes
-  the kernels do not serve, and is off by default.
+  the kernels do not serve; both switches are off by default.
 - Every kernel the fused path launches compiles for sm_80 at the model's
   hidden size (no GPU needed).
 
@@ -121,6 +123,7 @@ def interpreted_errors(T: int = 5, hidden: int = 1056, calls: int = 6) -> dict:
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
 
     sm80_mhc_fused.post_prenorm = _stand_in_kernel_a
+    sm80_mhc_fused.FINISH_KERNEL = True
     out = {}
     for seed in range(calls):
         for name, a in variants(T, hidden, seed).items():
@@ -164,6 +167,35 @@ def test_finish_kernel_within_v2_of_the_torch_formulas(interpreted):
         assert cm <= 1.25 * rm, (key, cm, rm)
 
 
+def test_torch_finish_within_v2_of_the_torch_formulas(monkeypatch):
+    """Kernel A (its stand-in) with the torch finish: the reference formulas
+    on the reduced partials instead of one SGEMM."""
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
+
+    monkeypatch.setattr(sm80_mhc_fused, "post_prenorm", _stand_in_kernel_a)
+    monkeypatch.setattr(sm80_mhc_fused, "FINISH_KERNEL", False)
+    pooled = {}
+    for seed in range(6):
+        for name, a in variants(5, 1056, seed).items():
+            got, want = call(sm80_mhc_fused, a), call(sm80_mhc, a)
+            exact = {rp: mhc_delayed_fp64(a, rounding=rp) for rp in (False, True)}
+            for o in got:
+                assert got[o].shape == want[o].shape and got[o].dtype == want[o].dtype
+                for rp in (False, True):
+                    if o == "residual" and rp:
+                        continue
+                    p = pooled.setdefault((name, o, rp), [0.0, 0.0, 0.0, 0.0, 0])
+                    cs, cm, n = abs_errors(got[o], exact[rp][o])
+                    rs, rm, _ = abs_errors(want[o], exact[rp][o])
+                    p[0], p[1], p[2], p[3] = p[0] + cs, max(p[1], cm), p[2] + rs, max(p[3], rm)
+                    p[4] += n
+    assert len(pooled) == 3 * 9 + 2 * 8
+    for key, (cs, cm, rs, rm, n) in pooled.items():
+        assert n > 0, key
+        assert cs / n <= 1.10 * (rs / n), (key, cs / n, rs / n)
+        assert cm <= 1.25 * rm, (key, cm, rm)
+
+
 def test_fp64_reference_is_the_torch_formulas_at_fp32_accuracy():
     for name, a in variants(3, 256).items():
         want = call(sm80_mhc, a)
@@ -184,7 +216,8 @@ def test_mhc_ops_switch(monkeypatch):
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
 
     monkeypatch.delenv("VLLM_DSV41_FUSED_MHC", raising=False)
-    assert envs.VLLM_DSV41_FUSED_MHC is False
+    monkeypatch.delenv("VLLM_DSV41_FUSED_MHC_FINISH", raising=False)
+    assert envs.VLLM_DSV41_FUSED_MHC is False and envs.VLLM_DSV41_FUSED_MHC_FINISH is False
     cfg = SimpleNamespace(hc_mult=4, hidden_size=5120)
     assert sm80_model.mhc_ops(cfg) is sm80_mhc
     monkeypatch.setenv("VLLM_DSV41_FUSED_MHC", "1")

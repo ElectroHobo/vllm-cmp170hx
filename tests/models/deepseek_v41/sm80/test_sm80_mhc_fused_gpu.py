@@ -47,10 +47,13 @@ def _outputs(variant: str) -> list[str]:
     return (["residual"] if variant.startswith("fused") else []) + out
 
 
-@pytest.fixture(scope="module")
-def fused():
+@pytest.fixture(params=[False, True], ids=["finish_torch", "finish_kernel"])
+def fused(request, monkeypatch):
+    """The fused module with its finish in torch (kernel A only) or as kernel
+    B (``VLLM_DSV41_FUSED_MHC_FINISH``)."""
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
 
+    monkeypatch.setattr(sm80_mhc_fused, "FINISH_KERNEL", request.param)
     return sm80_mhc_fused
 
 
@@ -60,7 +63,7 @@ def _cuda(a: dict) -> dict:
 
 @pytest.mark.parametrize("variant", VARIANTS)
 @pytest.mark.parametrize("T", ROWS)
-def test_fp64_within_v2_of_the_torch_formulas(T, variant):
+def test_fp64_within_v2_of_the_torch_formulas(T, variant, fused):
     family = F.mhc_delayed if variant.startswith("fused") else F.mhc_pre_delayed
     calls = [
         {k: v for k, v in variants(T, HIDDEN, seed)[variant].items() if v is not None}
@@ -117,7 +120,7 @@ def _kernels(fn) -> int:
 
 
 @pytest.mark.parametrize("T", (1, 48))
-def test_two_kernels_per_call(T, fused):
+def test_kernels_per_call(T, fused):
     a = _cuda(variants(T, HIDDEN)["fused"])
     common = [a[k] for k in ("fn", "hc_scale", "hc_base", "rms_eps", "hc_pre_eps",
                              "hc_sinkhorn_eps", "hc_post_mult_value", "sinkhorn_repeat")]
@@ -128,6 +131,13 @@ def test_two_kernels_per_call(T, fused):
             a["x"], a["residual"], a["post_layer_mix"], a["comb_res_mix"], *common,
             capture_aux=aux, **kw)
 
-    assert _kernels(post_pre) == 2
-    assert _kernels(lambda: post_pre(aux=True)) == 3
-    assert _kernels(lambda: fused.mhc_pre_delayed(a["residual"], *common, **kw)) == 2
+    if fused.FINISH_KERNEL:
+        assert _kernels(post_pre) == 2
+        assert _kernels(lambda: post_pre(aux=True)) == 3
+        assert _kernels(lambda: fused.mhc_pre_delayed(a["residual"], *common, **kw)) == 2
+    else:
+        # kernel A, then the torch finish: fewer than the torch formulas
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
+
+        full = _kernels(lambda: call(sm80_mhc, a))
+        assert _kernels(post_pre) < full, full

@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
     VLLM_DSV41_FUSED_MHC: bool = False
+    VLLM_DSV41_FUSED_MHC_FINISH: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -795,12 +796,20 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: run the decoder layers' delayed mHC (the fused
-    # post + pre at every sublayer boundary and the pre-only entries) as two
-    # kernels per call (ops/sm80_mhc_fused.py) instead of the reference's FP32
-    # torch formulas (ops/sm80_mhc.py, about 155 kernels per call), with the
-    # reference's BF16 rounding points. Default OFF: unset, the torch formulas
-    # run. Read in vllm/models/deepseek_v41/nvidia/sm80_model.py.
+    # post + pre at every sublayer boundary and the pre-only entries) through
+    # the sm_80 mHC kernel A (ops/sm80_mhc_fused.py: post step, projection and
+    # squared-sum partials) instead of the reference's FP32 torch formulas
+    # (ops/sm80_mhc.py, about 155 kernels per call), with the reference's BF16
+    # rounding points; the finish stays the torch formulas unless
+    # VLLM_DSV41_FUSED_MHC_FINISH. Default OFF: unset, the torch formulas run.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_model.py.
     "VLLM_DSV41_FUSED_MHC": lambda: bool(int(os.getenv("VLLM_DSV41_FUSED_MHC", "0"))),
+    # With VLLM_DSV41_FUSED_MHC: the finish after kernel A (coefficients,
+    # Sinkhorn, collapse, RMSNorm) as one Triton kernel, two kernels per call.
+    # Default OFF. Read in vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
+    "VLLM_DSV41_FUSED_MHC_FINISH": lambda: bool(
+        int(os.getenv("VLLM_DSV41_FUSED_MHC_FINISH", "0"))
+    ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
     "VLLM_EXL3_PLE_COLD": lambda: bool(int(os.getenv("VLLM_EXL3_PLE_COLD", "0"))),
