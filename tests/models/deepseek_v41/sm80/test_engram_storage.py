@@ -715,28 +715,32 @@ def _cut_after_row_2396(files):
 
 
 def test_fixed_staging_matches_the_eager_fetch(tmp_path):
-    """The fixed (graph) fetch gives the eager fetch's bytes and counters,
-    poisons the same rows, reports them through take_fixed, and leaves the
-    eager staging alone."""
+    """The fixed (graph) fetch gives the eager fetch's bytes and counters for
+    any row count up to its capacity, poisons the same rows, publishes them
+    on its CPU counter (take_fixed reads the native record only when it
+    moved), and leaves the eager staging alone."""
     files = _table_2400(tmp_path)
     store = _store(files, 0, 2400, capacity=64)
     other = _store(files, 0, 2400, capacity=64)
+    fresh = _store(files, 0, 2400, capacity=64)
     _cut_after_row_2396(files)
     try:
+        assert store.take_fixed() == 0  # no fixed staging: nothing to take
         fixed = store.add_fixed(48)
-        assert store.fixed == [fixed] and fixed.index == 0
+        assert store.fixed is fixed and fixed.failed_total.item() == 0
         rng = np.random.default_rng(7)
-        for step in range(6):
-            ids = rng.integers(-3, 2396, 48)
+        for step, count in enumerate((48, 1, 17, 48, 30, 6)):
+            ids = rng.integers(-3, 2396, count)
             if step == 3:
                 ids[5] = 2397  # past the cut: a short read
             store.ids.numpy()[:48] = -7
-            fixed.ids.numpy()[:] = ids
-            store.fetcher.run_fixed(fixed.index)
+            fixed.ids.numpy()[:count] = ids
+            store.fetcher.run_fixed(count)
             want_values, want_scales = _fetch(other, ids)
-            np.testing.assert_array_equal(fixed.values.numpy(), want_values)
-            np.testing.assert_array_equal(fixed.scales.numpy(), want_scales)
+            np.testing.assert_array_equal(fixed.values.numpy()[:count], want_values)
+            np.testing.assert_array_equal(fixed.scales.numpy()[:count], want_scales)
             assert (store.ids.numpy()[:48] == -7).all()
+            assert fixed.failed_total.item() == (1 if step >= 3 else 0)
             failed = store.take_fixed()
             assert failed == (1 if step == 3 else 0)
             if step == 3:
@@ -753,13 +757,20 @@ def test_fixed_staging_matches_the_eager_fetch(tmp_path):
             "rows_unique",
         ):
             assert a[name] == b[name], name
-        with pytest.raises(RuntimeError, match="No such Engram fixed staging"):
-            store.fetcher.run_fixed(1)
-        with pytest.raises(RuntimeError, match="exceeds the fetch capacity"):
-            store.add_fixed(65)
+        with pytest.raises(RuntimeError, match="exceeds the fixed staging"):
+            store.fetcher.run_fixed(49)
+        with pytest.raises(RuntimeError, match="already added"):
+            store.add_fixed(8)
     finally:
         store.close()
         other.close()
+    try:
+        with pytest.raises(RuntimeError, match="exceeds the fetch capacity"):
+            fresh.add_fixed(65)
+        with pytest.raises(RuntimeError, match="No Engram fixed staging"):
+            fresh.fetcher.run_fixed(1)
+    finally:
+        fresh.close()
 
 
 class _GraphEmulator:
@@ -772,79 +783,121 @@ class _GraphEmulator:
     def __getattr__(self, name):
         return getattr(self.fetcher, name)
 
-    def enqueue_fixed(self, index, dev_ids, dev_values, dev_scales):
+    def enqueue_fixed(self, count, dev_ids, dev_values, dev_scales):
         self.queued.append(
-            (index, dev_ids.data_ptr(), dev_values.data_ptr(), dev_scales.data_ptr())
+            (count, dev_ids.data_ptr(), dev_values.data_ptr(), dev_scales.data_ptr())
         )
-        fixed = self.store.fixed[index]
-        fixed.ids.copy_(dev_ids)
-        self.fetcher.run_fixed(index)
-        dev_values.copy_(fixed.values)
-        dev_scales.copy_(fixed.scales)
+        fixed = self.store.fixed
+        fixed.ids[:count].copy_(dev_ids[:count])
+        self.fetcher.run_fixed(count)
+        dev_values[:count].copy_(fixed.values[:count])
+        dev_scales[:count].copy_(fixed.scales[:count])
+
+
+def _graph_tables(tables, max_tokens):
+    kwargs = dict(
+        tp_rank=2,
+        tp_size=TP,
+        max_tokens=max_tokens,
+        placement="ssd",
+        cache_bytes=1 << 20,
+    )
+    table = Sm80EngramEmbedding(
+        BIG_ROWS, DIM, BIG_HEADS, tables.big, graph_capture=True, **kwargs
+    )
+    eager = Sm80EngramEmbedding(BIG_ROWS, DIM, BIG_HEADS, tables.big, **kwargs)
+    return table, eager
+
+
+def _check_captured(tables, table, eager, emulator, counts, seeds):
+    for tokens in counts:
+        for seed in seeds:
+            indices = _hash_like_indices(BIG_HEADS, tables.big_written, tokens, seed)
+            got = torch.full((tokens, 2, DIM), float("nan"), dtype=torch.bfloat16)
+            table.lookup(indices, got)
+            want = torch.empty_like(got)
+            eager.lookup(indices, want)
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), tokens
+            ref = _reference_lookup(tables.big, BIG_LAYER, BIG_HEADS, 2, indices)
+            assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), tokens
+            assert emulator.queued[-1][0] == tokens * table.part_n_hash_cols
+    # Every captured lookup queues the one fixed staging.
+    assert len({q[1:] for q in emulator.queued}) == 1
 
 
 def test_captured_lookup_is_the_eager_lookup(tables, monkeypatch):
-    """A lookup inside a capture uses the fixed staging of its size with the
-    same arguments every time, and dequantizes to the eager lookup's bits
-    (the reference), poisoned rows included; other sizes are refused."""
-    sizes = (4, 16, 64)
-    table = Sm80EngramEmbedding(
-        BIG_ROWS,
-        DIM,
-        BIG_HEADS,
-        tables.big,
-        tp_rank=2,
-        tp_size=TP,
-        max_tokens=64,
-        placement="ssd",
-        cache_bytes=1 << 20,
-        graph_sizes=sizes,
-    )
-    eager = Sm80EngramEmbedding(
-        BIG_ROWS,
-        DIM,
-        BIG_HEADS,
-        tables.big,
-        tp_rank=2,
-        tp_size=TP,
-        max_tokens=64,
-        placement="ssd",
-        cache_bytes=1 << 20,
-    )
+    """A lookup inside a capture uses the one fixed staging with the same
+    buffers every time, for any token count, and dequantizes to the eager
+    lookup's bits (the reference)."""
+    table, eager = _graph_tables(tables, 64)
+    emulator = _GraphEmulator(table.store)
+    table.store.fetcher = emulator
     try:
-        assert table.graph_token_counts == list(sizes)
-        assert table.device_bytes() == sum(sizes) * 2 * (8 + DIM + DIM // 32)
-        emulator = _GraphEmulator(table.store)
-        table.store.fetcher = emulator
+        # On CPU only the fixed device staging is counted: one capacity.
+        cap = table.capacity_rows
+        assert table.device_bytes() == cap * (8 + DIM + DIM // 32)
         monkeypatch.setattr(table, "_capturing", lambda: True)
-        for tokens in sizes:
-            queued = None
-            for seed in range(3):
-                indices = _hash_like_indices(
-                    BIG_HEADS, tables.big_written, tokens, seed
-                )
-                got = torch.full((tokens, 2, DIM), float("nan"), dtype=torch.bfloat16)
-                table.lookup(indices, got)
-                want = torch.empty_like(got)
-                eager.lookup(indices, want)
-                assert torch.equal(got.view(torch.int16), want.view(torch.int16))
-                ref = _reference_lookup(tables.big, BIG_LAYER, BIG_HEADS, 2, indices)
-                assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
-                # Every replay of one size queues the same staging.
-                assert queued is None or emulator.queued[-1] == queued
-                queued = emulator.queued[-1]
-        assert len({q[0] for q in emulator.queued}) == len(sizes)
-        with pytest.raises(RuntimeError, match="no fixed staging"):
-            table.lookup(
+        _check_captured(tables, table, eager, emulator, (4, 16, 64, 1, 33), range(3))
+        # The eager staging was never used by the captured lookups.
+        assert table.telemetry()["host_ns"] == 0
+        # A table built without full graphs refuses a captured lookup.
+        monkeypatch.setattr(eager, "_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="without full CUDA graphs"):
+            eager.lookup(
                 torch.zeros(8, 8, dtype=torch.int32),
                 torch.empty(8, 2, DIM, dtype=torch.bfloat16),
             )
-        # The eager staging was never used by the captured lookups.
-        assert table.telemetry()["host_ns"] == 0
     finally:
         table.store.fetcher = emulator.fetcher
         table.close()
         eager.close()
+
+
+def _round_up(x, q):
+    return -(-x // q) * q
+
+
+def test_captured_lookup_covers_spec_decode_graph_counts(tables, monkeypatch):
+    """DSpark (k = 5) with FULL_DECODE_ONLY graphs at capture sizes 6..48:
+    the V2 runner captures uniform-decode graphs of round_up(size, q) tokens
+    for decode query lengths q = 5 and 6 (cudagraph_utils), up to the
+    largest capture size. Every such count, and every capture size, is
+    captured on the fixed staging and equals the eager lookup."""
+    sizes = range(6, 49)
+    counts = set(sizes)
+    for q in (5, 6):
+        counts |= {_round_up(s, q) for s in sizes if _round_up(s, q) <= max(sizes)}
+    counts = sorted(counts)
+    assert not set(counts) <= {1, 2, 4, 8, 16, 24, 32, 40, 48}  # more than sizes
+    table, eager = _graph_tables(tables, max(sizes))
+    emulator = _GraphEmulator(table.store)
+    table.store.fetcher = emulator
+    try:
+        monkeypatch.setattr(table, "_capturing", lambda: True)
+        _check_captured(tables, table, eager, emulator, counts, (0,))
+    finally:
+        table.store.fetcher = emulator.fetcher
+        table.close()
+        eager.close()
+
+
+@pytest.mark.parametrize(
+    "mode, full",
+    [
+        ("FULL_DECODE_ONLY", True),
+        ("FULL", True),
+        ("FULL_AND_PIECEWISE", True),
+        ("PIECEWISE", False),
+        ("NONE", False),
+    ],
+)
+def test_fixed_staging_follows_the_cudagraph_mode(mode, full):
+    """The builder gives a table the fixed staging whenever the cudagraph
+    mode captures full graphs, FULL_DECODE_ONLY included."""
+    from vllm.config import CUDAGraphMode
+
+    assert sm80_engram.captures_full_graphs(getattr(CUDAGraphMode, mode)) is full
+    assert sm80_engram.captures_full_graphs(None) is False
 
 
 def test_captured_lookup_fails_only_its_requests(tmp_path, monkeypatch):
@@ -870,7 +923,7 @@ def test_captured_lookup_fails_only_its_requests(tmp_path, monkeypatch):
             max_tokens=tokens,
             placement="ssd",
             cache_bytes=1 << 20,
-            graph_sizes=(tokens,),
+            graph_capture=True,
         )
         for rank in range(TP)
     ]
@@ -1007,10 +1060,9 @@ def test_gpu_dequant_kernel_bitwise_exhaustive():
 
 @needs_cuda
 def test_gpu_captured_lookup_replays_the_eager_lookup(tables):
-    """Captured with torch.cuda.graph: each replay fetches that replay's ids,
-    byte-equal to the eager lookup; a size without fixed staging is refused
-    at capture."""
-    tokens = 8
+    """Captured with torch.cuda.graph at several token counts on the one fixed
+    staging: each replay fetches that replay's ids, byte-equal to the
+    reference, with graphs of different counts replayed in turn."""
     table = Sm80EngramEmbedding(
         BIG_ROWS,
         DIM,
@@ -1022,31 +1074,29 @@ def test_gpu_captured_lookup_replays_the_eager_lookup(tables):
         placement="ssd",
         cache_bytes=1 << 20,
         device="cuda",
-        graph_sizes=(tokens,),
+        graph_capture=True,
     )
     try:
-        static_ids = torch.full((tokens, 8), -1, dtype=torch.int32, device="cuda")
-        rows = torch.empty(tokens, 2, DIM, dtype=torch.bfloat16, device="cuda")
-        table.lookup(static_ids, rows)  # warm-up compiles the dequant
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            table.lookup(static_ids + 0, rows)
-        for seed in range(4):
-            indices = _hash_like_indices(BIG_HEADS, tables.big_written, tokens, seed)
-            static_ids.copy_(indices.cuda())
-            graph.replay()
+        graphs = {}
+        for tokens in (5, 8, 12):
+            static_ids = torch.full((tokens, 8), -1, dtype=torch.int32, device="cuda")
+            rows = torch.empty(tokens, 2, DIM, dtype=torch.bfloat16, device="cuda")
+            table.lookup(static_ids, rows)  # warm-up compiles the dequant
             torch.cuda.synchronize()
-            want = _reference_lookup(tables.big, BIG_LAYER, BIG_HEADS, 1, indices)
-            _assert_bitwise(rows.cpu(), want)
-        with (
-            pytest.raises(RuntimeError, match="no fixed staging"),
-            torch.cuda.graph(torch.cuda.CUDAGraph()),
-        ):
-            table.lookup(
-                torch.zeros(4, 8, dtype=torch.int32, device="cuda"),
-                torch.empty(4, 2, DIM, dtype=torch.bfloat16, device="cuda"),
-            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                table.lookup(static_ids + 0, rows)
+            graphs[tokens] = (graph, static_ids, rows)
+        for seed in range(4):
+            for tokens, (graph, static_ids, rows) in graphs.items():
+                indices = _hash_like_indices(
+                    BIG_HEADS, tables.big_written, tokens, seed
+                )
+                static_ids.copy_(indices.cuda())
+                graph.replay()
+                torch.cuda.synchronize()
+                want = _reference_lookup(tables.big, BIG_LAYER, BIG_HEADS, 1, indices)
+                assert torch.equal(rows.cpu().view(torch.int16), want.view(torch.int16))
     finally:
         table.close()
 

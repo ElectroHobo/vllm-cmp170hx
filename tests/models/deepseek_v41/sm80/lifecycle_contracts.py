@@ -29,7 +29,7 @@ rows after a cache eviction or an early staging reuse.
   freed behind the window, recycled, shared by prefix hits, at ids whose
   element offsets pass 2**31.
 * ``engram_staging`` -- ``Sm80EngramEmbedding`` lookups of every TP rank,
-  eager and captured (the fixed staging of a graph size), with the device
+  eager and captured (the one fixed staging of every graph), with the device
   side emulated by an in-order queue: the copies, the native host fetch
   (``EngramHostFetch``, queued as a host function) and the dequant run when
   the queue reaches them; the host only waits through the layer's events.
@@ -1109,7 +1109,8 @@ ENGRAM_TP = 4
 ENGRAM_MAX_TOKENS = 12
 ENGRAM_CACHE_SETS = 2
 ENGRAM_CACHE_WAYS = 8
-ENGRAM_GRAPH_SIZES = (3, 7, 12)
+# Token counts of captured lookups: capture sizes and spec-decode counts.
+ENGRAM_GRAPH_SIZES = (3, 5, 6, 7, 12)
 ENGRAM_LOOKUPS = 40
 
 
@@ -1212,26 +1213,26 @@ class FetchProxy:
             "host_fetch", lookup,
         )
 
-    def enqueue_fixed(self, index, dev_ids, dev_values, dev_scales) -> None:
+    def enqueue_fixed(self, count, dev_ids, dev_values, dev_scales) -> None:
         rank, lookup = self.rank, self.rank.lookup
-        fixed = rank.emb.store.fixed[index]
-        staging = f"f{index}"
+        fixed = rank.emb.store.fixed
+        staging = "fixed"
 
         def ids_to_host():
             rank.read(staging, "dev_ids", lookup)
-            fixed.ids.copy_(dev_ids)
+            fixed.ids[:count].copy_(dev_ids[:count])
             rank.writer[(staging, "host_ids")] = lookup
 
         def rows_to_device():
             rank.read(staging, "host_rows", lookup)
-            dev_values.copy_(fixed.values)
-            dev_scales.copy_(fixed.scales)
+            dev_values[:count].copy_(fixed.values[:count])
+            dev_scales[:count].copy_(fixed.scales[:count])
             rank.writer[(staging, "dev_values")] = lookup
 
         rank.queue.enqueue(ids_to_host, "host_ids", lookup)
         rank.queue.enqueue(
-            lambda: rank.host_fetch(staging, lookup, fixed.count,
-                                    lambda: self.fetcher.run_fixed(index)),
+            lambda: rank.host_fetch(staging, lookup, count,
+                                    lambda: self.fetcher.run_fixed(count)),
             "host_fetch", lookup,
         )
         rank.queue.enqueue(rows_to_device, "dev_values", lookup)
@@ -1248,7 +1249,7 @@ class EngramRank:
         emb = sm80_engram.Sm80EngramEmbedding(
             ENGRAM_ROWS, ENGRAM_DIM, ENGRAM_HEADS, files, tp_rank=rank, tp_size=ENGRAM_TP,
             max_tokens=ENGRAM_MAX_TOKENS, placement="ssd", cache_bytes=cache_bytes,
-            device="cpu", graph_sizes=ENGRAM_GRAPH_SIZES,
+            device="cpu", graph_capture=True,
         )
         assert emb.store.fetcher.cache_rows() == ENGRAM_CACHE_SETS * ENGRAM_CACHE_WAYS
         self.emb = emb
@@ -1274,11 +1275,10 @@ class EngramRank:
             ptr(store.ids): "eager:host_ids",
             ptr(self.out): "out:dev_out",
         }
-        for fixed, (dev_ids, dev_values, dev_scales) in emb._graph_staging.values():
-            staging = f"f{fixed.index}"
-            self.kinds[ptr(dev_ids)] = f"{staging}:dev_ids"
-            self.kinds[ptr(dev_values)] = f"{staging}:dev_values"
-            self.kinds[ptr(dev_scales)] = f"{staging}:dev_scales"
+        dev_ids, dev_values, dev_scales = emb._graph_staging[1]
+        self.kinds[ptr(dev_ids)] = "fixed:dev_ids"
+        self.kinds[ptr(dev_values)] = "fixed:dev_values"
+        self.kinds[ptr(dev_scales)] = "fixed:dev_scales"
         self.lookup = -1
         # (staging, buffer) -> the lookup whose data the buffer holds.
         self.writer: dict = {}
@@ -1317,7 +1317,7 @@ class EngramRank:
         against the LRU model of the row cache."""
         rec, store = self.rec, self.emb.store
         self.read(staging, "host_ids", lookup)
-        ids = (store.ids if staging == "eager" else store.fixed[int(staging[1:])].ids)
+        ids = store.ids if staging == "eager" else store.fixed.ids
         ids = ids.numpy()[:count].copy()
         lo, hi = store.owner_lo, store.owner_hi
         local = np.unique(ids[(ids >= lo) & (ids < hi)] - lo)
@@ -1402,10 +1402,7 @@ class EngramRank:
                 n = self.rng.choice(ENGRAM_GRAPH_SIZES)
             else:
                 n = self.rng.randint(1, ENGRAM_MAX_TOKENS)
-            staging = "eager"
-            if captured:
-                fixed = emb._graph_staging[n * emb.part_n_hash_cols][0]
-                staging = f"f{fixed.index}"
+            staging = "fixed" if captured else "eager"
             # The device ordering, not a host wait, protects a staging that
             # an earlier lookup's queued work still uses.
             rec.coverage["staging_waits"] += any(

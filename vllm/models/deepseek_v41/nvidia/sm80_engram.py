@@ -34,15 +34,19 @@ The module registers no parameter or buffer, so no loader looks for the
 table in the checkpoint.
 
 Lookups can be captured into a CUDA graph (FULL graphs, where the upstream
-Engram's ``_start_prefetch`` runs inside the capture). Each graph size has a
-fixed staging, host and device: a captured lookup stages its ids on the
-device, then queues with fixed arguments the copy of the ids to the fixed
-host ids, the native fetch as a host-function node on the fixed host
+Engram's ``_start_prefetch`` runs inside the capture). With full graphs a
+table has one fixed staging, host and device, as large as the eager one, so
+every token count the runner captures fits (the capture sizes and the
+spec-decode counts rounded to the decode query length alike, all within
+``max_num_batched_tokens``). A captured lookup stages its ids on the device,
+then queues with fixed arguments the copy of the ids to the fixed host ids,
+the native fetch of its row count as a host-function node on the fixed host
 staging, the copies of its rows to the fixed device staging and the
 dequant. A replay therefore fetches that replay's ids; graph launches on one
-stream run one after another, so a replay's staging is never overwritten by
-the next one before it is read. Lookups outside a capture, or from an eager
-break of a breakable graph, use the eager staging above.
+stream run one after another, so the graphs of every count share the
+staging and a replay never overwrites it before the previous one has read
+it. Lookups outside a capture, or from an eager break of a breakable graph,
+use the eager staging above.
 
 A row that cannot be read (after the retries) fails only the requests that
 use it, as the EXL3 PLE rows do (``vllm/sm80/failed_inputs.py``): the
@@ -116,13 +120,13 @@ _LOOKUP_COUNTERS = ("gpu_wait_ns", "host_ns")
 
 @dataclass(frozen=True)
 class FixedStaging:
-    """The pinned host staging of one graph size and its native index."""
+    """The pinned host staging of captured fetches, and the CPU counter of
+    their failed rows the host functions add to."""
 
-    index: int
-    count: int
     ids: torch.Tensor
     values: torch.Tensor
     scales: torch.Tensor
+    failed_total: torch.Tensor
 
     @property
     def nbytes(self) -> int:
@@ -313,7 +317,9 @@ class EngramRowStore:
         self.scale_bytes = files.dim // ENGRAM_QUANT_BLOCK
         rows = owner_hi - owner_lo
         self.pin = pin
-        self.fixed: list[FixedStaging] = []
+        self.fixed: FixedStaging | None = None
+        # The failed rows of fixed fetches already taken.
+        self._fixed_failed_seen = 0
         self.fetcher = None
         # Fetches queued or finished but not yet taken. Counted here, so a
         # lookup calls into the fetch once (each call may hand off the GIL).
@@ -396,18 +402,20 @@ class EngramRowStore:
         if self.table is not None:
             resident += self.table.nbytes
         staging = self.ids.nbytes + self.values.nbytes + self.scales_out.nbytes
-        return resident + staging + sum(fixed.nbytes for fixed in self.fixed)
+        fixed = self.fixed.nbytes if self.fixed is not None else 0
+        return resident + staging + fixed
 
-    def add_fixed(self, count: int) -> FixedStaging:
-        """A fixed host staging for fetches of exactly ``count`` rows (one
-        graph size); add every one before queueing any fetch."""
-        ids = _host_empty((count,), torch.int64, self.pin)
-        values = _host_empty((count, self.row_bytes), torch.uint8, self.pin)
-        scales = _host_empty((count, self.scale_bytes), torch.uint8, self.pin)
-        index = self.fetcher.add_fixed(ids, values, scales)
-        fixed = FixedStaging(index, count, ids, values, scales)
-        self.fixed.append(fixed)
-        return fixed
+    def add_fixed(self, capacity: int) -> FixedStaging:
+        """The fixed host staging for captured fetches of up to
+        ``capacity`` rows; added once, before any fetch is queued."""
+        ids = _host_empty((capacity,), torch.int64, self.pin)
+        values = _host_empty((capacity, self.row_bytes), torch.uint8, self.pin)
+        scales = _host_empty((capacity, self.scale_bytes), torch.uint8, self.pin)
+        failed_total = torch.zeros(1, dtype=torch.int64, device="cpu")
+        self.fetcher.add_fixed(ids, values, scales, failed_total)
+        self.fixed = FixedStaging(ids, values, scales, failed_total)
+        self._fixed_failed_total = failed_total.numpy()
+        return self.fixed
 
     def page_cache_residency(self) -> tuple[int, int]:
         """(resident, total) page-cache pages of the owned value extent;
@@ -452,7 +460,18 @@ class EngramRowStore:
 
     def take_fixed(self) -> int:
         """Log the failed rows of the fixed (captured) fetches since the
-        last call; never waits for a fetch in flight. Returns their count."""
+        last call; never waits for a fetch in flight. Returns their count.
+
+        The host functions add every failed row to a CPU counter, read here
+        without calling into the native fetch (each call hands the GIL off),
+        which is called only when that counter moved.
+        """
+        if self.fixed is None:
+            return 0
+        total = int(self._fixed_failed_total[0])
+        if total == self._fixed_failed_seen:
+            return 0
+        self._fixed_failed_seen = total
         failed, row, code, offset, stopped = self.fetcher.take_fixed().tolist()
         if stopped:
             self._log_stopped(stopped, failed)
@@ -535,7 +554,7 @@ class Sm80EngramEmbedding(nn.Module):
         block_size: int = ENGRAM_QUANT_BLOCK,
         label: str = "engram",
         log_every: int = 0,
-        graph_sizes: Sequence[int] = (),
+        graph_capture: bool = False,
     ) -> None:
         super().__init__()
         if block_size != ENGRAM_QUANT_BLOCK or dim % block_size:
@@ -594,24 +613,22 @@ class Sm80EngramEmbedding(nn.Module):
             self._staged = torch.cuda.Event()
             # The last dequant finished reading the device staging.
             self._consumed = torch.cuda.Event()
-        # Fixed staging per CUDA graph size, by row count: host (native) and
-        # device. A captured lookup's copies, host fetch and dequant run on
-        # these on every replay.
-        self._graph_staging: dict[
-            int, tuple[FixedStaging, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-        ] = {}
-        for size in sorted(set(graph_sizes)):
-            count = size * self.part_n_hash_cols
-            if not 0 < count <= self.capacity_rows:
-                continue
+        # With full CUDA graphs: the fixed staging, host (native) and device,
+        # as large as the eager one. Every captured lookup's copies, host
+        # fetch and dequant run on it on every replay.
+        self._graph_staging: (
+            tuple[FixedStaging, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None
+        ) = None
+        if graph_capture:
+            cap = self.capacity_rows
             device_staging = (
-                torch.empty(count, dtype=torch.int64, device=self.device),
-                torch.empty(count, dim, dtype=torch.uint8, device=self.device),
+                torch.empty(cap, dtype=torch.int64, device=self.device),
+                torch.empty(cap, dim, dtype=torch.uint8, device=self.device),
                 torch.empty(
-                    count, dim // block_size, dtype=torch.uint8, device=self.device
+                    cap, dim // block_size, dtype=torch.uint8, device=self.device
                 ),
             )
-            self._graph_staging[count] = (self.store.add_fixed(count), device_staging)
+            self._graph_staging = (self.store.add_fixed(cap), device_staging)
 
     @property
     def placement(self) -> str:
@@ -624,20 +641,13 @@ class Sm80EngramEmbedding(nn.Module):
 
     def device_bytes(self) -> int:
         """Device memory of this table's staging (the tables use none)."""
-        graphs = sum(
-            tensor.nbytes
-            for _, staging in self._graph_staging.values()
-            for tensor in staging
-        )
+        graphs = 0
+        if self._graph_staging is not None:
+            graphs = sum(tensor.nbytes for tensor in self._graph_staging[1])
         if self.device.type != "cuda":
             return graphs
         eager = self._dev_ids.nbytes + self._dev_values.nbytes + self._dev_scales.nbytes
         return eager + graphs
-
-    @property
-    def graph_token_counts(self) -> list[int]:
-        """The token counts (graph sizes) that have a fixed staging."""
-        return [count // self.part_n_hash_cols for count in self._graph_staging]
 
     @staticmethod
     def telemetry_fields() -> dict[str, int]:
@@ -772,23 +782,22 @@ class Sm80EngramEmbedding(nn.Module):
         count: int,
         rows_out: torch.Tensor,
     ) -> None:
-        """The lookup inside a CUDA graph capture, on the fixed staging of
-        its size: every queued argument is fixed, so each replay fetches its
-        own ids. The host time of a replay is not counted."""
+        """The lookup inside a CUDA graph capture, on the fixed staging:
+        every queued argument is fixed, so each replay fetches its own ids.
+        The host time of a replay is not counted."""
         from vllm.models.deepseek_v41.nvidia.ops.sm80_engram_dequant import (
             dequant_engram_rows,
         )
 
-        staging = self._graph_staging.get(count)
-        if staging is None:
+        if self._graph_staging is None:
             raise RuntimeError(
-                f"sm_80 Engram: no fixed staging for a captured lookup of "
-                f"{num_tokens} tokens; fixed stagings exist for the CUDA graph "
-                f"capture sizes {self.graph_token_counts}"
+                "sm_80 Engram: a lookup is captured but the table was built "
+                "without full CUDA graphs (no fixed staging)"
             )
-        fixed, (dev_ids, dev_values, dev_scales) = staging
+        dev_ids, dev_values, dev_scales = self._graph_staging[1]
         self._stage_ids(indices, num_tokens, dev_ids)
-        self.store.fetcher.enqueue_fixed(fixed.index, dev_ids, dev_values, dev_scales)
+        self.store.fetcher.enqueue_fixed(count, dev_ids, dev_values, dev_scales)
+        dev_values, dev_scales = dev_values[:count], dev_scales[:count]
         dequant_engram_rows(dev_values, dev_scales, rows_out)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
@@ -850,6 +859,13 @@ def engram_table_dir(model_config) -> str:
     )
 
 
+def captures_full_graphs(mode) -> bool:
+    """Whether the cudagraph mode captures full graphs (FULL,
+    FULL_DECODE_ONLY, FULL_AND_PIECEWISE): their Engram lookups need the
+    fixed staging."""
+    return mode is not None and mode.has_full_cudagraphs()
+
+
 def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbedding:
     """The sm_80 Engram table of one Engram layer of the current model."""
     from vllm import envs
@@ -882,13 +898,7 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
     log_every = envs.VLLM_ENGRAM_TELEMETRY_STEPS
     if log_every < 0:
         raise ValueError("VLLM_ENGRAM_TELEMETRY_STEPS must be nonnegative")
-    compilation = vllm_config.compilation_config
-    graph_sizes: tuple[int, ...] = ()
-    if (
-        compilation.cudagraph_mode is not None
-        and compilation.cudagraph_mode.has_full_cudagraphs()
-    ):
-        graph_sizes = tuple(compilation.cudagraph_capture_sizes or ())
+    graph_capture = captures_full_graphs(vllm_config.compilation_config.cudagraph_mode)
     table = Sm80EngramEmbedding(
         rows,
         layout.head_dim,
@@ -902,7 +912,7 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         device=torch.device("cuda", torch.cuda.current_device()),
         label=f"layer {layer_id}",
         log_every=log_every,
-        graph_sizes=graph_sizes,
+        graph_capture=graph_capture,
     )
     _TABLES.add(table)
     if log_every:
@@ -920,8 +930,8 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
     logger.info(
         "sm_80 Engram layer %d (%s): placement=%s rows [%d, %d) heads [%d, %d); "
         "host %.2f GiB (scales %.2f GiB pinned, values %s); device staging "
-        "%.1f MiB; fixed graph stagings for %d sizes; page cache %d/%d value "
-        "pages resident",
+        "%.1f MiB (fixed graph staging %s); page cache %d/%d value pages "
+        "resident",
         layer_id,
         files.values_path,
         placement,
@@ -933,7 +943,7 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         table.store.scales.nbytes / GiB,
         values,
         table.device_bytes() / (1 << 20),
-        len(table.graph_token_counts),
+        "on" if graph_capture else "off",
         resident,
         total,
     )
