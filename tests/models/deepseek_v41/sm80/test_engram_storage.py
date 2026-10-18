@@ -6,6 +6,7 @@ telemetry, dequantization against the reference formula, the real shards
 (VLLM_ENGRAM_TEST_TABLE_DIR, Python and native readers) and CUDA graph
 replay with changing ids (GPU only)."""
 
+import errno
 import json
 import os
 import struct
@@ -18,6 +19,7 @@ import numpy as np
 import pytest
 import torch
 from safetensors import safe_open
+from torch import nn
 
 from vllm.models.deepseek_v41.nvidia import sm80_engram
 from vllm.models.deepseek_v41.nvidia.ops.sm80_engram_dequant import (
@@ -720,13 +722,99 @@ def test_create_embedding_hook_dispatch(monkeypatch):
     monkeypatch.setattr("vllm.sm80.kernels._platform._SM80_CACHE", False)
     assert wrapped(None, None, 0) == "upstream"
     monkeypatch.setattr("vllm.sm80.kernels._platform._SM80_CACHE", True)
+    table = SimpleNamespace(mask_failed_rows=lambda rows: -rows)
     monkeypatch.setattr(
         sm80_engram,
         "build_sm80_engram_embedding",
-        lambda layout, index: ("sm80", index),
+        lambda layout, index: table,
     )
-    assert wrapped(None, None, 1) == ("sm80", 1)
+    engram = SimpleNamespace(embed=lambda ids: ids + 1)
+    assert wrapped(engram, None, 1) is table
+    # The gathered rows pass through the table's failure mask.
+    assert engram.embed(torch.ones(2)).tolist() == [-2.0, -2.0]
     assert calls == [("upstream", 0)]
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_unreadable_rows_fail_only_their_requests(tmp_path, native):
+    """A short read (both readers) and EIO (Python reader) on chosen rows:
+    the owners' tokens come out zero and are reported on rank 0, the other
+    tokens stay byte-exact, nothing raises."""
+    from vllm.sm80.failed_inputs import failed_request_ids, take_failed_tokens
+
+    if native:
+        _require_native()
+    heads, rows, layer, tokens = (300,) * 8, 2400, 14, 12
+    _write_table(tmp_path, layer, rows, np.arange(rows), "model.safetensors")
+    files = locate_engram_table(tmp_path, layer, rows, DIM)
+    short_row, eio_row = 2397, 700  # rank 3 (head 7), rank 1 (head 2)
+    good = np.arange(rows)
+    good = good[(good < 2396) & (good != eio_row)]
+    # A table row whose first value dequantizes to NaN (an E4M3 NaN value or
+    # an E8M0 NaN scale) would fail its token too.
+    good = good[(_row_bytes(good, DIM, 1)[:, 0] & 0x7F) != 0x7F]
+    good = good[_row_bytes(good, SCALE_DIM, 2)[:, 0] != 0xFF]
+    indices = _hash_like_indices(heads, good, tokens, seed=5)
+    indices[5, 7] = short_row  # request b
+    indices[9, 2] = eio_row  # request c
+    want = torch.cat(
+        [_reference_lookup(files, layer, heads, r, indices) for r in range(TP)], 1
+    )
+    tables = [
+        Sm80EngramEmbedding(
+            rows,
+            DIM,
+            heads,
+            files,
+            tp_rank=rank,
+            tp_size=TP,
+            max_tokens=tokens,
+            placement="ssd",
+            cache_bytes=1 << 20,
+            native_read=native,
+        )
+        for rank in range(TP)
+    ]
+    try:
+        # Cut the file inside row 2396: rows from there on read short.
+        os.truncate(files.values_path, files.values_offset + 2396 * DIM + 100)
+        failed_reqs = {"b"}
+        if not native:
+            source = tables[1].store.source
+            source._nowait = False
+            read = source._pread_exact_into
+
+            def eio(fd, target, offset):
+                if offset == files.values_offset + eio_row * DIM:
+                    raise OSError(errno.EIO, os.strerror(errno.EIO))
+                read(fd, target, offset)
+
+            source._pread_exact_into = eio
+            failed_reqs.add("c")
+        outs = []
+        for table in tables:
+            outs.append(torch.empty(tokens, 2, DIM, dtype=torch.bfloat16))
+            table.lookup(indices, outs[-1])
+        engram = SimpleNamespace(embed=lambda ids: torch.cat(outs, dim=1))
+        sm80_engram.mask_failed_after_gather(engram, tables[0])
+        got = engram.embed(indices)
+        failed = [5] + ([] if native else [9])
+        keep = [t for t in range(tokens) if t not in failed]
+        assert not got[failed].any()
+        assert torch.equal(got[keep].view(torch.int16), want[keep].view(torch.int16))
+        model = nn.Module()
+        model.table = tables[0]
+        query_start_loc, req_ids = np.array([0, 4, 8, 12]), ["a", "b", "c"]
+        mask = take_failed_tokens(model).numpy()
+        assert failed_request_ids(mask, query_start_loc, req_ids) == failed_reqs
+        # Taking clears the mask.
+        mask = take_failed_tokens(model).numpy()
+        assert failed_request_ids(mask, query_start_loc, req_ids) == set()
+        assert tables[3].telemetry()["rows_failed"] == 1
+        assert tables[1].telemetry()["rows_failed"] == (0 if native else 1)
+    finally:
+        for table in tables:
+            table.close()
 
 
 def test_upstream_engram_carries_the_hook():

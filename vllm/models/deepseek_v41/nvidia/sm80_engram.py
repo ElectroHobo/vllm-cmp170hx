@@ -32,6 +32,14 @@ copies and the dequant on the caller's stream. Staging reuse is ordered by
 two events: the host waits for the previous host-to-device copy before it
 overwrites the host staging, and the stream waits for the previous dequant
 before it overwrites the device staging.
+
+A row that cannot be read (after the retries) fails only the requests that
+use it, as the EXL3 PLE rows do (``vllm/sm80/failed_inputs.py``): the
+owning rank stages it poisoned, an E4M3 NaN as its first value and zeros
+after, which survives the TP gather of the rows. After the gather every rank
+marks the tokens holding a NaN first value as failed, zeros those tokens'
+rows, and reports them through ``take_failed_tokens``; the runner finishes
+their requests with an error. Only startup and the table locator raise.
 """
 
 import atexit
@@ -46,7 +54,7 @@ import time
 import weakref
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -73,6 +81,8 @@ _RWF_NOWAIT = 0x8
 _MAX_HEADER_BYTES = 100 << 20
 _GOLDEN = np.uint64(0x9E3779B97F4A7C15)
 GiB = 1 << 30
+# A row that could not be read: E4M3 NaN as its first value, then zeros.
+_POISON_VALUE = 0x7F
 # The native reader's operator, as csrc/exl3/module.cpp declares it.
 PLE_READ_ROWS_SCHEMA = (
     "_exl3_C::ple_read_rows(int fd, Tensor ids, Tensor(a!) dest, int count, "
@@ -204,6 +214,7 @@ class EngramTelemetry:
         "cache_misses",
         "cache_inserts",
         "cache_evictions",
+        "rows_failed",
         "page_cache_rows",
         "storage_rows",
         "unclassified_rows",
@@ -244,7 +255,8 @@ def format_engram_telemetry(counts: dict[str, int]) -> str:
         f"(unowned {counts['rows_unowned']}, unique {counts['rows_unique']}) "
         f"cache hits {hits} misses {misses} "
         f"({100.0 * hits / max(hits + misses, 1):.1f}% hit) "
-        f"evictions {counts['cache_evictions']}; read MiB page cache "
+        f"evictions {counts['cache_evictions']}; "
+        f"failed rows {counts['rows_failed']}; read MiB page cache "
         f"{counts['page_cache_bytes'] / mib:.1f} storage "
         f"{counts['storage_bytes'] / mib:.1f} unclassified "
         f"{counts['unclassified_bytes'] / mib:.1f}; host ms fetch "
@@ -404,6 +416,9 @@ class EngramReadStats:
     page_cache_rows: int = 0
     storage_rows: int = 0
     unclassified_rows: int = 0
+    # (index into the rows read, error) of the rows that still failed after
+    # the retries; their bytes are unspecified.
+    failed: list[tuple[int, BaseException]] = field(default_factory=list)
 
 
 class EngramRowSource:
@@ -516,7 +531,10 @@ class EngramRowSource:
                 time.sleep(0.001 * 2**attempt)
 
     def read(self, rows: np.ndarray, dest: np.ndarray) -> EngramReadStats:
-        """Read global ``rows`` (int64, owned) into ``dest`` ([n, row_bytes])."""
+        """Read global ``rows`` (int64, owned) into ``dest`` ([n, row_bytes]).
+
+        Rows that still fail after the retries are returned in ``failed``.
+        """
         count = len(rows)
         if dest.shape != (count, self.row_bytes) or not dest.flags.c_contiguous:
             raise ValueError("Engram row destination does not match the rows")
@@ -545,12 +563,13 @@ class EngramRowSource:
             self.retries,
             self.threads,
         ).tolist()
-        if failed:
-            index, code, offset = failed[0]
-            self._raise_failed(
-                len(failed), int(rows[index]), self._read_error(code, offset)
-            )
-        return EngramReadStats(unclassified_rows=len(rows))
+        return EngramReadStats(
+            unclassified_rows=len(rows),
+            failed=[
+                (index, self._read_error(code, offset))
+                for index, code, offset in failed
+            ],
+        )
 
     def _read_python(self, rows: np.ndarray, dest: np.ndarray) -> EngramReadStats:
         row_bytes = self.row_bytes
@@ -584,15 +603,17 @@ class EngramRowSource:
         else:
             pending = list(range(len(rows)))
         cached = len(rows) - len(pending)
+        failures = []
         if pending:
             view = memoryview(dest).cast("B")
             failures = self._read_pending(rows, view, pending)
-            if failures:
-                index, error = failures[0]
-                self._raise_failed(len(failures), int(rows[index]), error)
         if probe:
-            return EngramReadStats(page_cache_rows=cached, storage_rows=len(pending))
-        return EngramReadStats(page_cache_rows=cached, unclassified_rows=len(pending))
+            return EngramReadStats(
+                page_cache_rows=cached, storage_rows=len(pending), failed=failures
+            )
+        return EngramReadStats(
+            page_cache_rows=cached, unclassified_rows=len(pending), failed=failures
+        )
 
     def _read_pending(
         self, rows: np.ndarray, view: memoryview, pending: list[int]
@@ -633,12 +654,6 @@ class EngramRowSource:
         if errors:
             raise errors[0]
         return sorted(failed, key=lambda item: item[0])
-
-    def _raise_failed(self, count: int, row: int, error: BaseException) -> None:
-        raise RuntimeError(
-            f"Engram table {self.path}: {count} row read(s) failed after "
-            f"{self.retries} retries (first: row {row}: {error})"
-        ) from error
 
     def close(self) -> None:
         if self._pool is not None:
@@ -740,7 +755,8 @@ class EngramRowStore:
 
     def fetch(self, ids: np.ndarray, values: np.ndarray, scales: np.ndarray) -> None:
         """Fill ``values`` [n, row_bytes] and ``scales`` [n, scale_bytes] for
-        global row ids [n]. Thread-safe."""
+        global row ids [n]. Rows that cannot be read are poisoned (an E4M3
+        NaN, then zeros) and never cached. Thread-safe."""
         start = time.perf_counter_ns()
         owned = (ids >= self.owner_lo) & (ids < self.owner_hi)
         unowned = ~owned
@@ -771,8 +787,26 @@ class EngramRowStore:
                 read_start = time.perf_counter_ns()
                 stats = self.source.read(miss + self.owner_lo, missed)
                 counts["read_ns"] = time.perf_counter_ns() - read_start
+                good = np.ones(len(miss), dtype=bool)
+                if stats.failed:
+                    bad = np.array([index for index, _ in stats.failed])
+                    good[bad] = False
+                    missed[bad] = 0
+                    missed[bad, 0] = _POISON_VALUE
+                    counts["rows_failed"] = len(bad)
+                    index, error = stats.failed[0]
+                    logger.error(
+                        "sm_80 Engram table %s: %d row read(s) failed after %d "
+                        "retries (first: row %d: %s); the requests using them "
+                        "will be finished with an error",
+                        self.source.path,
+                        len(bad),
+                        self.source.retries,
+                        int(miss[index]) + self.owner_lo,
+                        error,
+                    )
                 rows[~hit] = missed
-                inserted, evicted = self.cache.insert(miss, missed)
+                inserted, evicted = self.cache.insert(miss[good], missed[good])
                 counts.update(
                     cache_inserts=inserted,
                     cache_evictions=evicted,
@@ -875,6 +909,10 @@ class Sm80EngramEmbedding(nn.Module):
         self._host_ids_np = self._host_ids.numpy()
         self._host_values_np = self._host_values.numpy()
         self._host_scales_np = self._host_scales.numpy()
+        # Tokens of the last forward whose rows failed, on any rank.
+        self._failed_tokens = torch.zeros(
+            max_tokens, dtype=torch.bool, device=self.device
+        )
         if cuda:
             self._dev_ids = torch.empty(cap, dtype=torch.int64, device=self.device)
             self._dev_values = torch.empty(
@@ -1024,6 +1062,24 @@ class Sm80EngramEmbedding(nn.Module):
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("sm_80 Engram tables are read through Engram.lookup")
 
+    def mask_failed_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """Zero the tokens of gathered rows [T, n_hash_cols, dim] that hold a
+        poisoned row and remember them for :meth:`take_failed_tokens`.
+
+        Runs on every rank after the TP gather, so each rank sees the rows
+        any rank failed to read. Graph-capturable.
+        """
+        failed = rows[:, :, 0].isnan().any(-1)
+        self._failed_tokens[: rows.shape[0]].copy_(failed)
+        return rows.masked_fill(failed[:, None, None], 0)
+
+    def take_failed_tokens(self) -> torch.Tensor:
+        """The failed-token mask over the last forward's tokens (padded to
+        the staging capacity), cleared once taken (vllm/sm80/failed_inputs.py)."""
+        failed = self._failed_tokens.clone()
+        self._failed_tokens.zero_()
+        return failed
+
     def close(self) -> None:
         """Wait for queued staging copies, then close the table file."""
         if self.device.type == "cuda":
@@ -1140,6 +1196,19 @@ def sm80_engram_embedding(create: Callable) -> Callable:
 
         if not _is_sm80():
             return create(engram, layout, layer_hash_index)
-        return build_sm80_engram_embedding(layout, layer_hash_index)
+        table = build_sm80_engram_embedding(layout, layer_hash_index)
+        mask_failed_after_gather(engram, table)
+        return table
 
     return build
+
+
+def mask_failed_after_gather(engram, table: Sm80EngramEmbedding) -> None:
+    """Route ``engram.embed`` (the lookup's rows after the TP gather) through
+    :meth:`Sm80EngramEmbedding.mask_failed_rows`."""
+    gather = engram.embed
+
+    def embed(hash_ids: torch.Tensor) -> torch.Tensor:
+        return table.mask_failed_rows(gather(hash_ids))
+
+    engram.embed = embed
