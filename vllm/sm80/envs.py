@@ -90,6 +90,8 @@ if TYPE_CHECKING:
     VLLM_EXL3_DENSE_MMA: bool = False
     VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE: str = ""
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
+    VLLM_EXL3_OVERRIDE: str = ""
+    VLLM_EXL3_OVERRIDE_SHA256: str = ""
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
     VLLM_DSV41_WO_B_BF16_ALLREDUCE: bool = False
@@ -756,6 +758,15 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PLE_PLACEMENT": lambda: _env_with_choices(
         "VLLM_EXL3_PLE_PLACEMENT", "ssd", ["ssd", "ram", "device"]
     )(),
+    # An override sidecar's manifest (tools/sm80/build_override_sidecar.py):
+    # the plain tensors it lists load from its safetensors file, in the source
+    # checkpoint's dtype, in place of an EXL3 export's lower-precision copies
+    # (vllm/sm80/kernels/exl3/override.py). Unset: the export's tensors.
+    "VLLM_EXL3_OVERRIDE": lambda: os.getenv("VLLM_EXL3_OVERRIDE", ""),
+    # sha256 of the VLLM_EXL3_OVERRIDE manifest; required when it is set.
+    "VLLM_EXL3_OVERRIDE_SHA256": lambda: os.getenv(
+        "VLLM_EXL3_OVERRIDE_SHA256", ""
+    ),
     # Order Qwen QSA's native-selected blocks before expansion/attention.
     # Set 0 to retain native traversal order without changing selection.
     "VLLM_QWEN_QSA_TOPK_SORTED": lambda: bool(

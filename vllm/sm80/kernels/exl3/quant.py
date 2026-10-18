@@ -29,6 +29,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sm80.kernels.exl3.layout import Exl3Layout, exl3_layout
+from vllm.sm80.kernels.exl3.override import apply_override
 from vllm.sm80.kernels.exl3.utils import (
     Exl3Manifest,
     PackedMatrix,
@@ -144,6 +145,10 @@ class Exl3Config(QuantizationConfig):
             raise ValueError("Download the EXL3 safetensors checkpoint before loading")
         self.layout = exl3_layout(hf_config)
         self.manifest = Exl3Manifest(model_name)
+        if envs.VLLM_EXL3_OVERRIDE:
+            apply_override(
+                self.manifest, envs.VLLM_EXL3_OVERRIDE, envs.VLLM_EXL3_OVERRIDE_SHA256
+            )
         self.layout.check_manifest(self.manifest)
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
