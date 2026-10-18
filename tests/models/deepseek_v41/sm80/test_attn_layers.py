@@ -121,24 +121,32 @@ def run_sm80(args, specs, weights, xs, schedule, device="cpu"):
     return run, outs, topks
 
 
-def run_reference(args, specs, weights, xs):
+def run_reference(args, specs, weights, xs, device="cpu"):
+    """The reference, every request alone, on ``device`` (its tensors are
+    created under that default device, so its libm, reductions and RoPE
+    table are the device's)."""
     outs, topks, layers = {}, {}, {}
-    for r, (prompt, total) in REQUESTS.items():
-        refs = [RefAttention(args, s, w) for s, w in zip(specs, weights)]
-        shared = RefShared()
-        layers[r] = refs
-        steps = [(0, prompt)] + [(p, 1) for p in range(prompt, total)]
-        for start, n in steps:
-            for li, ref in enumerate(refs):
-                o = ref.forward(xs[li][r][start : start + n].unsqueeze(0), start, shared)
-                for i in range(n):
-                    outs[(li, r, start + i)] = o[0, i]
-                if specs[li].ratio:
-                    idxs = shared.topk_idxs
-                    offset = n if start == 0 else args.window_size
+    weights = [{k: v.to(device) for k, v in w.items()} for w in weights]
+    with torch.device(device):
+        for r, (prompt, total) in REQUESTS.items():
+            refs = [RefAttention(args, s, w) for s, w in zip(specs, weights)]
+            shared = RefShared()
+            layers[r] = refs
+            steps = [(0, prompt)] + [(p, 1) for p in range(prompt, total)]
+            for start, n in steps:
+                for li, ref in enumerate(refs):
+                    x = xs[li][r][start : start + n].unsqueeze(0).to(device)
+                    o = ref.forward(x, start, shared).cpu()
                     for i in range(n):
-                        row = idxs[0, i].tolist() if idxs.shape[-1] else []
-                        topks[(li, r, start + i)] = [j - offset for j in row if j >= 0]
+                        outs[(li, r, start + i)] = o[0, i]
+                    if specs[li].ratio:
+                        idxs = shared.topk_idxs.cpu()
+                        offset = n if start == 0 else args.window_size
+                        for i in range(n):
+                            row = idxs[0, i].tolist() if idxs.shape[-1] else []
+                            topks[(li, r, start + i)] = [
+                                j - offset for j in row if j >= 0
+                            ]
     return layers, outs, topks
 
 
@@ -162,20 +170,20 @@ def check(args, specs, run, outs, topks, ref_layers, ref_outs, ref_topks):
             ref = ref_layers[r][li]
             for p in range(max(0, total - args.window_size), total):
                 got = run.window_row(li, r, p).cpu()
-                want = ref.window_kv_cache[0, p % args.window_size]
+                want = ref.window_kv_cache[0, p % args.window_size].cpu()
                 assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
                     f"window row layer {li} req {r} pos {p}"
                 )
             if spec.kv_source:
                 for j in range(total // spec.ratio):
                     got = run.comp_row(r, j).cpu()
-                    want = ref.compress_kv_cache[0, j]
+                    want = ref.compress_kv_cache[0, j].cpu()
                     assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
                         f"compressed row req {r} pos {j}"
                     )
                     if spec.index_source:
                         got = run.comp_row(r, j, idxk=True).cpu()
-                        want = ref.k_cache[0, j]
+                        want = ref.k_cache[0, j].cpu()
                         assert torch.equal(
                             got.view(torch.int16), want.view(torch.int16)
                         ), f"index key req {r} pos {j}"

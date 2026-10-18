@@ -171,10 +171,27 @@ def test_kernels_int64_offsets() -> None:
     ],
 )
 def test_layer_on_cuda_matches_reference(specs) -> None:
+    """The sm_80 layer on CUDA against the reference run on CUDA: the same
+    bitwise contract as on CPU (caches, top-k sets)."""
     args = RefArgs()
     weights = [make_weights(args, s, 100 + i) for i, s in enumerate(specs)]
     xs = layers.make_inputs(args, len(specs), 5)
     schedule = layers.make_schedule(11)
     run, outs, topks = layers.run_sm80(args, specs, weights, xs, schedule, "cuda")
-    ref_layers, ref_outs, ref_topks = layers.run_reference(args, specs, weights, xs)
-    layers.check(args, specs, run, outs, topks, ref_layers, ref_outs, ref_topks)
+    ref = layers.run_reference(args, specs, weights, xs, "cuda")
+    layers.check(args, specs, run, outs, topks, *ref)
+
+    # Against the reference run on CPU only to tolerance: the two devices'
+    # libm (cos/sin/exp/rsqrt) and fp32 reduction orders differ by ulps,
+    # which a BF16 or FP4/FP8 rounding can turn into one grid step, and a
+    # rare near-tie of index scores into a different top-k member.
+    _, cpu_outs, cpu_topks = layers.run_reference(args, specs, weights, xs)
+    n_far = n_total = 0
+    for key, want in cpu_outs.items():
+        got = outs[key].float()
+        far = (got - want.float()).abs() > 1e-3 + 0.13 * want.float().abs()
+        n_far += int(far.sum())
+        n_total += far.numel()
+    assert n_far <= 0.01 * n_total, f"{n_far}/{n_total} elements beyond tolerance"
+    same = sum(topks[k] == v for k, v in cpu_topks.items())
+    assert same >= 0.95 * len(cpu_topks), f"{same}/{len(cpu_topks)} top-k sets equal"

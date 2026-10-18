@@ -140,13 +140,22 @@ def _pow2_ceil_tl(a):
 
 
 @triton.jit
+def _with_sign_of(r, v):
+    """``r`` (>= 0) carrying the sign bit of ``v``, -0.0 included. Triton's
+    unary minus is ``0 - r``, which turns a rounded-away -0.0 into +0.0; the
+    hardware casts keep it."""
+    sign = (v.to(tl.int32, bitcast=True) >> 31) << 31
+    return (r.to(tl.int32, bitcast=True) | sign).to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _round_grid_tl(v, MIN_EXP: tl.constexpr, MANT_BITS: tl.constexpr):
     a = tl.abs(v)
     exp = ((a.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 127
     ulp_exp = tl.maximum(exp, MIN_EXP) - MANT_BITS
     ulp = ((ulp_exp + 127) << 23).to(tl.float32, bitcast=True)
     r = libdevice.rint(tl.div_rn(a, ulp)) * ulp
-    return tl.where(v < 0, -r, tl.where(v > 0, r, v))
+    return _with_sign_of(r, v)
 
 
 @triton.jit
@@ -161,7 +170,7 @@ def round_e2m1_tl(v):
     a = tl.abs(v)
     ulp = tl.where(a < 2.0, 0.5, tl.where(a < 4.0, 1.0, 2.0))
     r = libdevice.rint(tl.div_rn(a, ulp)) * ulp
-    return tl.where(v < 0, -r, tl.where(v > 0, r, v))
+    return _with_sign_of(r, v)
 
 
 @triton.jit
