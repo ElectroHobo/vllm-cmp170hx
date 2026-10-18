@@ -25,7 +25,8 @@ check again, and loads the source bytes in place of the export's.
 
     python tools/sm80/build_override_sidecar.py \\
         --repo ORG/NAME --revision COMMIT --export EXPORT_DIR --out OUT_DIR \\
-        [--names NAMES_FILE] [--map MAP_JSON] [--source-dir LOCAL_SOURCE]
+        [--names NAMES_FILE] [--map MAP_JSON] [--source-dir LOCAL_SOURCE] \
+        [--replace]
 
 --names restricts the classification to the listed export tensors (one per
 line); by default every plain export tensor is classified. --map is a JSON
@@ -34,6 +35,10 @@ tensors; unlisted names map to themselves. The source is read from the
 repository's resolve URL at the pinned revision with HTTP Range requests
 (only headers and the compared tensors), or from --source-dir, a local copy of
 that revision.
+
+A built sidecar is pinned by sha256 wherever it is served, so a new build
+goes into a new directory: an existing non-empty --out is refused unless
+--replace is given.
 """
 
 from __future__ import annotations
@@ -228,6 +233,10 @@ def sha256_file(path: Path) -> str:
 
 
 def build(args: argparse.Namespace) -> tuple[dict, dict]:
+    if args.out.exists() and any(args.out.iterdir()) and not args.replace:
+        raise ValueError(
+            f"{args.out} is not empty; build into a new directory (or --replace)"
+        )
     source = Source(args.repo, args.revision, args.source_dir)
     source_map = source.index()
     export = Export(args.export)
@@ -332,6 +341,11 @@ def main(argv=None) -> int:
     parser.add_argument("--map", type=Path, help="JSON export name -> source name")
     parser.add_argument(
         "--source-dir", type=Path, help="local copy of the source at --revision"
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="overwrite a non-empty --out (never one a served setting pins)",
     )
     args = parser.parse_args(argv)
     manifest, report = build(args)

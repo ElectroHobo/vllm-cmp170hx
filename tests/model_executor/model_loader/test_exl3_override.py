@@ -112,6 +112,13 @@ def checkpoints(tmp_path):
     argv = ["--repo", "org/model", "--revision", REVISION]
     argv += ["--export", str(export_dir), "--out", str(out)]
     assert builder.main(argv + ["--source-dir", str(source_dir)]) == 0
+    manifest_sha = _pin(out / builder.MANIFEST)
+    # A non-empty --out is refused without --replace and left untouched.
+    with pytest.raises(ValueError, match="is not empty"):
+        builder.main(argv + ["--source-dir", str(source_dir)])
+    assert manifest_sha == _pin(out / builder.MANIFEST)
+    argv += ["--replace", "--source-dir", str(source_dir)]
+    assert builder.main(argv) == 0
     path = out / builder.MANIFEST
     return source, export, export_dir, path
 
