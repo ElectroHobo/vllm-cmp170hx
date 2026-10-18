@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """DSpark draft model for DeepSeek-V4.1 (semi-autoregressive speculative decoding).
 
 See: qwen3_dspark.py for base architecture. This one is specialized to the
