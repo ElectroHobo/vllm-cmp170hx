@@ -148,6 +148,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/dflash2_model.py` | 425 |
 | `vllm/sm80/spec_decode/lilicorr_model.py` | 31 |
 | `vllm/sm80/spec_decode/warmup.py` | 170 |
+| `vllm/sm80/spec_decode/zero_draft.py` | 29 |
 | `vllm/sm80/worker/__init__.py` | 2 |
 | `vllm/sm80/worker/cudagraph_mem.py` | 464 |
 | `vllm/sm80/worker/graph_mem_worker.py` | 57 |
@@ -155,7 +156,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **38 files** | **10,043** |
+| **39 files** | **10,072** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -411,6 +412,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/core/test_scheduler_failed_inputs.py` | 108 |
 | `tests/v1/kv_connector/conftest.py` | 17 |
 | `tests/v1/spec_decode/test_adaptive_k.py` | 223 |
+| `tests/v1/spec_decode/test_dspark_zero_draft.py` | 223 |
 | `tests/v1/spec_decode/test_glm5_dflash_accept_depth.py` | 378 |
 | `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 453 |
 | `tests/v1/spec_decode/test_glm5_dflash_draft_width.py` | 560 |
@@ -424,7 +426,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **174 files** | **87,354** |
+| **175 files** | **87,577** |
 
 #### `tools/`
 
@@ -508,13 +510,13 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/model_states/recoverssm.py` | modified | 4 | 9 | 3 |
 | `vllm/v1/worker/gpu/pp_utils.py` | modified | 222 | 8 | 15 |
 | `vllm/v1/worker/gpu/sample/gumbel.py` | modified | 9 | 1 | 2 |
-| `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` | modified | 100 | 18 | 5 |
+| `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` | modified | 103 | 18 | 7 |
 | `vllm/v1/worker/gpu/spec_decode/dflash/utils.py` | modified | 13 | 3 | 4 |
 | `vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py` | modified | 282 | 0 | 7 |
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **71 files** | | **3,555** | **244** | **492** |
+| **71 files** | | **3,558** | **244** | **494** |
 
 ### Tests, docs and .github
 
@@ -548,9 +550,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 71 | 3,555 | 244 | 492 |
+| Product code | 71 | 3,558 | 244 | 494 |
 | Tests, docs and .github | 22 | 572 | 550 | 78 |
-| All | 93 | 4,127 | 794 | 570 |
+| All | 93 | 4,130 | 794 | 572 |
 
 ## 3. Fork environment variables
 
@@ -675,12 +677,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 148 |
-| Fork-added product lines | 46,256 |
+| Fork-added product files | 149 |
+| Fork-added product lines | 46,285 |
 | Patched upstream files | 93 |
-| Patched upstream lines | +4,127 / -794 |
+| Patched upstream lines | +4,130 / -794 |
 | Patched upstream product files | 71 |
-| Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 49,811 |
+| Patched upstream product lines | +3,558 / -244 |
+| Product lines added (new files and patches) | 49,843 |
 | Fork environment variables (flags) | 97 |
 | Unreferenced fork definitions | 2 (23 lines) |
