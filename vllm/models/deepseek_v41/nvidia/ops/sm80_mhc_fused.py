@@ -24,11 +24,13 @@ Kernel A is the GLM-5.3-Flash sm_80 decode kernel
 (``vllm/sm80/kernels/mhc/decode.py``, ``post_prenorm``): the post step
 ``post * x + comb^T @ residual`` stored BF16, and the projection on the
 streams onto the 24 mixes as split-K partials, three TF32 passes on the
-tensor cores (FP32-equivalent), with the squared-sum partials. Two of its
+tensor cores (FP32-equivalent), with the squared-sum partials. Three of its
 compile-time options serve this model: ``round_mix`` (the projection and
 the squared sum read the BF16 streams, as the reference computes its
-coefficients from the BF16 stream) and ``has_post=False`` (the pre-only
-call).
+coefficients from the BF16 stream), ``has_post=False`` (the pre-only
+call) and ``fp64_acc`` (each slice's partials accumulated in FP64 and
+rounded once to FP32: at 4 x 5120 streams the FP32 accumulation was
+kernel A's largest error source in the coefficients).
 
 Kernel B (``_delayed_finish_kernel``, grid ``(tokens, 2)``) is the delayed
 finish, in Triton:
@@ -334,7 +336,10 @@ def _delayed(
     if x is None:
         # pre only: the kernel reads the streams themselves; x, post and comb
         # are placeholders of sufficient size (not used)
-        post_prenorm(res, res, mix, mix, fnc, rc, mix, sqr, has_post=False, round_mix=True)
+        post_prenorm(
+            res, res, mix, mix, fnc, rc, mix, sqr, has_post=False, round_mix=True,
+            fp64_acc=True,
+        )
         streams = res
     else:
         assert x.dtype == torch.bfloat16 and x.shape == (T, hidden), (x.dtype, x.shape)
@@ -350,6 +355,7 @@ def _delayed(
             mix,
             sqr,
             round_mix=True,
+            fp64_acc=True,
         )
         streams = rc
     if not FINISH_KERNEL:

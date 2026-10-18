@@ -25,13 +25,13 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_engram_dequant.py` | 112 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 209 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 490 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 496 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_sparse_attn.py` | 180 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue.py` | 538 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **11 files** | **5,403** |
+| **11 files** | **5,409** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -92,7 +92,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/marlin_moe/prefill.py` | 492 |
 | `vllm/sm80/kernels/marlin_moe/split_align.py` | 224 |
 | `vllm/sm80/kernels/mhc/__init__.py` | 114 |
-| `vllm/sm80/kernels/mhc/decode.py` | 888 |
+| `vllm/sm80/kernels/mhc/decode.py` | 922 |
 | `vllm/sm80/kernels/mhc/prenorm.py` | 470 |
 | `vllm/sm80/kernels/mhc/prenorm_workspace.py` | 118 |
 | `vllm/sm80/kernels/mhc/warmup.py` | 47 |
@@ -109,7 +109,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **50 files** | **16,571** |
+| **50 files** | **16,605** |
 
 ### `vllm/sm80/`
 
@@ -341,8 +341,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_official_reference.py` | 1,363 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 283 |
 | `tests/models/deepseek_v41/sm80/test_sm80_kernels_gpu.py` | 312 |
-| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused.py` | 298 |
-| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused_gpu.py` | 162 |
+| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused.py` | 299 |
+| `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused_gpu.py` | 173 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
 | `tests/models/deepseek_v41/sm80/test_wo_b_allreduce_bits_gpu.py` | 90 |
@@ -420,7 +420,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **172 files** | **86,291** |
+| **172 files** | **86,303** |
 
 #### `tools/`
 
@@ -670,11 +670,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 146 |
-| Fork-added product lines | 45,606 |
+| Fork-added product lines | 45,646 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 49,161 |
+| Product lines added (new files and patches) | 49,201 |
 | Fork environment variables (flags) | 95 |
 | Unreferenced fork definitions | 2 (23 lines) |

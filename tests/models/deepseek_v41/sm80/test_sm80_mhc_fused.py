@@ -100,11 +100,11 @@ def variants(T: int, hidden: int, seed: int = 0) -> dict:
 
 
 def _stand_in_kernel_a(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True,
-                       round_mix=False):
+                       round_mix=False, fp64_acc=False):
     """kernel A's contract in torch: the streams (stored BF16), FP32 partial
     projections and squared sums over 32-wide hidden slices of the streams
     as stored (``round_mix``; the only mode this model uses)."""
-    assert round_mix
+    assert round_mix and fp64_acc  # this model's options
     T, hc, hidden = res.shape
     streams = sm80_mhc.mhc_post(x, res, post, comb) if has_post else res
     rc.copy_(streams)
@@ -285,7 +285,8 @@ def test_kernels_compile_for_sm80():
                            options={"num_warps": 4})
         assert c.asm["cubin"]
 
-    base = dict(HIDDEN=hidden, NOUT=24, HB=decode.HB_GLU, NP2=32, ROUND_MIX=True)
+    base = dict(HIDDEN=hidden, NOUT=24, HB=decode.HB_GLU, NP2=32, ROUND_MIX=True,
+                FP64_ACC=True)
     for has_post in (True, False):
         build(GluonASTSource, decode._glu_post_prenorm_tb_kernel, a_types,
               dict(base, BT=decode.BT_T, HAS_POST=has_post))

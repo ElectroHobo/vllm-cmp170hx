@@ -109,8 +109,8 @@ def _mma3(a, b, acc_s, acc_t, acc_b, z, K: gl.constexpr):
     acc_t = mma_v2(ah, b - bh, acc_t)
     kk = gl.arange(0, K, layout=gl.SliceLayout(0, gl.SliceLayout(2, b.type.layout)))
     lo8 = (kk < 8)[None, :, None]
-    acc_b = acc_b + mma_v2(ah, gl.where(lo8, bh, 0.0), z)
-    acc_b = acc_b + mma_v2(ah, gl.where(lo8, 0.0, bh), z)
+    acc_b = acc_b + mma_v2(ah, gl.where(lo8, bh, 0.0), z).to(acc_b.dtype)
+    acc_b = acc_b + mma_v2(ah, gl.where(lo8, 0.0, bh), z).to(acc_b.dtype)
     return acc_s, acc_t, acc_b
 
 
@@ -130,8 +130,8 @@ def _mma3_smem(hsh, hsl, sb, acc_s, acc_t, acc_b, z, LA: gl.constexpr, LB: gl.co
         bh = _tf32_hi(b)
         acc_t = mma_v2(ah, b - bh, acc_t)
         acc_s = mma_v2(al, bh, acc_s)
-        acc_b = acc_b + mma_v2(gl.where(lo8, ah, 0.0), bh, z)
-        acc_b = acc_b + mma_v2(gl.where(lo8, 0.0, ah), bh, z)
+        acc_b = acc_b + mma_v2(gl.where(lo8, ah, 0.0), bh, z).to(acc_b.dtype)
+        acc_b = acc_b + mma_v2(gl.where(lo8, 0.0, ah), bh, z).to(acc_b.dtype)
     return acc_s, acc_t, acc_b
 
 
@@ -139,7 +139,8 @@ def _mma3_smem(hsh, hsl, sb, acc_s, acc_t, acc_b, z, LA: gl.constexpr, LB: gl.co
 def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr, mix_ptr, sqr_ptr,
                              M, HIDDEN: gl.constexpr, NOUT: gl.constexpr, HB: gl.constexpr,
                              BM: gl.constexpr, NP2: gl.constexpr, NW: gl.constexpr,
-                             HAS_POST: gl.constexpr, ROUND_MIX: gl.constexpr):
+                             HAS_POST: gl.constexpr, ROUND_MIX: gl.constexpr,
+                             FP64_ACC: gl.constexpr = False):
     """Kernel A for hc == 4: residual_cur + prenorm GEMM partials on the tensor cores.
 
     grid (cdiv(M, BM), HIDDEN // HB).  CTA (pm, ks) owns tokens [pm*BM, pm*BM+BM)
@@ -274,11 +275,18 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
     gl.store(ob + HIDDEN, n1.to(gl.bfloat16), mask=m2)
     gl.store(ob + 2 * HIDDEN, n2.to(gl.bfloat16), mask=m2)
     gl.store(ob + 3 * HIDDEN, n3.to(gl.bfloat16), mask=m2)
-    sq = gl.sum(n0 * n0 + n1 * n1 + n2 * n2 + n3 * n3, axis=1)
+    if FP64_ACC:
+        sq = gl.sum(n0.to(gl.float64) * n0 + n1.to(gl.float64) * n1
+                    + n2.to(gl.float64) * n2 + n3.to(gl.float64) * n3, axis=1).to(gl.float32)
+    else:
+        sq = gl.sum(n0 * n0 + n1 * n1 + n2 * n2 + n3 * n3, axis=1)
     gl.store(sqr_ptr + ks * M + mi, sq, mask=mm)
 
     acc_s = gl.zeros([BM, NP2], gl.float32, layout=MMA)
-    acc_b = gl.zeros([BM, NP2], gl.float32, layout=MMA)
+    if FP64_ACC:
+        acc_b = gl.zeros([BM, NP2], gl.float64, layout=MMA)
+    else:
+        acc_b = gl.zeros([BM, NP2], gl.float32, layout=MMA)
     acc_t = gl.zeros([BM, NP2], gl.float32, layout=MMA)
     z = gl.zeros([BM, NP2], gl.float32, layout=MMA)
     # operand A split hi/lo once here (4 elements per thread) - see the docstring
@@ -315,7 +323,10 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
     async_copy.wait_group(0)
     gl.barrier()
     acc_s, acc_t, acc_b = _mma3_smem(hs6, hs7, s3, acc_s, acc_t, acc_b, z, LA, LB, HB)
-    acc = acc_b + (acc_s + acc_t)
+    if FP64_ACC:
+        acc = (acc_b + (acc_s + acc_t).to(gl.float64)).to(gl.float32)
+    else:
+        acc = acc_b + (acc_s + acc_t)
 
     mo = pm * BM + gl.arange(0, BM, layout=gl.SliceLayout(1, MMA))
     no = gl.arange(0, NP2, layout=gl.SliceLayout(0, MMA))
@@ -327,7 +338,8 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
 def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr, mix_ptr, sqr_ptr,
                                 M, HIDDEN: gl.constexpr, NOUT: gl.constexpr, HB: gl.constexpr,
                                 BT: gl.constexpr, NP2: gl.constexpr,
-                                HAS_POST: gl.constexpr, ROUND_MIX: gl.constexpr):
+                                HAS_POST: gl.constexpr, ROUND_MIX: gl.constexpr,
+                                FP64_ACC: gl.constexpr = False):
     """Kernel A for hc == 4 and M <= BT (= 8), transposed and K-split over warps:
     mix^T[n, t] = sum over the two k-halves h of fn^T[h][n, k] @ rc^T[h][k, t], as one
     batched mma with warps [2 (k-half), 2 (n-tile), 1].  The [16, 32] form wastes
@@ -455,12 +467,20 @@ def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_p
     gl.store(ob + HIDDEN, n1.to(gl.bfloat16), mask=m3)
     gl.store(ob + 2 * HIDDEN, n2.to(gl.bfloat16), mask=m3)
     gl.store(ob + 3 * HIDDEN, n3.to(gl.bfloat16), mask=m3)
-    sq = gl.sum(gl.sum(n0 * n0 + n1 * n1 + n2 * n2 + n3 * n3, axis=1), axis=0)
+    if FP64_ACC:
+        sq = gl.sum(gl.sum(n0.to(gl.float64) * n0 + n1.to(gl.float64) * n1
+                           + n2.to(gl.float64) * n2 + n3.to(gl.float64) * n3, axis=1),
+                    axis=0).to(gl.float32)
+    else:
+        sq = gl.sum(gl.sum(n0 * n0 + n1 * n1 + n2 * n2 + n3 * n3, axis=1), axis=0)
     gl.store(sqr_ptr + ks * M + ti, sq, mask=tm)
 
     acc_s = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
     acc_t = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
-    acc_b = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
+    if FP64_ACC:
+        acc_b = gl.zeros([2, NP2, BT], gl.float64, layout=MMA)
+    else:
+        acc_b = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
     z = gl.zeros([2, NP2, BT], gl.float32, layout=MMA)
     b0 = gl.convert_layout(n0, LB)
     b1 = gl.convert_layout(n1, LB)
@@ -481,11 +501,17 @@ def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_p
     # the two k-half partials meet in shared memory (one barrier); gl.sum over the
     # warp-distributed batch dim lowers to a longer shuffle + smem sequence.
     SR: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
-    red = gl.allocate_shared_memory(gl.float32, [2, NP2, BT], SR)
-    red.store(acc_b + (acc_s + acc_t))
-    gl.barrier()
     LR: gl.constexpr = gl.BlockedLayout([2, 1, 1], [1, 4, 8], [1, 4, 1], [2, 1, 0])
-    acc = gl.sum(red.load(LR), axis=0)
+    if FP64_ACC:
+        red64 = gl.allocate_shared_memory(gl.float64, [2, NP2, BT], SR)
+        red64.store(acc_b + (acc_s + acc_t).to(gl.float64))
+        gl.barrier()
+        acc = gl.sum(red64.load(LR), axis=0).to(gl.float32)
+    else:
+        red = gl.allocate_shared_memory(gl.float32, [2, NP2, BT], SR)
+        red.store(acc_b + (acc_s + acc_t))
+        gl.barrier()
+        acc = gl.sum(red.load(LR), axis=0)
 
     LO: gl.constexpr = gl.SliceLayout(0, LR)
     no = gl.arange(0, NP2, layout=gl.SliceLayout(1, LO))
@@ -763,13 +789,14 @@ WARPS_GLU = 4
 BM_A = 16           # bf16/tf32 mma is m16n8k16: 16 rows is the minimum unit
 
 
-def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_mix=False):
+def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_mix=False,
+                 fp64_acc=False):
     """Kernel A alone: ``rc`` [M, 4, H] bf16, the prenorm GEMM partials ``mix``
     [H / HB_GLU, M, 24] and the squared-sum partials ``sqr`` [H / HB_GLU, M].
 
     ``x`` [M, H] bf16, ``res`` [M, 4, H] bf16, ``post`` [M, 4] and ``comb``
     [M, 4, 4] fp32, ``fn`` [24, 4 * H] fp32, all contiguous; H a multiple of
-    HB_GLU. Two compile-time options, both off for GLM-5.3-Flash (whose
+    HB_GLU. Three compile-time options, all off for GLM-5.3-Flash (whose
     kernels are then the ones measured above, unchanged):
       * ``has_post=False``: no post step; the streams are ``res`` itself (the
         delayed ``pre``-only call). ``x``, ``post`` and ``comb`` are not used,
@@ -777,7 +804,14 @@ def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_m
       * ``round_mix=True``: the GEMM and the squared sum read the streams as
         stored, rounded to bf16 (the DeepSeek-V4.1 reference computes its
         coefficients from the bf16 stream), not the fp32 values before the
-        rounding.
+        rounding;
+      * ``fp64_acc=True``: inside each hidden slice the big (hi * hi)
+        products' 8-wide mma blocks, the two small terms, the two k-halves
+        and the squared sum are accumulated in FP64 (full rate on this card)
+        and each partial is rounded once to FP32; the mma passes and their
+        split are unchanged. At DeepSeek-V4.1's 4 x 5120 streams the FP32
+        accumulation was kernel A's largest error source in the
+        coefficients (CPU emulation: pre max error 1.3e-7 -> 7e-8).
     """
     M, hidden = res.shape[0], res.shape[-1]
     nout = fn.shape[0]
@@ -788,13 +822,13 @@ def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_m
             x, res, post, comb, fn, rc, mix, sqr, M,
             HIDDEN=hidden, NOUT=nout, HB=HB_GLU, BT=BT_T,
             NP2=triton.next_power_of_2(nout), HAS_POST=has_post, ROUND_MIX=round_mix,
-            num_warps=4)
+            FP64_ACC=fp64_acc, num_warps=4)
     else:
         _glu_post_prenorm_kernel[(triton.cdiv(M, BM_A), ksb)](
             x, res, post, comb, fn, rc, mix, sqr, M,
             HIDDEN=hidden, NOUT=nout, HB=HB_GLU, BM=BM_A,
             NP2=triton.next_power_of_2(nout), NW=WARPS_GLU, HAS_POST=has_post,
-            ROUND_MIX=round_mix, num_warps=WARPS_GLU)
+            ROUND_MIX=round_mix, FP64_ACC=fp64_acc, num_warps=WARPS_GLU)
 
 
 def mhc_fused_post_pre(

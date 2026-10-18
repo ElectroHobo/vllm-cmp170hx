@@ -160,7 +160,7 @@ def test_kernels_compile_for_sm80():
              "comb_ptr": "*fp32", "fn_ptr": "*fp32", "rc_ptr": "*bf16",
              "mix_ptr": "*fp32", "sqr_ptr": "*fp32", "M": "i32"}
     # GLM's options (see decode.post_prenorm)
-    glm = dict(HAS_POST=True, ROUND_MIX=False)
+    glm = dict(HAS_POST=True, ROUND_MIX=False, FP64_ACC=False)
     build(v3._glu_post_prenorm_tb_kernel, types,
           dict(HIDDEN=HIDDEN, NOUT=NOUT, HB=hb, BT=8, NP2=32, **glm))
     build(v3._glu_post_prenorm_kernel, types,
