@@ -138,7 +138,8 @@ def _mma3_smem(hsh, hsl, sb, acc_s, acc_t, acc_b, z, LA: gl.constexpr, LB: gl.co
 @gluon.jit
 def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr, mix_ptr, sqr_ptr,
                              M, HIDDEN: gl.constexpr, NOUT: gl.constexpr, HB: gl.constexpr,
-                             BM: gl.constexpr, NP2: gl.constexpr, NW: gl.constexpr):
+                             BM: gl.constexpr, NP2: gl.constexpr, NW: gl.constexpr,
+                             HAS_POST: gl.constexpr, ROUND_MIX: gl.constexpr):
     """Kernel A for hc == 4: residual_cur + prenorm GEMM partials on the tensor cores.
 
     grid (cdiv(M, BM), HIDDEN // HB).  CTA (pm, ks) owns tokens [pm*BM, pm*BM+BM)
@@ -256,6 +257,17 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
     n3 = gl.fma(c13[:, None], rf1, n3)
     n3 = gl.fma(c23[:, None], rf2, n3)
     n3 = gl.fma(c33[:, None], rf3, n3)
+    if not HAS_POST:
+        # pre only (see `post_prenorm`): the streams are residual itself
+        n0 = rf0
+        n1 = rf1
+        n2 = rf2
+        n3 = rf3
+    if ROUND_MIX:
+        n0 = n0.to(gl.bfloat16).to(gl.float32)
+        n1 = n1.to(gl.bfloat16).to(gl.float32)
+        n2 = n2.to(gl.bfloat16).to(gl.float32)
+        n3 = n3.to(gl.bfloat16).to(gl.float32)
 
     ob = rc_ptr + mi[:, None] * (HC * HIDDEN) + h[None, :]
     gl.store(ob, n0.to(gl.bfloat16), mask=m2)
@@ -314,7 +326,8 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
 @gluon.jit
 def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr, mix_ptr, sqr_ptr,
                                 M, HIDDEN: gl.constexpr, NOUT: gl.constexpr, HB: gl.constexpr,
-                                BT: gl.constexpr, NP2: gl.constexpr):
+                                BT: gl.constexpr, NP2: gl.constexpr,
+                                HAS_POST: gl.constexpr, ROUND_MIX: gl.constexpr):
     """Kernel A for hc == 4 and M <= BT (= 8), transposed and K-split over warps:
     mix^T[n, t] = sum over the two k-halves h of fn^T[h][n, k] @ rc^T[h][k, t], as one
     batched mma with warps [2 (k-half), 2 (n-tile), 1].  The [16, 32] form wastes
@@ -425,6 +438,17 @@ def _glu_post_prenorm_tb_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_p
     n3 = gl.fma(c13, rf1, n3)
     n3 = gl.fma(c23, rf2, n3)
     n3 = gl.fma(c33, rf3, n3)
+    if not HAS_POST:
+        # pre only (see `post_prenorm`): the streams are residual itself
+        n0 = rf0
+        n1 = rf1
+        n2 = rf2
+        n3 = rf3
+    if ROUND_MIX:
+        n0 = n0.to(gl.bfloat16).to(gl.float32)
+        n1 = n1.to(gl.bfloat16).to(gl.float32)
+        n2 = n2.to(gl.bfloat16).to(gl.float32)
+        n3 = n3.to(gl.bfloat16).to(gl.float32)
 
     ob = rc_ptr + t3 * (HC * HIDDEN) + h3
     gl.store(ob, n0.to(gl.bfloat16), mask=m3)
@@ -739,6 +763,40 @@ WARPS_GLU = 4
 BM_A = 16           # bf16/tf32 mma is m16n8k16: 16 rows is the minimum unit
 
 
+def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_mix=False):
+    """Kernel A alone: ``rc`` [M, 4, H] bf16, the prenorm GEMM partials ``mix``
+    [H / HB_GLU, M, 24] and the squared-sum partials ``sqr`` [H / HB_GLU, M].
+
+    ``x`` [M, H] bf16, ``res`` [M, 4, H] bf16, ``post`` [M, 4] and ``comb``
+    [M, 4, 4] fp32, ``fn`` [24, 4 * H] fp32, all contiguous; H a multiple of
+    HB_GLU. Two compile-time options, both off for GLM-5.3-Flash (whose
+    kernels are then the ones measured above, unchanged):
+      * ``has_post=False``: no post step; the streams are ``res`` itself (the
+        delayed ``pre``-only call). ``x``, ``post`` and ``comb`` are not used,
+        but must still be tensors of at least the sizes above;
+      * ``round_mix=True``: the GEMM and the squared sum read the streams as
+        stored, rounded to bf16 (the DeepSeek-V4.1 reference computes its
+        coefficients from the bf16 stream), not the fp32 values before the
+        rounding.
+    """
+    M, hidden = res.shape[0], res.shape[-1]
+    nout = fn.shape[0]
+    ksb = hidden // HB_GLU
+    assert hidden % HB_GLU == 0 and mix.shape == (ksb, M, nout), (hidden, mix.shape)
+    if M <= BT_T:
+        _glu_post_prenorm_tb_kernel[(triton.cdiv(M, BT_T), ksb)](
+            x, res, post, comb, fn, rc, mix, sqr, M,
+            HIDDEN=hidden, NOUT=nout, HB=HB_GLU, BT=BT_T,
+            NP2=triton.next_power_of_2(nout), HAS_POST=has_post, ROUND_MIX=round_mix,
+            num_warps=4)
+    else:
+        _glu_post_prenorm_kernel[(triton.cdiv(M, BM_A), ksb)](
+            x, res, post, comb, fn, rc, mix, sqr, M,
+            HIDDEN=hidden, NOUT=nout, HB=HB_GLU, BM=BM_A,
+            NP2=triton.next_power_of_2(nout), NW=WARPS_GLU, HAS_POST=has_post,
+            ROUND_MIX=round_mix, num_warps=WARPS_GLU)
+
+
 def mhc_fused_post_pre(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -797,16 +855,7 @@ def mhc_fused_post_pre(
     comb_out = torch.empty(M, hc * hc, dtype=torch.float32, device=dev)
     li = torch.empty(M, hidden, dtype=torch.bfloat16, device=dev)
 
-    if M <= BT_T:
-        _glu_post_prenorm_tb_kernel[(triton.cdiv(M, BT_T), ksb)](
-            xf, res, pf, cf, fnf, rc, mix, sqr, M,
-            HIDDEN=hidden, NOUT=nout, HB=HB_GLU, BT=BT_T,
-            NP2=triton.next_power_of_2(nout), num_warps=4)
-    else:
-        _glu_post_prenorm_kernel[(triton.cdiv(M, BM_A), ksb)](
-            xf, res, pf, cf, fnf, rc, mix, sqr, M,
-            HIDDEN=hidden, NOUT=nout, HB=HB_GLU, BM=BM_A,
-            NP2=triton.next_power_of_2(nout), NW=WARPS_GLU, num_warps=WARPS_GLU)
+    post_prenorm(xf, res, pf, cf, fnf, rc, mix, sqr)
     _glu_finish_kernel[(M, 2)](
         mix, sqr, hc_scale, hc_base, rc, nw, post_out, comb_out, li, M,
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, norm_eps,

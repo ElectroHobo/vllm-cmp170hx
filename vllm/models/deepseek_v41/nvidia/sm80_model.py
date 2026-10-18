@@ -15,7 +15,10 @@ What changes on sm_80:
 
 - mHC runs in the reference's FP32 formulas (``ops/sm80_mhc.py``) instead of
   the TileLang/DeepGEMM kernels: the decoder layers' forward, the backbone's
-  final post and the DSpark drafter's forward call them;
+  final post and the DSpark drafter's forward call them. With
+  ``VLLM_DSV41_FUSED_MHC`` the decoder layers' delayed pre and fused post +
+  pre run as two kernels per call instead (``ops/sm80_mhc_fused.py``, same
+  contracts and rounding points; :func:`mhc_ops`);
 - each MoE keeps the upstream modules and EXL3 experts, with an FP32 gate and
   the reference routing (``sm80_moe.adopt_moe``);
 - the drafter holds no embedding or LM head of its own (the DSpark loader
@@ -36,23 +39,46 @@ from itertools import islice
 
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.models.deepseek_v41.nvidia import dspark as upstream_dspark
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
-from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import (
-    mhc_fused_post_pre_delayed,
-    mhc_post,
-    mhc_pre_delayed,
-)
+from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
+from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
 from vllm.models.deepseek_v41.nvidia.sm80_moe import adopt_moe
 from vllm.sm80.kernels.exl3.quant import Exl3HeadLogitsProcessor
 
+logger = init_logger(__name__)
+
+
+def mhc_ops(config):
+    """The module whose delayed mHC ops (``mhc_pre_delayed``,
+    ``mhc_fused_post_pre_delayed``, ``mhc_post``) the decoder layers call:
+    ``ops/sm80_mhc_fused.py`` with ``VLLM_DSV41_FUSED_MHC``, else the
+    reference's torch formulas ``ops/sm80_mhc.py``. The layers look each op
+    up on the module at every call."""
+    if not envs.VLLM_DSV41_FUSED_MHC:
+        return sm80_mhc
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
+
+    reason = sm80_mhc_fused.supports(config.hc_mult, config.hidden_size)
+    if reason is not None:
+        raise ValueError(f"VLLM_DSV41_FUSED_MHC: {reason}")
+    logger.info_once(
+        "DeepSeek-V4.1 sm_80: the decoder layers' delayed mHC runs as two "
+        "kernels per call (VLLM_DSV41_FUSED_MHC=1)",
+        scope="global",
+    )
+    return sm80_mhc_fused
+
 
 class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
-    """Decoder layer whose mHC steps run ``ops/sm80_mhc.py``.
+    """Decoder layer whose mHC steps run the module :func:`mhc_ops` picks
+    (``self._mhc_ops``).
 
     ``forward`` is the upstream one for the sm_80 topology: the first layer
     takes the repeated embedding (its coefficients from the whole stream),
@@ -72,6 +98,7 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
             raise ValueError("DeepSeek-V4.1 on sm_80 has no mHC overlap stream")
         layer.__class__ = cls
         adopt_moe(layer.ffn, config)
+        layer._mhc_ops = mhc_ops(config)
 
     def _mixes(self, attn: bool) -> tuple:
         if attn:
@@ -105,6 +132,7 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
         mega_gate_metadata=None,
     ):
         previous_aux = None
+        ops = self._mhc_ops
         attn_norm = {
             "norm_weight": self.attn_norm.weight,
             "norm_eps": self.attn_norm.variance_epsilon,
@@ -117,13 +145,13 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
                 if x.dim() == 2
                 else x
             )
-            post_mix, res_mix, x, attn_pre = mhc_pre_delayed(
+            post_mix, res_mix, x, attn_pre = ops.mhc_pre_delayed(
                 residual, *self._mixes(True), pre_mix=pre_mix, **attn_norm
             )
         elif self.engram is not None and engram_hashes is not None:
             # Engram injects into the previous sublayer's post, before this
             # block's coefficients are computed from the stream.
-            previous_post = mhc_post(x, residual, post_mix, res_mix)
+            previous_post = ops.mhc_post(x, residual, post_mix, res_mix)
             if capture_previous_aux:
                 previous_aux = previous_post.mean(dim=1)
             residual = self.engram(
@@ -131,12 +159,12 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
                 engram_hashes[:, self.engram.layer_hash_index],
                 engram_mask,
             )
-            post_mix, res_mix, x, attn_pre = mhc_pre_delayed(
+            post_mix, res_mix, x, attn_pre = ops.mhc_pre_delayed(
                 residual, *self._mixes(True), pre_mix=pre_mix, **attn_norm
             )
         else:
             residual, post_mix, res_mix, x, attn_pre, aux = (
-                mhc_fused_post_pre_delayed(
+                ops.mhc_fused_post_pre_delayed(
                     x,
                     residual,
                     post_mix,
@@ -153,7 +181,7 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
         x = self.attn(positions, x, None)
 
         # The FFN collapses with the pre-mix this layer's attention produced.
-        residual, post_mix, res_mix, x, ffn_pre, _ = mhc_fused_post_pre_delayed(
+        residual, post_mix, res_mix, x, ffn_pre, _ = ops.mhc_fused_post_pre_delayed(
             x,
             residual,
             post_mix,
@@ -178,7 +206,7 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
     ) -> None:
         """Upstream ``write_kv`` with the sm_80 mHC."""
         assert self.engram is None
-        *_, x, _, _ = mhc_fused_post_pre_delayed(
+        *_, x, _, _ = self._mhc_ops.mhc_fused_post_pre_delayed(
             x,
             residual,
             post_mix,
