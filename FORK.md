@@ -21,7 +21,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | Path | Lines |
 |---|---:|
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_act_quant.py` | 259 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 786 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 865 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_engram_dequant.py` | 112 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 209 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
@@ -30,7 +30,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **10 files** | **4,834** |
+| **10 files** | **4,913** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -38,7 +38,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 
 | Path | Lines |
 |---|---:|
-| `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 710 |
+| `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 713 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 978 |
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
 | `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 308 |
@@ -50,7 +50,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **12 files** | **4,383** |
+| **12 files** | **4,386** |
 
 ### `vllm/sm80/kernels/`
 
@@ -271,8 +271,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_prefill.py` | 534 |
 | `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
 | `tests/kernels/quantization/test_exl3_moe_swiglu_clamp.py` | 83 |
-| `tests/kernels/quantization/test_exl3_moe_v2.py` | 634 |
-| `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 585 |
+| `tests/kernels/quantization/test_exl3_moe_v2.py` | 614 |
+| `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 590 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 85 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
@@ -322,15 +322,15 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/exl3_fixture.py` | 284 |
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
 | `tests/models/deepseek_v41/sm80/fixtures/exl3_headers.json` | 25,297 |
-| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 614 |
+| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 688 |
 | `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,508 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
 | `tests/models/deepseek_v41/sm80/test_boot_warmup.py` | 289 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,171 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
-| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 322 |
-| `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 240 |
+| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 525 |
+| `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 336 |
 | `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 126 |
 | `tests/models/deepseek_v41/sm80/test_no_host_sync.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 283 |
@@ -411,7 +411,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **165 files** | **83,258** |
+| **165 files** | **83,616** |
 
 #### `tools/`
 
@@ -565,8 +565,8 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES` | `int` | `262144` | `'262144'` |
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S` | `float` | `60.0` | `'60'` |
 | `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P` | `bool` | `False` | `'0'` |
+| `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
-| `VLLM_DSV41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
 | `VLLM_ENGRAM_TELEMETRY_STEPS` | `int` | `0` | `'0'` |
@@ -645,9 +645,9 @@ Functions, methods and classes in fork-added product files whose name occurs now
 
 | Path | Line | Name | Lines | Used by tests |
 |---|---:|---|---:|---|
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 770 | `forward_layer` | 17 | yes |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 847 | `forward_layer` | 19 | yes |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 260 | `engram_telemetry` | 4 | yes |
-| **2 definitions** | | | **21** | |
+| **2 definitions** | | | **23** | |
 
 ## 5. Health numbers
 
@@ -656,11 +656,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 144 |
-| Fork-added product lines | 44,659 |
+| Fork-added product lines | 44,741 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 48,214 |
+| Product lines added (new files and patches) | 48,296 |
 | Fork environment variables (flags) | 91 |
-| Unreferenced fork definitions | 2 (21 lines) |
+| Unreferenced fork definitions | 2 (23 lines) |
