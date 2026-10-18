@@ -327,6 +327,17 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         )
         self._sm80_freqs: dict[torch.device, torch.Tensor] = {}
         self._sm80_chunk_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        if self.indexer is not None and vllm_config.kernel_config.enable_jit_warmup:
+            from vllm.models.deepseek_v41.nvidia.ops.sm80_index_scores import (
+                INDEX_SCORES_WARMUP,
+            )
+
+            INDEX_SCORES_WARMUP.register_warmup(
+                self.indexer.k_cache,
+                self.sm80_cfg.index_n_heads,
+                self.sm80_cfg.index_head_dim,
+                self.sm80_cfg.index_heads_per_rank,
+            )
         self._wo_b_bf16_allreduce = bool(envs.VLLM_DSV41_WO_B_BF16_ALLREDUCE)
         if self._wo_b_bf16_allreduce:
             logger.info_once(

@@ -9,13 +9,31 @@ the head's BF16 weight and rounds again, then sums each rank's heads in head
 order (fp32, rounded to BF16) and adds the ranks in order with BF16 rounding.
 Positions at or past the query's visible count score ``-inf``. No atomics;
 every output element is written by exactly one program.
+
+One compiled variant per index-key cache: the score width ``n_cols`` and the
+block-table row stride are not specialised on, and the output rows are padded
+to a multiple of 16 so their stride always falls in Triton's divisible-by-16
+class. The rest of the specialisation key (dtypes, constexprs, the cache's
+block stride and alignment, the fixed q/w strides) is the same for every call
+on a cache, so :data:`INDEX_SCORES_WARMUP`, registered by each index-source
+layer, compiles everything a served run can reach at boot. No boot dummy run
+reaches the kernel: dummy and capture batches have padding slots or position
+0, where no compressed position is visible yet.
 """
+
+from dataclasses import dataclass, field
 
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    triton_scalar_specialization_rep,
+)
 from vllm.triton_utils import tl, triton
 
 _BLOCK_N = 64
+# Output row stride granule: a multiple of 16 keeps one specialisation class.
+_ROW_ALIGN = 16
 
 
 @triton.jit
@@ -24,7 +42,7 @@ def _row(s, hidx, h: tl.constexpr):
     return tl.sum(tl.where(hidx[:, None] == h, s, 0.0), axis=0)
 
 
-@triton.jit(do_not_specialize=["n_cols"])
+@triton.jit(do_not_specialize=["n_cols", "stride_bt"])
 def _index_scores_kernel(
     q_ptr,
     w_ptr,
@@ -95,7 +113,8 @@ def index_scores_triton(
     n, h, d = q.shape
     assert q.stride(2) == 1 and idxk.stride(2) == 1 and w.stride(1) == 1
     assert h % heads_per_rank == 0
-    out = torch.empty((n, n_cols), dtype=torch.float32, device=q.device)
+    padded = triton.cdiv(max(n_cols, 1), _ROW_ALIGN) * _ROW_ALIGN
+    out = torch.empty((n, padded), dtype=torch.float32, device=q.device)[:, :n_cols]
     if n == 0 or n_cols == 0:
         return out
     grid = (n, triton.cdiv(n_cols, _BLOCK_N))
@@ -123,3 +142,59 @@ def index_scores_triton(
         num_warps=4,
     )
     return out
+
+
+class IndexScoresWarmup(VllmJitKernel["IndexScoresWarmup.Key"]):
+    """Boot-time compile of :func:`index_scores_triton` for one index-key
+    cache. Registered by every index-source layer (whose cache is bound by the
+    time the warmup runs); layers whose caches share a specialisation key
+    compile once."""
+
+    @dataclass(frozen=True)
+    class Key:
+        entries: int
+        heads: int
+        dim: int
+        heads_per_rank: int
+        block_stride_class: int
+        aligned: bool
+        cache: torch.Tensor = field(compare=False, hash=False, repr=False)
+
+    def get_warmup_keys(
+        self, k_cache_layer, heads: int, dim: int, heads_per_rank: int
+    ) -> list["IndexScoresWarmup.Key"]:
+        cache = k_cache_layer.kv_cache
+        if cache.numel() == 0 or not cache.is_cuda:
+            return []
+        return [
+            self.Key(
+                entries=cache.shape[1],
+                heads=heads,
+                dim=dim,
+                heads_per_rank=heads_per_rank,
+                block_stride_class=triton_scalar_specialization_rep(cache.stride(0)),
+                aligned=cache.data_ptr() % 16 == 0,
+                cache=cache,
+            )
+        ]
+
+    def compile(self, compile_key: "IndexScoresWarmup.Key") -> None:
+        # Block 0 (the null block) of the real cache, two queries seeing one
+        # and two positions; the launch matches a served one in every
+        # specialised argument.
+        cache = compile_key.cache
+        dev = cache.device
+        n = 2
+        q = torch.zeros(
+            (n, compile_key.heads, compile_key.dim), dtype=torch.bfloat16, device=dev
+        )
+        w = torch.zeros((n, compile_key.heads), dtype=torch.bfloat16, device=dev)
+        n_vis = torch.tensor([1, 2], dtype=torch.int64, device=dev)
+        req = torch.zeros(n, dtype=torch.int64, device=dev)
+        block_table = torch.zeros((1, 2), dtype=torch.int32, device=dev)
+        index_scores_triton(
+            q, w, n_vis, req, cache, block_table, 2, compile_key.heads_per_rank
+        )
+
+
+INDEX_SCORES_WARMUP = IndexScoresWarmup()
