@@ -1186,28 +1186,28 @@ seams:
   kind: method
   target: vllm.models.deepseek_v41.nvidia.model:DeepseekV4DecoderLayer.forward
   why: the fork sm_80 decoder layer forward mirrors it (first-layer, Engram and fused post/pre branches, attention then FFN, same return tuple) with the mHC ops of ops/sm80_mhc.py; a change here must be carried over
-  sha256: 812626649576f6aa846afb30f288c924b80543e9c0c9fafb386841440b2ff1b3
-  signature: '(self, x: torch.Tensor, positions: torch.Tensor, input_ids: torch.Tensor | None, pre_mix: torch.Tensor | None = None, post_mix: torch.Tensor | None = None, res_mix: torch.Tensor | None = None, residual: torch.Tensor | None = None, engram_hashes: torch.Tensor | None = None, engram_mask: torch.Tensor | None = None, *, capture_previous_aux: bool = False, mega_gate_metadata: vllm.models.deepseek_v4.nvidia.model.MegaGateRoutingMetadata | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]'
+  sha256: 7c90e41ec2d690cc62670680c9577f5f5c7f07a7a1f736e73e0503ca9f1de973
+  signature: '(self, x: torch.Tensor | vllm.model_executor.layers.fused_moe.moe_output.MoEOutput, positions: torch.Tensor, input_ids: torch.Tensor | None, pre_mix: torch.Tensor | None = None, post_mix: torch.Tensor | None = None, res_mix: torch.Tensor | None = None, residual: torch.Tensor | None = None, engram_hashes: torch.Tensor | None = None, engram_mask: torch.Tensor | None = None, *, capture_previous_aux: bool = False, mega_gate_metadata: vllm.models.deepseek_v4.nvidia.model.MegaGateRoutingMetadata | None = None) -> tuple[torch.Tensor | vllm.model_executor.layers.fused_moe.moe_output.MoEOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]'
 
 - id: dsv41-dspark-forward
   kind: method
   target: vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4Model.forward
   why: the fork DSpark model forward mirrors it without sequence parallelism or MegaMoE, with the sm_80 mHC post and hc_collapse_triton
-  sha256: eb7fc848cf94c9a8b0f27ef8aac0e77d1a6c5263a9bb398befe92ac2758843c5
+  sha256: 83bc8973a0792cd3c526cdc229b318cdda992f4fa8a1ce51fe71fa514491da02
   signature: '(self, input_ids: torch.Tensor, positions: torch.Tensor, inputs_embeds: torch.Tensor | None = None) -> torch.Tensor'
 
 - id: dsv41-dspark-load-weights
   kind: method
   target: vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.load_weights
   why: the fork drafter wraps it and restores confidence_head, which it drops when one call (the EXL3 loader passes one tensor per call) carries no confidence-head weight
-  sha256: e724e3f03fff261ec0be646e5fd6632e0e56a5a58413f8c24e8115b1dc8642fa
+  sha256: 2996723e1b649d5d0569e123e912d43e393e36a7b385688d2a07a998664a3bd9
   signature: '(self, weights: collections.abc.Iterable[tuple[str, torch.Tensor]]) -> set[str]'
 
 - id: dsv41-moe-init
   kind: method
   target: vllm.models.deepseek_v4.nvidia.model:DeepseekV4MoE.__init__
   why: sm80_moe.adopt_moe needs ffn.gate (GateLinear, FP32 out), gate.e_score_correction_bias, gate.bias_vl, tid2eid None and ffn.experts.router a FusedTopKBiasRouter sharing those bias tensors
-  sha256: 57cb14efc5ff8b969f35dadbd6eb8dcf82d1a4b662a16e41d5bc368a352c89f9
+  sha256: 90b653eeb223b37da75a5ecc6a3ba5bea05530e945c301f5117d3d5576ad4c0d
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''', use_sequence_parallel: bool = False, *, num_hash_layers: int, reduce_results: bool = True, n_routed_experts: int | None = None, n_activated_experts: int | None = None, image_sentinel_lo: int = 129257)'
 
 - id: dsv41-topk-bias-router-init
@@ -1221,19 +1221,19 @@ seams:
   kind: method
   target: vllm.model_executor.layers.fused_moe.router.gate_linear:GateLinear.forward
   why: with every allow_* tier off and an FP32 weight, the fallback casts the BF16 input to FP32 and returns FP32 logits (the reference gate GEMM)
-  sha256: c57ae0e4e67ba40b8a5f4b2205a93520b4b98ded0fa2789ad47ce71c0f96e54b
+  sha256: ba0ba5a74fb55d4ed8e48537a38c464ef63acfe7612c977efd0d98af91e7043f
   signature: '(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.nn.parameter.Parameter | None]'
 
 - id: dsv41-load-dspark-model
   kind: function
   target: vllm.v1.worker.gpu.spec_decode.dspark.utils:load_dspark_model
   why: aliases the target embed_tokens and lm_head into the drafter, whose own are PPMissingLayer placeholders in the fork class
-  sha256: 8ccd8f867b79037bd578c2e2ba942c53dfa5497963e2c6cd43c97bdd0fa05661
+  sha256: 0df5094f15311ebd2341b99fda51058067c03be0b9cda3b54300300264814587
   signature: '(target_model: torch.nn.modules.module.Module, vllm_config: vllm.config.vllm.VllmConfig) -> torch.nn.modules.module.Module'
 
 - id: dsv41-engram-create-embedding
   kind: method
   target: vllm.models.deepseek_v41.common.engram:Engram._create_embedding
   why: the EXL3 construction test replaces it with a parameter-free table; the fork loader expects no engram.embed tensors in the EXL3 directory
-  sha256: ccba8d5057aeaadbf1dc723821056c01ca40c64632850c4e9e25fa5622d926f9
+  sha256: d331ec38811b076c1c742aac125343024fae5ca6ec097bd0811ab8384d4f87ab
   signature: '(self, layout: vllm.models.deepseek_v41.common.engram.EngramLayout, layer_hash_index: int) -> vllm.models.deepseek_v41.common.engram.ParallelEngramEmbedding'
