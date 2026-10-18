@@ -21,7 +21,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | Path | Lines |
 |---|---:|
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_act_quant.py` | 259 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 786 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 821 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_engram_dequant.py` | 112 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 209 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
@@ -30,7 +30,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **10 files** | **4,834** |
+| **10 files** | **4,869** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -38,7 +38,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 
 | Path | Lines |
 |---|---:|
-| `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 710 |
+| `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 713 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 968 |
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
 | `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 308 |
@@ -50,7 +50,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **12 files** | **4,373** |
+| **12 files** | **4,376** |
 
 ### `vllm/sm80/kernels/`
 
@@ -330,7 +330,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,121 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 322 |
-| `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 240 |
+| `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 336 |
 | `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 126 |
 | `tests/models/deepseek_v41/sm80/test_no_host_sync.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 283 |
@@ -411,7 +411,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **165 files** | **83,211** |
+| **165 files** | **83,307** |
 
 #### `tools/`
 
@@ -645,9 +645,9 @@ Functions, methods and classes in fork-added product files whose name occurs now
 
 | Path | Line | Name | Lines | Used by tests |
 |---|---:|---|---:|---|
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 770 | `forward_layer` | 17 | yes |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 803 | `forward_layer` | 19 | yes |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 256 | `engram_telemetry` | 4 | yes |
-| **2 definitions** | | | **21** | |
+| **2 definitions** | | | **23** | |
 
 ## 5. Health numbers
 
@@ -656,11 +656,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 144 |
-| Fork-added product lines | 44,612 |
+| Fork-added product lines | 44,650 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 48,167 |
+| Product lines added (new files and patches) | 48,205 |
 | Fork environment variables (flags) | 91 |
-| Unreferenced fork definitions | 2 (21 lines) |
+| Unreferenced fork definitions | 2 (23 lines) |
