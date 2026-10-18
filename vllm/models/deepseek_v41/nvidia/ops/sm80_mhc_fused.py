@@ -41,9 +41,10 @@ finish, in Triton:
   path's FP32 rounding error at the ulp level, so the FP64 rule's 1.25x
   bound on their maximum would otherwise hang on single ulps;
 - CTA ``(t, 1)``: the streams collapsed with the CARRIED pre-mix (the
-  delayed step: this call's pre is only an output), rounded to BF16, then
-  the RMSNorm with its statistic from that BF16 value and ``weight * x``
-  rounded to BF16, in FP32 as torch does. The two CTAs share nothing.
+  delayed step: this call's pre is only an output), exact in FP64 and
+  rounded to FP32 then BF16 (where the reference rounds its FP32 sum), then
+  the RMSNorm in FP32 as torch does, its statistic from that BF16 value and
+  ``weight * x`` rounded to BF16. The two CTAs share nothing.
 
 The rounding points are the reference's; the arithmetic differs from the
 torch path in summation order, in the projection (split-K tensor core
@@ -110,12 +111,15 @@ def _bf16(v):
 
 @triton.jit
 def _collapse(rc_row, h, hm, w0, w1, w2, w3, HIDDEN: tl.constexpr):
-    """sum_j pre_mix[j] * stream_j over ``h``, rounded to BF16 (as FP32)."""
-    p0 = w0 * tl.load(rc_row + h, mask=hm, other=0.0).to(tl.float32)
-    p1 = w1 * tl.load(rc_row + HIDDEN + h, mask=hm, other=0.0).to(tl.float32)
-    p2 = w2 * tl.load(rc_row + 2 * HIDDEN + h, mask=hm, other=0.0).to(tl.float32)
-    p3 = w3 * tl.load(rc_row + 3 * HIDDEN + h, mask=hm, other=0.0).to(tl.float32)
-    return _bf16(((p0 + p1) + p2) + p3)
+    """sum_j pre_mix[j] * stream_j over ``h``, rounded to BF16 (as FP32). The
+    products (FP32 x BF16) and their sum are exact in FP64; the sum is rounded
+    to FP32 and then to BF16, where the reference rounds its FP32 sum."""
+    f64 = tl.float64
+    p0 = tl.load(rc_row + h, mask=hm, other=0.0).to(f64) * w0
+    p1 = tl.load(rc_row + HIDDEN + h, mask=hm, other=0.0).to(f64) * w1
+    p2 = tl.load(rc_row + 2 * HIDDEN + h, mask=hm, other=0.0).to(f64) * w2
+    p3 = tl.load(rc_row + 3 * HIDDEN + h, mask=hm, other=0.0).to(f64) * w3
+    return _bf16((((p0 + p1) + p2) + p3).to(tl.float32))
 
 
 @triton.jit

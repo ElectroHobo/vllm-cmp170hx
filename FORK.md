@@ -25,13 +25,13 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_engram_dequant.py` | 112 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 209 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 462 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 466 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_sparse_attn.py` | 180 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue.py` | 538 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **11 files** | **5,375** |
+| **11 files** | **5,379** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -670,11 +670,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 146 |
-| Fork-added product lines | 45,578 |
+| Fork-added product lines | 45,582 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,127 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,555 / -244 |
-| Product lines added (new files and patches) | 49,133 |
+| Product lines added (new files and patches) | 49,137 |
 | Fork environment variables (flags) | 95 |
 | Unreferenced fork definitions | 2 (23 lines) |
