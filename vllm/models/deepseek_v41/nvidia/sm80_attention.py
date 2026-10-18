@@ -35,7 +35,9 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -56,6 +58,8 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+
+logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Backends: upstream's metadata builders, plain BF16 rows, compute capability 8
@@ -323,6 +327,15 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         )
         self._sm80_freqs: dict[torch.device, torch.Tensor] = {}
         self._sm80_chunk_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        self._wo_b_bf16_allreduce = bool(envs.VLLM_DSV41_WO_B_BF16_ALLREDUCE)
+        if self._wo_b_bf16_allreduce:
+            logger.info_once(
+                "DeepSeek-V4.1 sm_80: wo_b partials are all-reduced in BF16 "
+                "when the custom all-reduce takes the message, else in FP32 "
+                "rounded once (VLLM_DSV41_WO_B_BF16_ALLREDUCE=1; set 0 to "
+                "all-reduce every wo_b partial in FP32)",
+                scope="global",
+            )
 
     # -- pieces -------------------------------------------------------------
 
@@ -533,7 +546,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         """``wo_a`` per group (the reference's einsum over its block-diagonal
         weight) on the already inverse-RoPE'd, FP8-qdq'd output, then
         ``wo_b``; with TP the ``wo_b`` partials are summed in fp32 and rounded
-        once, as the reference's RowParallelLinear does."""
+        once, as the reference's RowParallelLinear does (in BF16 by a kernel
+        that does exactly that, with VLLM_DSV41_WO_B_BF16_ALLREDUCE; see
+        :func:`wo_b_all_reduce`)."""
         T = attn_out.shape[0]
         o = attn_out.view(T, self.n_local_groups, -1)
         wo_a = self.wo_a
@@ -547,8 +562,59 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         if self.gemm_rs is not None or not wo_b.reduce_results or wo_b.tp_size == 1:
             return self._wo_b_proj(z)
         partial = wo_b.quant_method.apply(wo_b, z, None)
-        return tensor_model_parallel_all_reduce(partial.float()).to(z.dtype)
+        return wo_b_all_reduce(partial, self._wo_b_bf16_allreduce)
 
+
+# Backends the communicator tries before the custom all-reduce. When one is
+# enabled the custom all-reduce's own predicate no longer says which kernel
+# reduces a message, so the BF16 switch stays inert.
+_PREEMPTING_BACKENDS = (
+    "fi_ar_comm",
+    "qr_comm",
+    "fi_pcie_ipc_ar_comm",
+    "aiter_ar_comm",
+)
+
+
+def _preempting_backends(comm: Any) -> list[str]:
+    from vllm.distributed.device_communicators.pynccl_allocator import (
+        is_symmetric_memory_enabled,
+    )
+
+    names = [
+        name
+        for name in _PREEMPTING_BACKENDS
+        if getattr(comm, name, None) is not None
+        and not getattr(getattr(comm, name), "disabled", False)
+    ]
+    pynccl = getattr(comm, "pynccl_comm", None)
+    if pynccl is not None and is_symmetric_memory_enabled():
+        names.append("nccl_symm_mem")
+    return names
+
+
+def custom_all_reduce_takes(t: torch.Tensor) -> bool:
+    """Whether the TP group's custom all-reduce reduces ``t``: the host-staged
+    path (dispatched first by the fork communicator) does not take it, no
+    backend dispatched before the custom all-reduce is enabled, and the
+    custom all-reduce's own ``should_custom_ar`` accepts it."""
+    comm = get_tp_group().device_communicator
+    host = getattr(comm, "hostshm_comm", None)
+    if host is not None and host.should_host_ar(t):
+        return False
+    ca = getattr(comm, "ca_comm", None)
+    if ca is None or ca.disabled or _preempting_backends(comm):
+        return False
+    return bool(ca.should_custom_ar(t))
+
+
+def wo_b_all_reduce(partial: torch.Tensor, bf16_when_custom: bool) -> torch.Tensor:
+    """Sum the ``wo_b`` partials of the TP ranks, rounding once to BF16: in
+    FP32, or with ``bf16_when_custom`` as BF16 when the custom all-reduce
+    (FP32 accumulation in a fixed order, one rounding) takes the message."""
+    if bf16_when_custom and custom_all_reduce_takes(partial):
+        return tensor_model_parallel_all_reduce(partial)
+    return tensor_model_parallel_all_reduce(partial.float()).to(partial.dtype)
 
 def _first(linear: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
     """Call a ``(output, bias)``-returning linear for its output."""

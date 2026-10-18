@@ -182,6 +182,7 @@ def test_o_proj_grouped_wo_a_and_fp32_reduce(monkeypatch) -> None:
     layer = _bare_layer(
         n_local_groups=G, o_lora_rank=R, gemm_rs=None,
         wo_a=_Linear(wo_a), wo_b=_Linear(wo_b, tp_size=4),
+        _wo_b_bf16_allreduce=False,
     )
     got = layer._o_proj(attn_out, torch.arange(T))
     want = (torch.nn.functional.linear(z, wo_b).float() * 3).to(BF16)
@@ -222,3 +223,58 @@ def test_dspark_context_kv_hook_dispatch() -> None:
     wrapped = sm80.sm80_dspark_context_kv(lambda *a: hits.append(a))
     wrapped(other, x, pos, None)
     assert len(hits) == 1 and upstream is not None
+
+
+class _FakeComm:
+    """A TP communicator whose custom all-reduce accepts what ``takes`` says."""
+
+    def __init__(self, takes: bool, host_takes: bool = False, preempt=None):
+        self.ca_comm = SimpleNamespace(
+            disabled=False, should_custom_ar=lambda t: takes
+        )
+        self.hostshm_comm = SimpleNamespace(should_host_ar=lambda t: host_takes)
+        self.pynccl_comm = None
+        self.fi_ar_comm = preempt
+
+
+@pytest.mark.parametrize(
+    "switch,comm,bf16_message",
+    [
+        (False, _FakeComm(True), False),
+        (True, _FakeComm(True), True),
+        (True, _FakeComm(False), False),
+        (True, _FakeComm(True, host_takes=True), False),
+        (True, _FakeComm(True, preempt=SimpleNamespace(disabled=False)), False),
+        (True, _FakeComm(True, preempt=SimpleNamespace(disabled=True)), True),
+    ],
+)
+def test_wo_b_bf16_allreduce_switch(monkeypatch, switch, comm, bf16_message) -> None:
+    """VLLM_DSV41_WO_B_BF16_ALLREDUCE sends the BF16 partial to the all-reduce
+    only when the custom all-reduce's own predicate takes it; otherwise, and
+    with the switch off, today's FP32 sum rounded once."""
+    seen = []
+
+    def all_reduce(t):
+        seen.append(t.dtype)
+        return t * 3
+
+    monkeypatch.setattr(sm80, "tensor_model_parallel_all_reduce", all_reduce)
+    monkeypatch.setattr(
+        sm80, "get_tp_group", lambda: SimpleNamespace(device_communicator=comm)
+    )
+    g = torch.Generator().manual_seed(2)
+    partial = torch.randn(5, 64, generator=g).to(BF16)
+    got = sm80.wo_b_all_reduce(partial, switch)
+    assert seen == [BF16 if bf16_message else torch.float32]
+    assert got.dtype == BF16
+    if not bf16_message:
+        assert torch.equal(got, (partial.float() * 3).to(BF16))
+
+
+def test_wo_b_bf16_allreduce_default_off(monkeypatch) -> None:
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_DSV41_WO_B_BF16_ALLREDUCE", raising=False)
+    assert envs.VLLM_DSV41_WO_B_BF16_ALLREDUCE is False
+    monkeypatch.setenv("VLLM_DSV41_WO_B_BF16_ALLREDUCE", "1")
+    assert envs.VLLM_DSV41_WO_B_BF16_ALLREDUCE is True
