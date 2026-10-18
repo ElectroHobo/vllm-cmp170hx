@@ -456,7 +456,8 @@ def embedding(n: int) -> torch.Tensor:
         emb = M.ParallelEmbedding(_config()["vocab_size"], _config()["dim"])
     load_official(emb, "embed.")
     with torch.inference_mode():
-        return emb(prompt_ids(n)[None])[0]
+        out = emb(prompt_ids(n)[None])[0]
+    return out.clone()  # an ordinary tensor: callers use it outside inference mode
 
 
 def stream(layer: int, n: int) -> torch.Tensor:
@@ -665,7 +666,9 @@ def test_rope_rotate(ratio, inverse, record_property):
 
 def _single_request(positions: torch.Tensor, ratio: int) -> core.Sm80AttnBatch:
     """One request at ``positions``: closed group j at compressed slot j, a
-    ratio-2 state ring of 8 rows at slot ``position % 8``."""
+    ratio-2 state ring of 8 rows in ring block 1 (slot ``8 + position % 8``):
+    block 0 is the null block, which the port's masked writes target and no
+    request owns."""
     T = positions.shape[0]
     return core.Sm80AttnBatch(
         positions=positions,
@@ -674,7 +677,7 @@ def _single_request(positions: torch.Tensor, ratio: int) -> core.Sm80AttnBatch:
         swa_slots=torch.full((T,), -1, dtype=torch.int64),
         swa_indices=torch.empty(T, 0, dtype=torch.int32),
         comp_slots=torch.where((positions + 1) % ratio == 0, positions // ratio, -1),
-        ring_slots=positions % 8 if ratio == 2 else None,
+        ring_slots=8 + positions % 8 if ratio == 2 else None,
     )
 
 
@@ -694,7 +697,7 @@ def test_compressor(layer, prefill, decode, record_property):
     ratio = comp.compress_ratio
     steps = [(0, prefill)] + [(prefill + i, 1) for i in range(decode)]
     theirs, exact, ours = [], [], []
-    ring = torch.zeros(1, 8, 2 * comp.head_dim)
+    ring = torch.zeros(2, 8, 2 * comp.head_dim)
     cfg = types.SimpleNamespace(compress_ratio=ratio, head_dim=comp.head_dim, eps=comp.norm.eps)
     with torch.inference_mode():
         for start, length in steps:
@@ -924,7 +927,8 @@ def test_engram_layout(record_property):
 def _official_hashes(n: int) -> torch.Tensor:
     _, state = _official_hash_state(n)
     with torch.inference_mode():
-        return state(prompt_ids(n)[None], 0)[0]  # [n, layers, cols]
+        out = state(prompt_ids(n)[None], 0)[0]  # [n, layers, cols]
+    return out.clone()
 
 
 def test_engram_hash_ids(record_property):
@@ -986,8 +990,9 @@ def test_engram_dequant(record_property):
 
     n = 512
     _, inv, values, scales = _engram_rows(0, n)
+    table = _small_engram_embedding(values, scales)
     with torch.inference_mode():
-        theirs = _small_engram_embedding(values, scales)(inv)  # [n, cols, head_dim]
+        theirs = table(inv)  # [n, cols, head_dim]
     v8 = values.view(torch.uint8)[inv.flatten()]
     s8 = scales.view(torch.uint8)[inv.flatten()]
     check_exact("engram.dequant", dequant_engram_rows_reference(v8, s8).view(theirs.shape), theirs,
@@ -1315,15 +1320,17 @@ def test_attention_layer(layer, prefill, decode, record_property):
 # ---------------------------------------------------------------------------
 
 
-def test_dspark_heads(record_property):
+def test_dspark_heads(record_property, monkeypatch):
     """``DSparkMarkovHead.forward`` (the previous token's rank-256 embedding
     and its vocab bias) and ``DSparkConfidenceHead.forward`` against the
     port's DSpark Markov and confidence heads, built in the model dtype, with
-    the same weights and inputs."""
+    the same weights and inputs, on one rank (no process group)."""
+    from tests.models.deepseek_v41.sm80.construct import set_groups
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead, DSparkMarkovHead
     from vllm.utils.torch_utils import set_default_torch_dtype
 
+    set_groups(monkeypatch, 1, 0)
     args = model_args(64)
     stage = f"mtp.{args.n_mtp_layers - 1}."
     rank, vocab = args.dspark_markov_rank, args.vocab_size
@@ -1343,7 +1350,9 @@ def test_dspark_heads(record_property):
             bias_64, _ = m64(tokens)
             conf_64 = c64(hidden.double(), emb_t.double())
 
-    with set_default_torch_dtype(BF16):
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    with set_default_torch_dtype(BF16), set_current_vllm_config(VllmConfig()):
         port_markov = DSparkMarkovHead(vocab, vocab, rank, prefix="markov_head")
         port_conf = DSparkConfidenceHead(args.dim + rank, prefix="confidence_head")
         processor = LogitsProcessor(vocab)
@@ -1359,5 +1368,5 @@ def test_dspark_heads(record_property):
     record_property("dspark.markov_embed.equal", embed_equal)
     record_property("dspark.markov_bias.port_dtype", str(bias_o.dtype))
     assert embed_equal, "the Markov embeddings differ"
-    check_fp64("dspark.markov_bias", bias_o, bias_t, bias_64, record_property)
     check_fp64("dspark.confidence", conf_o, conf_t, conf_64, record_property)
+    check_fp64("dspark.markov_bias", bias_o, bias_t, bias_64, record_property)
