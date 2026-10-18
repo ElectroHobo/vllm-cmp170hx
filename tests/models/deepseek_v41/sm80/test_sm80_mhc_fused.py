@@ -10,7 +10,7 @@
   (``fp64_cases.mhc_delayed_fp64``) within the V2 bounds of the torch
   formulas (``ops/sm80_mhc.py``) on the same inputs, at a hidden size that
   is not a multiple of the collapse chunk.
-- The torch finish (kernel A only, ``VLLM_DSV41_FUSED_MHC_FINISH`` off) on
+- The torch finish (kernel A only, ``VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH`` off) on
   the same stand-in, in process, within the same bounds.
 - The FP64 reference against the torch formulas at FP32 accuracy.
 - ``mhc_ops``: the switch picks the module the layers call, refuses shapes
@@ -228,16 +228,16 @@ def test_mhc_ops_switch(monkeypatch):
     from vllm.models.deepseek_v41.nvidia import sm80_model
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
 
-    monkeypatch.delenv("VLLM_DSV41_FUSED_MHC", raising=False)
-    monkeypatch.delenv("VLLM_DSV41_FUSED_MHC_FINISH", raising=False)
-    assert envs.VLLM_DSV41_FUSED_MHC is False and envs.VLLM_DSV41_FUSED_MHC_FINISH is False
+    monkeypatch.delenv("VLLM_DEEPSEEK_V41_FUSED_MHC", raising=False)
+    monkeypatch.delenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", raising=False)
+    assert envs.VLLM_DEEPSEEK_V41_FUSED_MHC is False and envs.VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH is False
     cfg = SimpleNamespace(hc_mult=4, hidden_size=5120)
     assert sm80_model.mhc_ops(cfg) is sm80_mhc
-    monkeypatch.setenv("VLLM_DSV41_FUSED_MHC", "1")
+    monkeypatch.setenv("VLLM_DEEPSEEK_V41_FUSED_MHC", "1")
     assert sm80_model.mhc_ops(cfg) is sm80_mhc_fused
     for bad in (SimpleNamespace(hc_mult=2, hidden_size=5120),
                 SimpleNamespace(hc_mult=4, hidden_size=5100)):
-        with pytest.raises(ValueError, match="VLLM_DSV41_FUSED_MHC"):
+        with pytest.raises(ValueError, match="VLLM_DEEPSEEK_V41_FUSED_MHC"):
             sm80_model.mhc_ops(bad)
     # both modules carry every op the layers call
     for mod in (sm80_mhc, sm80_mhc_fused):

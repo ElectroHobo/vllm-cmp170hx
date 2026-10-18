@@ -16,9 +16,9 @@ What changes on sm_80:
 - mHC runs in the reference's FP32 formulas (``ops/sm80_mhc.py``) instead of
   the TileLang/DeepGEMM kernels: the decoder layers' forward, the backbone's
   final post and the DSpark drafter's forward call them. With
-  ``VLLM_DSV41_FUSED_MHC`` the decoder layers' delayed pre and fused post +
+  ``VLLM_DEEPSEEK_V41_FUSED_MHC`` the decoder layers' delayed pre and fused post +
   pre run through the sm_80 mHC kernel A instead, with the finish in torch or,
-  with ``VLLM_DSV41_FUSED_MHC_FINISH``, as a second kernel
+  with ``VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH``, as a second kernel
   (``ops/sm80_mhc_fused.py``, same contracts and rounding points; :func:`mhc_ops`);
 - each MoE keeps the upstream modules and EXL3 experts, with an FP32 gate and
   the reference routing (``sm80_moe.adopt_moe``);
@@ -59,20 +59,20 @@ logger = init_logger(__name__)
 def mhc_ops(config):
     """The module whose delayed mHC ops (``mhc_pre_delayed``,
     ``mhc_fused_post_pre_delayed``, ``mhc_post``) the decoder layers call:
-    ``ops/sm80_mhc_fused.py`` with ``VLLM_DSV41_FUSED_MHC``, else the
+    ``ops/sm80_mhc_fused.py`` with ``VLLM_DEEPSEEK_V41_FUSED_MHC``, else the
     reference's torch formulas ``ops/sm80_mhc.py``. The layers look each op
     up on the module at every call."""
-    if not envs.VLLM_DSV41_FUSED_MHC:
+    if not envs.VLLM_DEEPSEEK_V41_FUSED_MHC:
         return sm80_mhc
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
 
     reason = sm80_mhc_fused.supports(config.hc_mult, config.hidden_size)
     if reason is not None:
-        raise ValueError(f"VLLM_DSV41_FUSED_MHC: {reason}")
+        raise ValueError(f"VLLM_DEEPSEEK_V41_FUSED_MHC: {reason}")
     logger.info_once(
         "DeepSeek-V4.1 sm_80: the decoder layers' delayed mHC runs through the "
-        "sm_80 mHC kernel A (VLLM_DSV41_FUSED_MHC=1), finish %s",
-        "kernel (VLLM_DSV41_FUSED_MHC_FINISH=1)" if sm80_mhc_fused.FINISH_KERNEL
+        "sm_80 mHC kernel A (VLLM_DEEPSEEK_V41_FUSED_MHC=1), finish %s",
+        "kernel (VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH=1)" if sm80_mhc_fused.FINISH_KERNEL
         else "in torch",
         scope="global",
     )

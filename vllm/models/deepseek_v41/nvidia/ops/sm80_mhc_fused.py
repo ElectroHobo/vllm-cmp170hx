@@ -4,9 +4,9 @@
 
 The same contracts, arguments and BF16 rounding points as ``ops/sm80_mhc.py``
 (the reference's FP32 formulas in torch, about 155 kernels per call, 134 of
-them the Sinkhorn loop), selected with ``VLLM_DSV41_FUSED_MHC`` in
+them the Sinkhorn loop), selected with ``VLLM_DEEPSEEK_V41_FUSED_MHC`` in
 ``sm80_model.py``. Kernel A (below) always runs; the finish after it is the
-Triton kernel B with ``VLLM_DSV41_FUSED_MHC_FINISH`` (two kernels per call),
+Triton kernel B with ``VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH`` (two kernels per call),
 else the reference's torch formulas on kernel A's partials
 (:func:`_torch_finish`: ``hc_split_sinkhorn`` in FP64 on the partials summed
 in a fixed FP64 order, then ``hc_collapse`` and ``rms_norm`` of
@@ -73,9 +73,9 @@ __all__ = ["mhc_fused_post_pre_delayed", "mhc_post", "mhc_pre_delayed", "support
 
 HC = 4
 NOUT = (2 + HC) * HC
-# Kernel B for the finish (VLLM_DSV41_FUSED_MHC_FINISH), read once per
+# Kernel B for the finish (VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH), read once per
 # process; the tests set it directly.
-FINISH_KERNEL = bool(envs.VLLM_DSV41_FUSED_MHC_FINISH)
+FINISH_KERNEL = bool(envs.VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH)
 # Hidden chunk of the collapse CTA (two passes over the streams: the norm's
 # statistic, then the scaled output).
 _BH = 1024

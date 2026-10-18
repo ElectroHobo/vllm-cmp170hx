@@ -36,7 +36,7 @@ eps 1e-6, RMS eps 1e-20).
 
 - Bitwise run-to-run determinism, CUDA graph replay equal to eager.
 - Kernels per call: two (three with ``capture_aux``) with the finish kernel;
-  with the torch finish (``VLLM_DSV41_FUSED_MHC`` alone: the reference arm the
+  with the torch finish (``VLLM_DEEPSEEK_V41_FUSED_MHC`` alone: the reference arm the
   finish kernel is measured against, not a speed path) a fixed count,
   TORCH_FINISH_KERNELS. Until the second GPU run this asserted fewer kernels
   than the torch formulas; the FP64 torch finish launches more (177 against
@@ -78,7 +78,7 @@ def _outputs(variant: str) -> list[str]:
 @pytest.fixture(params=[False, True], ids=["finish_torch", "finish_kernel"])
 def fused(request, monkeypatch):
     """The fused module with its finish in torch (kernel A only) or as kernel
-    B (``VLLM_DSV41_FUSED_MHC_FINISH``)."""
+    B (``VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH``)."""
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
 
     monkeypatch.setattr(sm80_mhc_fused, "FINISH_KERNEL", request.param)
