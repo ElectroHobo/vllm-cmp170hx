@@ -6,17 +6,20 @@
 
 Run from the tree root on one CUDA card (it refuses to run without CUDA).
 
-Cases: a JSON object with schema ``served_cases/1`` (an export of captured
-calls) or ``generated_cases/1``; each case has an ``id`` and
-``captured_sources``, the files of the calls it pools. A source is a
-``torch.save`` dict, read with ``weights_only=True``:
+Cases: a JSON object with schema ``served_cases/1`` (the export of captured
+calls) or ``generated_cases/1``. Each case has an ``id``, a ``family`` and
+``captured_sources``, the files of the calls it pools; the file's top-level
+``checkpoint`` ({role: directory} of the served launch) names the weights
+the EXL3 MoE families replay. A source is a ``torch.save`` dict
+(``lab-point-capture/1``), read with ``weights_only=True``:
 
-    {"family": <family>, "meta": {...}, "tensors": {argument: value}}
+    {"schema": "lab-point-capture/1", "family": <family>, "meta": {...},
+     "tensors": {argument: value}}
 
-``tensors`` holds the arguments of one call of the family's capture point by
-parameter name (tensors, numbers, strings, lists of strings). Paged buffers
-may be compacted to the rows the call reads, with their slot or block-table
-values renumbered: every family below reads them only through those values.
+``tensors`` holds the arguments of one call of the family's capture point
+(below) by parameter name, as the call received them (defaults applied,
+buffers the call writes as they were before it). ``meta.module_prefix`` is
+the vLLM prefix of the module that made the call.
 
 Output: a first line ``{"header": {torch, triton, cuda, gpu, sm_count}}``,
 then one line per case, pooled over its sources:
@@ -36,46 +39,52 @@ the reference path's, exact where the reference path is exact.
 last request for the compressor; for moe_out_prefill, which takes no fewer
 than MOE_PREFILL_MIN_ROWS rows, the first and last calls of that size) give
 the same bits run alone as in the whole call. ``numel``: output elements.
-A case whose sources cannot be run gets no line; the reason goes to stderr.
+A case whose sources cannot be run gets no line and its reason goes to
+stderr; the driver then exits 1 once every other case is written, so the
+run is refused as a whole and no planned case goes unjudged.
 
-Families: capture point (arguments) -> candidate / reference path / FP64.
+Families: capture point (recorded arguments) -> candidate / reference path /
+FP64. Module paths below are under ``vllm.models.deepseek_v41.nvidia.ops``
+unless named in full.
 
-- ``sparse_attention``: ``sm80_attn_core.sparse_attention`` (q, swa_cache,
+- ``sparse_attention``: ``sm80_attn_core:sparse_attention`` (q, swa_cache,
   swa_indices, comp_cache, comp_block_table, comp_local, req, sink, scale)
   -> the Triton kernel / the reference ``sparse_attn`` arithmetic
   (``ref_sparse_attn``) over the same rows / sink attention in FP64.
-- ``index_scores``: ``sm80_attn_core.index_scores`` (q, w, n_vis, req, idxk,
-  block_table, n_cols, heads_per_rank) -> the Triton kernel /
+- ``index_scores``: ``sm80_attn_core:index_scores`` (q, w, n_vis, req,
+  idxk, block_table, n_cols, heads_per_rank) -> the Triton kernel /
   ``index_scores_torch`` / ReLU'd per-head dot products times the head
   weights, summed over every head in FP64 (invisible columns are -inf).
-- ``qdq_fp8``: ``sm80_attn_core.qdq_fp8`` (x, block) -> Triton /
+- ``qdq_fp8``: ``sm80_attn_core:qdq_fp8`` (x, block) -> Triton /
   ``act_quant_qdq_fp8`` on CPU / the independent definition
   ``test_act_quant.ref_fp8``. Exact: both errors are zero.
-- ``qdq_fp4``: ``sm80_attn_core.qdq_fp4`` (x, block, scale) -> Triton /
+- ``qdq_fp4``: ``sm80_attn_core:qdq_fp4`` (x, block, scale) -> Triton /
   ``fp4_qdq`` on CPU / ``test_act_quant.ref_fp4``. Exact.
-- ``compress``: ``sm80_attn_core.compress``; tensors kv_score, norm_weight,
-  ring (as before the call; absent at ratio 1), positions, token_to_req,
-  query_start_loc, comp_slots, ring_slots (absent at ratio 1); numbers
-  compress_ratio, head_dim, eps -> torch on CUDA / the same on CPU /
+- ``compress``: ``sm80_attn_core:compress_rows`` (kv_score, norm_weight,
+  ring, positions, token_to_req, query_start_loc, comp_slots, ring_slots,
+  compress_ratio, head_dim, eps) -> torch on CUDA / the same on CPU /
   softmax pooling and RMS norm in FP64. Both must close the same groups.
-- ``index_keys``: ``sm80_attn_core.index_keys``; tensors wk_out (the
-  ``weights.wk(latent)`` the path starts from), k_norm, freqs, group_pos;
-  number eps -> CUDA (torch norm and RoPE, Triton FP4) / CPU / RMS norm and
-  RoPE in FP64, then FP4 by ``test_act_quant.ref_fp4``.
-- ``engram_dequant``: ``sm80_engram_dequant.dequant_engram_rows`` (values,
+- ``index_keys``: ``sm80_attn_core:index_key_rows`` (k, k_norm, freqs,
+  group_pos, eps) -> CUDA (torch norm and RoPE, Triton FP4) / CPU / RMS
+  norm and RoPE in FP64, then FP4 by ``test_act_quant.ref_fp4``.
+- ``engram_dequant``: ``sm80_engram_dequant:dequant_engram_rows`` (values,
   scales) -> Triton / ``dequant_engram_rows_reference`` on CPU / the E4M3 x
   E8M0 product in FP64. Exact: bitwise.
-- ``exl3_moe``: ``Exl3Experts.apply``; tensors x, topk_ids, topk_weights,
-  expert_map, packed_meta; numbers intermediate_size, swiglu_limit; strings
-  operator (the one the dispatch chose: moe_out, moe_out_v2 or
-  moe_out_prefill), checkpoint (the EXL3 checkpoint directory) and matrices
-  (per local expert its gate, up and down matrix names) -> the operator /
-  moe_out / the routed experts in FP64 from the decoded checkpoint weights
-  (``exl3_real_cases.moe_fp64`` with the SwiGLU clamp). moe_out_v2 runs at the
-  layer's one routed bits_x2, read from packed_meta.
+- ``exl3_moe_out``, ``exl3_moe_out_v2``, ``exl3_moe_out_prefill``:
+  ``vllm.sm80.kernels.exl3.ops:moe_out`` / ``moe_out_v2`` /
+  ``moe_out_prefill`` (x, topk_ids, topk_weights, packed_meta, expert_map,
+  intermediate_size, swiglu_limit) -> that operator / ``moe_out`` / the
+  routed experts in FP64 (``exl3_real_cases.moe_fp64`` with the SwiGLU
+  clamp). The local experts are read from the ``target`` checkpoint by the
+  layer's expert matrix names (the model's EXL3 layout applied to
+  ``meta.module_prefix`` and the expert map); their layout must equal the
+  recorded ``packed_meta``. moe_out_v2 also records ``bits_x2``, the layer's
+  one routed bit width, which must be the one in ``packed_meta``.
+  ``moe_out`` is its own reference path.
 """
 
 import argparse
+import functools
 import json
 import math
 import sys
@@ -87,6 +96,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[4]
 SCHEMAS = ("served_cases/1", "generated_cases/1")
+SOURCE_SCHEMA = "lab-point-capture/1"
 # Bound of the intermediate tensors of one FP64 or reference chunk.
 CHUNK_BYTES = 1 << 30
 CPU = torch.device("cpu")
@@ -102,6 +112,15 @@ class Call:
     ref: torch.Tensor
     exact: torch.Tensor
     row_invariant: bool
+
+
+@dataclass
+class Source:
+    """What a family reads besides the arguments: the call's metadata and
+    the served launch's checkpoints ({role: directory})."""
+
+    meta: dict
+    checkpoint: dict
 
 
 def picks(n: int) -> list[int]:
@@ -139,7 +158,7 @@ def _to(value, device):
 # ---------------------------------------------------------------- attention
 
 
-def sparse_attention(a: dict, device: torch.device) -> Call:
+def sparse_attention(a: dict, device: torch.device, _src: Source) -> Call:
     from tests.models.deepseek_v41.sm80.dsv41_ref import ref_sparse_attn
     from tests.models.deepseek_v41.sm80.test_sm80_kernels_gpu import (
         _fp64_attention,
@@ -192,7 +211,7 @@ def sparse_attention(a: dict, device: torch.device) -> Call:
     return Call(whole, torch.cat(refs), torch.cat(exacts), alone)
 
 
-def index_scores(a: dict, device: torch.device) -> Call:
+def index_scores(a: dict, device: torch.device, _src: Source) -> Call:
     from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
 
     q, w, n_vis, req, idxk, table = (
@@ -261,11 +280,11 @@ def _qdq(a: dict, device: torch.device, fp4: bool) -> Call:
     return Call(whole, ref, exact.double(), alone)
 
 
-def qdq_fp8(a: dict, device: torch.device) -> Call:
+def qdq_fp8(a: dict, device: torch.device, _src: Source) -> Call:
     return _qdq(a, device, fp4=False)
 
 
-def qdq_fp4(a: dict, device: torch.device) -> Call:
+def qdq_fp4(a: dict, device: torch.device, _src: Source) -> Call:
     return _qdq(a, device, fp4=True)
 
 
@@ -273,6 +292,8 @@ def qdq_fp4(a: dict, device: torch.device) -> Call:
 
 
 def _compress_run(a: dict, device: torch.device, tokens: slice):
+    """``compress_rows`` on the recorded arguments, for all tokens or for the
+    tokens of one request run alone (as its own one-request call)."""
     from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
 
     def get(name):
@@ -284,29 +305,17 @@ def _compress_run(a: dict, device: torch.device, tokens: slice):
     if tokens == slice(None):
         req, qsl = a["token_to_req"].to(device), qsl.to(device)
     else:
-        req = torch.zeros_like(pos)
+        req = torch.zeros_like(a["token_to_req"][tokens]).to(device)
         qsl = torch.tensor([0, pos.shape[0]], dtype=qsl.dtype, device=device)
-    batch = core.Sm80AttnBatch(
-        positions=pos,
-        token_to_req=req,
-        query_start_loc=qsl,
-        swa_slots=torch.full_like(pos, -1),
-        swa_indices=pos.new_empty((pos.shape[0], 0)),
-        comp_slots=get("comp_slots"),
-        ring_slots=get("ring_slots"),
-    )
-    cfg = SimpleNamespace(
-        compress_ratio=int(a["compress_ratio"]),
-        head_dim=int(a["head_dim"]),
-        eps=float(a["eps"]),
-    )
     ring = a.get("ring")
-    # compress writes the ring's tail: every run starts from the captured ring.
+    # compress_rows writes the ring's tail: every run starts from the recorded ring.
     ring = None if ring is None else ring.to(device, copy=True)
-    closes, latent = core.compress(
-        cfg, batch, get("kv_score"), a["norm_weight"].to(device), ring
+    closes, latent = core.compress_rows(
+        get("kv_score"), a["norm_weight"].to(device), ring, pos, req, qsl,
+        get("comp_slots"), get("ring_slots"), int(a["compress_ratio"]),
+        int(a["head_dim"]), float(a["eps"]),
     )
-    # compress returns every token; the closing ones are the latents stored.
+    # compress_rows returns every token; the closing ones are the latents stored.
     rows = torch.nonzero(closes).flatten()
     return rows, latent[rows]
 
@@ -338,7 +347,7 @@ def _compress_fp64(a: dict, rows: torch.Tensor) -> torch.Tensor:
     return x * a["norm_weight"].double()
 
 
-def compress(a: dict, device: torch.device) -> Call:
+def compress(a: dict, device: torch.device, _src: Source) -> Call:
     rows, whole = _compress_run(a, device, slice(None))
     ref_rows, ref = _compress_run(a, CPU, slice(None))
     if not torch.equal(rows.cpu(), ref_rows):
@@ -354,7 +363,7 @@ def compress(a: dict, device: torch.device) -> Call:
     return Call(whole, ref, _compress_fp64(a, ref_rows), alone)
 
 
-def index_keys(a: dict, device: torch.device) -> Call:
+def index_keys(a: dict, device: torch.device, _src: Source) -> Call:
     from tests.models.deepseek_v41.sm80.test_act_quant import ref_fp4
     from tests.models.deepseek_v41.sm80.test_sm80_kernels_gpu import (
         _inverse_rope_fp64,
@@ -364,22 +373,19 @@ def index_keys(a: dict, device: torch.device) -> Call:
     eps = float(a["eps"])
 
     def run(dev, rows):
-        k = a["wk_out"][rows].to(dev)
-        weights = SimpleNamespace(
-            wk=lambda _latent: k, k_norm=a["k_norm"].to(dev), freqs=a["freqs"].to(dev)
-        )
-        return core.index_keys(
-            SimpleNamespace(eps=eps), weights, k, a["group_pos"][rows].to(dev)
+        return core.index_key_rows(
+            a["k"][rows].to(dev), a["k_norm"].to(dev), a["freqs"].to(dev),
+            a["group_pos"][rows].to(dev), eps,
         )
 
     whole = run(device, slice(None))
-    x = a["wk_out"].double()
+    x = a["k"].double()
     x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * a["k_norm"].double()
     # Forward RoPE with the layer's fp32 angles: the inverse rotation by the
     # negated frequencies (the sign of every fp32 angle flips exactly).
     x = _inverse_rope_fp64(x[:, None, :], a["group_pos"], -a["freqs"])[:, 0]
     exact = ref_fp4(x.float(), 32, "e8m0").double()
-    n = a["wk_out"].shape[0]
+    n = a["k"].shape[0]
     alone = all(bits_equal(whole[i : i + 1], run(device, slice(i, i + 1))) for i in picks(n))
     return Call(whole, run(CPU, slice(None)), exact, alone)
 
@@ -387,7 +393,7 @@ def index_keys(a: dict, device: torch.device) -> Call:
 # ---------------------------------------------------------------- Engram
 
 
-def engram_dequant(a: dict, device: torch.device) -> Call:
+def engram_dequant(a: dict, device: torch.device, _src: Source) -> Call:
     from vllm.models.deepseek_v41.nvidia.ops.sm80_engram_dequant import (
         ENGRAM_QUANT_BLOCK,
         dequant_engram_rows,
@@ -421,17 +427,34 @@ _WORKSPACE = {
 }
 
 
-def expert_set(checkpoint: str, matrices, packed_meta: torch.Tensor, device):
-    """The local experts as Exl3MoEMethod lays them out, read from the
-    checkpoint: (per projection (trellis, suh, svh), pointer table, meta).
-    The meta must be the captured ``packed_meta``."""
+def expert_set(checkpoint: str, module_prefix: str, expert_map, packed_meta, device):
+    """The layer's local experts as Exl3MoEMethod lays them out, read from
+    the checkpoint: (per projection (trellis, suh, svh), pointer table,
+    meta). Local expert l is the global g with ``expert_map[g] == l``; its
+    matrices are the model layout's expert matrices of ``module_prefix``.
+    The meta must be the recorded ``packed_meta``."""
     from tests.kernels.quantization import exl3_real_cases as real
+    from vllm.models.deepseek_v41.nvidia.sm80_exl3 import DeepseekV41Exl3Layout
 
+    config = json.loads((Path(checkpoint) / "config.json").read_text())
+    text = SimpleNamespace(**config.get("text_config", config))
+    layout = DeepseekV41Exl3Layout(SimpleNamespace(text_config=text))
+    resolver = SimpleNamespace()
+    resolver.source_prefix = lambda prefix: layout.source_prefix(resolver, prefix)
+    owner = {}
+    for g, local in enumerate(expert_map.tolist()):
+        if local >= 0:
+            if local in owner:
+                raise ValueError("the expert map assigns a local expert twice")
+            owner[local] = g
+    if sorted(owner) != list(range(packed_meta.shape[0])):
+        raise ValueError("the expert map does not cover the local experts")
     ckpt = real.Checkpoint(Path(checkpoint))
     weights, pointers, meta = [], [], []
-    for names in matrices:
+    for local in range(packed_meta.shape[0]):
         ptrs, rows = [], []
-        for name in names:
+        for role in ("gate_proj", "up_proj", "down_proj"):
+            name = layout.expert_matrix(resolver, module_prefix, owner[local], role)
             matrix = ckpt.matrix(name)
             parts = [t.to(device) for t in ckpt.whole(name)]
             weights.append(parts)
@@ -443,7 +466,7 @@ def expert_set(checkpoint: str, matrices, packed_meta: torch.Tensor, device):
         meta.append(rows)
     meta = torch.tensor(meta, dtype=torch.int64)
     if not torch.equal(meta, packed_meta.cpu()):
-        raise ValueError("the checkpoint's expert layout differs from the captured one")
+        raise ValueError("the checkpoint's expert layout differs from the recorded one")
     pointers = torch.tensor(pointers, dtype=torch.int64, device=device)
     return weights, pointers, meta.to(device)
 
@@ -463,21 +486,29 @@ def moe_exact(x, ids, weights_t, expert_map, weights, meta, intermediate, limit)
     return real.moe_fp64(calls, expert_map, decode, intermediate, limit)[0]
 
 
-def exl3_moe(a: dict, device: torch.device) -> Call:
+def _exl3_moe(name: str, a: dict, device: torch.device, src: Source) -> Call:
     from vllm.sm80.kernels.exl3 import ops
 
-    name = a["operator"]
-    if name not in _WORKSPACE:
-        raise ValueError(f"operator {name!r} is not one of {sorted(_WORKSPACE)}")
+    checkpoint = src.checkpoint.get("target")
+    prefix = src.meta.get("module_prefix")
+    if not checkpoint or not prefix:
+        raise ValueError("an EXL3 MoE call needs the cases file's checkpoint.target "
+                         "and the source's meta.module_prefix")
     x, ids, tw, emap = (
         a[k].to(device) for k in ("x", "topk_ids", "topk_weights", "expert_map")
     )
     inter, limit = int(a["intermediate_size"]), float(a["swiglu_limit"])
     weights, pointers, meta = expert_set(
-        a["checkpoint"], a["matrices"], a["packed_meta"], device
+        checkpoint, prefix, a["expert_map"], a["packed_meta"], device
     )
-    # moe_out_v2 runs at the layer's one routed bits_x2 (its gate checks it).
-    extra = {"bits_x2": int(a["packed_meta"][0][0][2])} if name == "moe_out_v2" else {}
+    extra = {}
+    if name == "moe_out_v2":
+        # The layer's one routed bit width (the dispatch's gate checks it).
+        bits = sorted({int(b) for b in a["packed_meta"][..., 2].flatten()})
+        if len(bits) != 1 or int(a.get("bits_x2", bits[0])) != bits[0]:
+            raise ValueError(f"moe_out_v2 bits_x2 {a.get('bits_x2')} for routed "
+                             f"matrices of bits_x2 {bits}")
+        extra = {"bits_x2": bits[0]}
 
     def run(op, rows):
         xr = x[rows]
@@ -488,8 +519,7 @@ def exl3_moe(a: dict, device: torch.device) -> Call:
         workspace = torch.full((size,), float("nan"), device=device)
         getattr(ops, op)(
             xr, ids[rows], tw[rows], pointers, meta, emap, inter, out, workspace,
-            swiglu_limit=limit,
-            **(extra if op == name else {}),
+            swiglu_limit=limit, **(extra if op == name else {}),
         )
         return out
 
@@ -514,14 +544,45 @@ FAMILIES = {
     "compress": compress,
     "index_keys": index_keys,
     "engram_dequant": engram_dequant,
-    "exl3_moe": exl3_moe,
+    **{
+        f"exl3_{op}": functools.partial(_exl3_moe, op)
+        for op in ("moe_out", "moe_out_v2", "moe_out_prefill")
+    },
+}
+
+
+# Capture point and recorded arguments of each family (the profile's
+# fp64_kernel.families lists the same).
+_CORE = "vllm.models.deepseek_v41.nvidia.ops.sm80_attn_core"
+_MOE_ARGS = ["x", "topk_ids", "topk_weights", "packed_meta", "expert_map",
+             "intermediate_size", "swiglu_limit"]
+POINTS = {
+    "sparse_attention": (f"{_CORE}:sparse_attention",
+                         ["q", "swa_cache", "swa_indices", "comp_cache",
+                          "comp_block_table", "comp_local", "req", "sink", "scale"]),
+    "index_scores": (f"{_CORE}:index_scores",
+                     ["q", "w", "n_vis", "req", "idxk", "block_table", "n_cols",
+                      "heads_per_rank"]),
+    "qdq_fp8": (f"{_CORE}:qdq_fp8", ["x", "block"]),
+    "qdq_fp4": (f"{_CORE}:qdq_fp4", ["x", "block", "scale"]),
+    "compress": (f"{_CORE}:compress_rows",
+                 ["kv_score", "norm_weight", "ring", "positions", "token_to_req",
+                  "query_start_loc", "comp_slots", "ring_slots", "compress_ratio",
+                  "head_dim", "eps"]),
+    "index_keys": (f"{_CORE}:index_key_rows", ["k", "k_norm", "freqs", "group_pos", "eps"]),
+    "engram_dequant": (
+        "vllm.models.deepseek_v41.nvidia.ops.sm80_engram_dequant:dequant_engram_rows",
+        ["values", "scales"]),
+    "exl3_moe_out": ("vllm.sm80.kernels.exl3.ops:moe_out", _MOE_ARGS),
+    "exl3_moe_out_v2": ("vllm.sm80.kernels.exl3.ops:moe_out_v2", _MOE_ARGS + ["bits_x2"]),
+    "exl3_moe_out_prefill": ("vllm.sm80.kernels.exl3.ops:moe_out_prefill", _MOE_ARGS),
 }
 
 
 # ---------------------------------------------------------------- driver
 
 
-def case_row(case: dict, device: torch.device) -> dict:
+def case_row(case: dict, device: torch.device, checkpoint: dict) -> dict:
     sources = case.get("captured_sources")
     if not sources:
         raise ValueError("no captured_sources: the case cannot be replayed")
@@ -531,11 +592,16 @@ def case_row(case: dict, device: torch.device) -> dict:
     families = set()
     for path in sources:
         obj = torch.load(path, map_location="cpu", weights_only=True)
+        if obj.get("schema") != SOURCE_SCHEMA:
+            raise ValueError(f"{path}: schema {obj.get('schema')!r} is not {SOURCE_SCHEMA}")
         family = obj.get("family")
         if family not in FAMILIES:
             raise ValueError(f"{path}: family {family!r} is not one of {sorted(FAMILIES)}")
+        if case.get("family", family) != family:
+            raise ValueError(f"{path}: family {family!r} in a case of {case['family']!r}")
         families.add(family)
-        call = FAMILIES[family](obj["tensors"], device)
+        src = Source(obj.get("meta") or {}, checkpoint)
+        call = FAMILIES[family](obj["tensors"], device, src)
         cs, cm, n = abs_errors(call.cand, call.exact)
         rs, rm, _ = abs_errors(call.ref, call.exact)
         cand_sum, cand_max = cand_sum + cs, max(cand_max, cm)
@@ -578,22 +644,30 @@ def header(device: torch.device) -> dict:
 
 
 def run(cases: Path, out: Path, device: torch.device) -> int:
-    """Write the header and one line per case that runs; 2 when the case
-    file is not one of SCHEMAS."""
+    """Write the header and one line per case that runs. 0 when every case
+    has its line, 1 when one has none (each named on stderr), 2 when the
+    case file is not one of SCHEMAS."""
     doc = json.loads(Path(cases).read_text())
     if not isinstance(doc, dict) or doc.get("schema") not in SCHEMAS:
         print(f"{cases}: schema is not one of {SCHEMAS}", file=sys.stderr)
         return 2
     with Path(out).open("w") as f, torch.inference_mode():
         f.write(json.dumps({"header": header(device)}) + "\n")
+        checkpoint = doc.get("checkpoint") or {}
+        failed = []
         for case in doc.get("cases") or []:
             try:
-                row = case_row(case, device)
+                row = case_row(case, device, checkpoint)
             except Exception as exc:  # noqa: BLE001 - reported, the other cases still run
                 print(f"case {case.get('id')}: {type(exc).__name__}: {exc}", file=sys.stderr)
+                failed.append(str(case.get("id")))
                 continue
             f.write(json.dumps(row) + "\n")
             f.flush()
+    if failed:
+        print(f"fp64_cases: {len(failed)} case(s) without a result: {', '.join(failed)}",
+              file=sys.stderr)
+        return 1
     return 0
 
 

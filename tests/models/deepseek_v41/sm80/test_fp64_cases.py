@@ -6,15 +6,18 @@ CPU: every family except the EXL3 MoE runs end to end through
 ``fp64_cases.run`` (on CPU the candidate is the torch path): one well-formed
 line per case, the exact families exact against their independent
 definitions, wrong or row-dependent candidates reported, a case that cannot
-run left out and named. The EXL3 MoE's checkpoint reading and FP64
-reference (with the SwiGLU clamp) run on the tiny checkpoint against a
-direct sum. GPU (skips without CUDA): the same cases through the CUDA paths.
+run left out and named. Each family's capture point takes the arguments the
+driver reads, and the plain-argument points compose the layer functions.
+The EXL3 MoE's expert matrices (target and drafter layers, from the module
+prefix and expert map) and FP64 reference (with the SwiGLU clamp) run on
+the tiny checkpoint against a direct sum. GPU (skips without CUDA): the same cases through the CUDA paths.
 
     pytest -q tests/models/deepseek_v41/sm80/test_fp64_cases.py
 """
 
 import json
 import math
+import re
 
 import numpy as np
 import pytest
@@ -29,13 +32,15 @@ from .test_sm80_kernels_gpu import _attn_case, _index_case
 BF16 = torch.bfloat16
 CPU = torch.device("cpu")
 KEYS = {"cand_mean", "cand_max", "ref_mean", "ref_max"}
-EXACT = ("qdq_fp8", "qdq_fp4_e8m0", "qdq_fp4_e4m3", "engram")
+EXACT = ("qdq_fp8", "qdq_fp4:e8m0", "qdq_fp4:e4m3", "engram_dequant")
 
 
-def _source(directory, name, family, tensors):
+def _source(directory, name, family, tensors, schema=F.SOURCE_SCHEMA):
     path = directory / f"{name}.pt"
-    meta = {"step": 0, "num_reqs": 1, "layer": 0, "rank": 0, "phase": "decode"}
-    torch.save({"family": family, "meta": meta, "tensors": tensors}, path)
+    meta = {"step": 0, "phase": "decode", "num_reqs": 1, "layer": 0, "rank": 0,
+            "module_prefix": "model.layers.0.attn", "family": family}
+    torch.save({"schema": schema, "family": family, "key": name, "seq": 0,
+                "meta": meta, "tensors": tensors}, path)
     return str(path)
 
 
@@ -81,6 +86,7 @@ def _compress(g, ratio):
     )
     if ratio == 1:
         t["comp_slots"] = torch.where(pos % 3 == 0, t["comp_slots"], -1)
+        t["ring"] = t["ring_slots"] = None
     else:
         blocks = torch.tensor([2, 0])
         t["ring"] = torch.randn(3, capacity, 2 * d, generator=g)
@@ -90,7 +96,7 @@ def _compress(g, ratio):
 
 def _index_keys(g, n=9, d=128):
     return dict(
-        wk_out=torch.randn(n, d, generator=g).to(BF16),
+        k=torch.randn(n, d, generator=g).to(BF16),
         k_norm=(1 + 0.1 * torch.randn(d, generator=g)).to(BF16),
         freqs=core.rope_freqs(64, 0, 10000.0, 1.0, 32, 1),
         group_pos=torch.randint(0, 5000, (n,), generator=g),
@@ -111,16 +117,16 @@ def cases(tmp_path_factory):
     d = tmp_path_factory.mktemp("sources")
     g = torch.Generator().manual_seed(7)
     sources = {
-        "attention": [
+        "sparse_attention": [
             _source(d, "attn0", "sparse_attention", _attention(g)),
             _source(d, "attn1", "sparse_attention", _attention(g, compressed=False)),
         ],
         "index_scores": [_source(d, "index", "index_scores", _index(g))],
         "qdq_fp8": [_source(d, "fp8", "qdq_fp8", dict(x=_activations(g), block=32))],
-        "qdq_fp4_e8m0": [
+        "qdq_fp4:e8m0": [
             _source(d, "fp4a", "qdq_fp4", dict(x=_activations(g), block=32, scale="e8m0"))
         ],
-        "qdq_fp4_e4m3": [
+        "qdq_fp4:e4m3": [
             _source(d, "fp4b", "qdq_fp4", dict(x=_activations(g), block=16, scale="e4m3"))
         ],
         "compress": [
@@ -128,21 +134,22 @@ def cases(tmp_path_factory):
             _source(d, "comp2", "compress", _compress(g, 2)),
         ],
         "index_keys": [_source(d, "keys", "index_keys", _index_keys(g))],
-        "engram": [_source(d, "engram", "engram_dequant", _engram(g))],
+        "engram_dequant": [_source(d, "engram", "engram_dequant", _engram(g))],
     }
     return [
-        {"id": k, "concurrency": 1, "phase": "decode", "captured_sources": v}
+        {"id": k, "family": k.split(":")[0], "phase": "decode", "concurrency": 1,
+         "calls": len(v), "captured_sources": v}
         for k, v in sources.items()
     ]
 
 
-def _run(tmp_path, cases, device=CPU, schema="served_cases/1"):
+def _run(tmp_path, cases, device=CPU, schema="served_cases/1", target="/nonexistent"):
     path = tmp_path / "cases.json"
-    path.write_text(json.dumps({"schema": schema, "model": "m", "family": "f",
-                                "cases": cases}))
+    path.write_text(json.dumps({"schema": schema, "model": "m", "cases": cases,
+                                "checkpoint": {"target": str(target)}}))
     out = tmp_path / "out.jsonl"
     rc = F.run(path, out, device)
-    if rc:
+    if rc not in (0, 1):
         return rc, None, None
     lines = [json.loads(line) for line in out.read_text().splitlines()]
     assert set(lines[0]) == {"header"}
@@ -166,7 +173,7 @@ def test_every_family_runs_on_cpu(tmp_path, cases):
         _well_formed(row)
         assert row["row_invariance"], cid
         e = row["fp64"]
-        if cid == "attention":
+        if cid == "sparse_attention":
             # The torch definition against the reference kernel's arithmetic:
             # both within BF16 rounding of the FP64 value.
             assert 0 < e["cand_max"] < 0.05 and 0 < e["ref_max"] < 0.05
@@ -179,6 +186,50 @@ def test_every_family_runs_on_cpu(tmp_path, cases):
         if cid in ("index_scores", "compress"):
             assert e["cand_max"] > 0, cid  # their BF16 rounding is measured
     assert rows["compress"]["family"] == "compress"
+
+
+def test_every_family_has_a_point_whose_parameters_are_its_arguments():
+    import importlib
+    import inspect
+
+    assert set(F.POINTS) == set(F.FAMILIES)
+    for family, (point, args) in F.POINTS.items():
+        module, qualname = point.split(":")
+        fn = importlib.import_module(module)
+        for part in qualname.split("."):
+            fn = getattr(fn, part)
+        params = list(inspect.signature(fn).parameters)
+        assert [p for p in params if p in args] == args, family
+
+
+def test_the_points_compose_the_layer_functions():
+    """compress / index_keys are compress_rows / index_key_rows of their
+    arguments: the recorded call is the one the layer makes."""
+    g = torch.Generator().manual_seed(11)
+    a = _compress(g, 2)
+    pos = a["positions"]
+    batch = core.Sm80AttnBatch(
+        positions=pos, token_to_req=a["token_to_req"],
+        query_start_loc=a["query_start_loc"], swa_slots=torch.full_like(pos, -1),
+        swa_indices=pos.new_empty((pos.shape[0], 0)), comp_slots=a["comp_slots"],
+        ring_slots=a["ring_slots"],
+    )
+    cfg = type("Cfg", (), dict(compress_ratio=2, head_dim=a["head_dim"], eps=a["eps"]))
+    ring = a["ring"].clone()
+    rows, latent = core.compress(cfg, batch, a["kv_score"], a["norm_weight"], ring)
+    ring2 = a["ring"].clone()
+    rows2, latent2 = core.compress_rows(
+        a["kv_score"], a["norm_weight"], ring2, pos, a["token_to_req"],
+        a["query_start_loc"], a["comp_slots"], a["ring_slots"], 2, a["head_dim"], a["eps"],
+    )
+    assert torch.equal(rows, rows2) and torch.equal(latent, latent2)
+    assert torch.equal(ring, ring2) and not torch.equal(ring, a["ring"])
+    k = _index_keys(g)
+    weights = type("Wts", (), dict(wk=staticmethod(lambda _x: k["k"]),
+                                   k_norm=k["k_norm"], freqs=k["freqs"]))
+    got = core.index_keys(type("Cfg", (), dict(eps=k["eps"])), weights, None, k["group_pos"])
+    want = core.index_key_rows(k["k"], k["k_norm"], k["freqs"], k["group_pos"], k["eps"])
+    assert torch.equal(got, want)
 
 
 def test_a_wrong_candidate_shows_in_its_bits_and_error(tmp_path, cases, monkeypatch):
@@ -203,24 +254,41 @@ def test_a_row_dependent_candidate_is_reported(tmp_path, cases, monkeypatch):
         return real(q, *args) + (q.shape[0] > 1)
 
     monkeypatch.setattr(core, "sparse_attention", batch_dependent)
-    _, _, rows = _run(tmp_path, [c for c in cases if c["id"] == "attention"])
-    assert not rows["attention"]["row_invariance"]
+    _, _, rows = _run(tmp_path, [c for c in cases if c["id"] == "sparse_attention"])
+    assert not rows["sparse_attention"]["row_invariance"]
 
 
-def test_a_case_that_cannot_run_is_left_out_and_named(tmp_path, cases, capsys):
-    bad = tmp_path / "bad.pt"
-    torch.save({"family": "unknown", "meta": {}, "tensors": {}}, bad)
-    good = [c for c in cases if c["id"] == "engram"]
+def test_a_case_that_cannot_run_is_named_and_refuses_the_run(tmp_path, cases, capsys):
+    good = [c for c in cases if c["id"] == "engram_dequant"]
+    src = good[0]["captured_sources"][0]
+    bad = _source(tmp_path, "bad", "unknown", {})
+    old = _source(tmp_path, "old", "engram_dequant", {}, schema="lab-gemm-capture/1")
+    moe = str(tmp_path / "moe.pt")
+    torch.save({"schema": F.SOURCE_SCHEMA, "family": "exl3_moe_out", "meta": {"layer": 0},
+                "tensors": {"x": torch.zeros(1, 8)}}, moe)
+
+    def case(cid, family, sources):
+        return {"id": cid, "family": family, "concurrency": 1, "phase": "decode",
+                "captured_sources": sources}
+
     extra = [
-        {"id": "no_family", "concurrency": 1, "phase": "decode",
-         "captured_sources": [str(bad)]},
+        case("no_family", "unknown", [bad]),
+        case("other_schema", "engram_dequant", [old]),
+        case("wrong_family", "qdq_fp8", [src]),
         {"id": "no_sources", "concurrency": 2, "phase": "prefill"},
+        case("moe_without_prefix", "exl3_moe_out", [moe]),
     ]
     rc, _, rows = _run(tmp_path, good + extra)
-    assert rc == 0 and set(rows) == {"engram"}
+    # The run is refused (exit 1) after writing the cases that ran.
+    assert rc == 1 and set(rows) == {"engram_dequant"}
     err = capsys.readouterr().err
+    assert ("5 case(s) without a result: no_family, other_schema, wrong_family, "
+            "no_sources, moe_without_prefix") in err
     assert "case no_family: ValueError" in err and "'unknown'" in err
+    assert "case other_schema: ValueError" in err and "lab-gemm-capture/1" in err
+    assert "case wrong_family: ValueError" in err and "'qdq_fp8'" in err
     assert "case no_sources: ValueError: no captured_sources" in err
+    assert "case moe_without_prefix: ValueError" in err and "module_prefix" in err
 
 
 def test_a_file_of_another_schema_is_refused(tmp_path, cases):
@@ -259,21 +327,32 @@ def test_moe_experts_from_the_checkpoint_and_their_fp64_output(checkpoint):
     from tests.kernels.quantization.test_exl3_kernels import effective_weight
 
     ckpt = real.Checkpoint(checkpoint)
-    local = (3, 7)
-    names = [[f"layers.0.ffn.experts.{e}.{w}" for w in ("w1", "w3", "w2")] for e in local]
-    meta = torch.tensor(
-        [[[m.padded_in, m.padded_out, m.bits_x2, m.codebook]
-          for m in map(ckpt.matrix, row)] for row in names]
+
+    # A target layer, and a DSpark drafter layer (vLLM numbers it after the
+    # target's layers; its experts are mtp.<stage>.* in the checkpoint).
+    expert_map, meta = _recorded(
+        ckpt, "layers.0.ffn.experts", (3, 7), fixture.TEXT["n_routed_experts"]
     )
-    weights, pointers, got = F.expert_set(str(checkpoint), names, meta, CPU)
+    weights, pointers, got = F.expert_set(
+        str(checkpoint), "model.layers.0.ffn.experts", expert_map, meta, CPU
+    )
     assert torch.equal(got, meta) and pointers.shape == (2, 3, 3)
+    assert torch.equal(weights[3][0], ckpt.whole("layers.0.ffn.experts.7.w1")[0])
     with pytest.raises(ValueError, match="layout"):
-        F.expert_set(str(checkpoint), names, meta + 1, CPU)
+        F.expert_set(str(checkpoint), "model.layers.0.ffn.experts", expert_map, meta + 1, CPU)
+    draft_map, draft_meta = _recorded(
+        ckpt, "mtp.0.ffn.experts", (2, 5), fixture.TEXT["dspark_n_routed_experts"]
+    )
+    layers = fixture.TEXT["num_hidden_layers"]
+    draft, _, _ = F.expert_set(
+        str(checkpoint), f"model.layers.{layers}.ffn.experts", draft_map, draft_meta, CPU
+    )
+    assert torch.equal(draft[3][2], ckpt.whole("mtp.0.ffn.experts.5.w1")[2])
+    with pytest.raises(ValueError, match="cover"):
+        F.expert_set(str(checkpoint), "model.layers.0.ffn.experts", expert_map[:4], meta, CPU)
 
     g = torch.Generator().manual_seed(3)
     hidden, inter = fixture.TEXT["hidden_size"], fixture.TEXT["moe_intermediate_size"]
-    expert_map = torch.full((fixture.TEXT["n_routed_experts"],), -1, dtype=torch.int32)
-    expert_map[3], expert_map[7] = 0, 1
     x = torch.randn(4, hidden, generator=g).to(BF16)
     ids = torch.tensor([[3, 7, -1, 5, 0, 9], [7, 1, 2, 4, 6, 8],
                         [10, 11, 12, 13, 14, 15], [3, 3, 7, 16, -1, 2]], dtype=torch.int32)
@@ -301,6 +380,130 @@ def test_moe_experts_from_the_checkpoint_and_their_fp64_output(checkpoint):
             b = np.clip(x64[t] @ up[:, :inter], -limit, limit)
             want += w * ((a / (1.0 + np.exp(-a)) * b) @ down[:inter, :hidden])
         np.testing.assert_allclose(clamped[t].numpy(), want, rtol=1e-11, atol=1e-13)
+
+
+def _recorded(ckpt, stem, local, experts):
+    """The expert map and packed meta a layer with these local experts records."""
+    expert_map = torch.full((experts,), -1, dtype=torch.int32)
+    for i, e in enumerate(local):
+        expert_map[e] = i
+    names = [[f"{stem}.{e}.{w}" for w in ("w1", "w3", "w2")] for e in local]
+    meta = torch.tensor(
+        [[[m.padded_in, m.padded_out, m.bits_x2, m.codebook]
+          for m in map(ckpt.matrix, row)] for row in names]
+    )
+    return expert_map, meta
+
+
+@pytest.fixture(scope="module")
+def mixed_checkpoint(tmp_path_factory):
+    """The tiny checkpoint with layer 1's routed experts at bits_x2 4 (the
+    others at 6), as the real one mixes the two widths by layer."""
+    directory = tmp_path_factory.mktemp("mixed")
+    tensors = fixture.checkpoint_tensors
+    width = re.compile(r"layers\.1\.ffn\.experts\.\d+\.w\d\.trellis")
+
+    def mixed(config):
+        out = tensors(config)
+        for name, (dtype, shape) in out.items():
+            if width.fullmatch(name):
+                out[name] = (dtype, (shape[0], shape[1], 8 * 4))
+        return out
+
+    fixture.checkpoint_tensors = mixed
+    try:
+        fixture.write_checkpoint(directory, fixture.tiny_config())
+    finally:
+        fixture.checkpoint_tensors = tensors
+    return directory
+
+
+def _cpu_operators(monkeypatch):
+    """CPU stand-ins for the EXL3 MoE operators (CUDA only): the routed
+    experts of the weights the driver loaded, in FP64 rounded to BF16. They
+    record the bits_x2 each moe_out_v2 call received."""
+    from vllm.sm80.kernels.exl3 import ops
+
+    loaded, seen = {}, []
+    expert_set = F.expert_set
+
+    def remember(*args):
+        weights, pointers, meta = expert_set(*args)
+        loaded[pointers.data_ptr()] = weights
+        return weights, pointers, meta
+
+    def operator(name):
+        def run(x, ids, tw, ptrs, meta, emap, inter, out, workspace,
+                swiglu_limit=0.0, *, bits_x2=None):
+            assert (bits_x2 is not None) == (name == "moe_out_v2"), name
+            if bits_x2 is not None:
+                assert {int(b) for b in meta[..., 2].flatten()} == {bits_x2}
+                seen.append(bits_x2)
+            out.copy_(F.moe_exact(x, ids, tw, emap, loaded[ptrs.data_ptr()], meta,
+                                  inter, swiglu_limit).to(out.dtype))
+        return run
+
+    monkeypatch.setattr(F, "expert_set", remember)
+    for name in ("moe_out", "moe_out_v2", "moe_out_prefill"):
+        monkeypatch.setattr(ops, name, operator(name))
+    for size in ("moe_workspace_size", "moe_workspace_size_v2",
+                 "moe_workspace_size_prefill"):
+        monkeypatch.setattr(ops, size, lambda *args: 1)
+    return seen
+
+
+def test_moe_families_run_at_both_bit_widths(tmp_path, mixed_checkpoint, monkeypatch):
+    """exl3_moe_out_v2 cases of a bits_x2 6 and a bits_x2 4 layer, and an
+    exl3_moe_out case, run through fp64_cases.run end to end (operators
+    replaced by CPU stand-ins): one line each, moe_out_v2 given each layer's
+    width; a recorded width that is not the layer's refuses its case."""
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    seen = _cpu_operators(monkeypatch)
+    ckpt = real.Checkpoint(mixed_checkpoint)
+    text = fixture.TEXT
+    g = torch.Generator().manual_seed(5)
+
+    def source(name, family, layer, bits=None):
+        expert_map, meta = _recorded(
+            ckpt, f"layers.{layer}.ffn.experts", range(4), text["n_routed_experts"]
+        )
+        args = dict(
+            x=torch.randn(3, text["hidden_size"], generator=g).to(BF16),
+            topk_ids=torch.randint(
+                0, text["n_routed_experts"], (3, text["num_experts_per_tok"]), generator=g
+            ).to(torch.int32),
+            topk_weights=torch.rand(3, text["num_experts_per_tok"], generator=g),
+            packed_meta=meta, expert_map=expert_map,
+            intermediate_size=text["moe_intermediate_size"], swiglu_limit=10.0,
+        )
+        if bits is not None:
+            args["bits_x2"] = bits
+        path = _source(tmp_path, name, family, args)
+        obj = torch.load(path, weights_only=True)
+        obj["meta"]["module_prefix"] = f"model.layers.{layer}.ffn.experts"
+        torch.save(obj, path)
+        return {"id": name, "family": family, "phase": "decode", "concurrency": 3,
+                "calls": 1, "captured_sources": [path]}
+
+    cases = [
+        source("v2_bits6", "exl3_moe_out_v2", 0, bits=6),
+        source("v2_bits4", "exl3_moe_out_v2", 1, bits=4),
+        source("v1_bits6", "exl3_moe_out", 0),
+    ]
+    rc, _, rows = _run(tmp_path, cases, target=mixed_checkpoint)
+    assert rc == 0 and set(rows) == {"v2_bits6", "v2_bits4", "v1_bits6"}
+    for cid, row in rows.items():
+        _well_formed(row)
+        assert row["family"] == ("exl3_moe_out_v2" if cid.startswith("v2") else "exl3_moe_out")
+        assert row["bitwise"] and row["row_invariance"], cid
+        assert row["fp64"]["cand_max"] == row["fp64"]["ref_max"] > 0, cid
+    # Whole call, moe_out reference, then three rows alone, per v2 case.
+    assert sorted(set(seen)) == [4, 6] and seen.count(6) == seen.count(4) == 4
+
+    wrong = source("v2_wrong_bits", "exl3_moe_out_v2", 1, bits=6)
+    rc, _, rows = _run(tmp_path, [wrong], target=mixed_checkpoint)
+    assert rc == 1 and rows == {}
 
 
 # ---------------------------------------------------------------- GPU
