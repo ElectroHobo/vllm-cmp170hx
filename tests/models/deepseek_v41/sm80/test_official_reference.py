@@ -1320,14 +1320,39 @@ def test_attention_layer(layer, prefill, decode, record_property):
 # ---------------------------------------------------------------------------
 
 
+def served_head_dtype() -> torch.dtype:
+    """ModelConfig.head_dtype of the served target and drafter: the
+    checkpoint's config (no head_dtype of its own) after the model-config
+    hook the plugin registers for DeepseekV41ForCausalLM."""
+    from transformers import PretrainedConfig
+
+    from vllm.config.model import _get_head_dtype
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+    from vllm.sm80 import plugin
+
+    architecture = "DeepseekV41ForCausalLM"
+    saved = MODELS_CONFIG_MAP.get(architecture)
+    try:
+        plugin.register_hf_config_defaults()
+        hf = PretrainedConfig(architectures=[architecture])
+        MODELS_CONFIG_MAP[architecture].verify_and_update_model_config(
+            types.SimpleNamespace(hf_config=hf, hf_text_config=hf)
+        )
+    finally:
+        MODELS_CONFIG_MAP[architecture] = saved
+    return _get_head_dtype(config=hf, dtype=BF16, runner_type="generate")
+
+
 def test_dspark_heads(record_property, monkeypatch):
     """``DSparkMarkovHead.forward`` (the previous token's rank-256 embedding
     and its vocab bias) and ``DSparkConfidenceHead.forward`` against the
     port's DSpark Markov and confidence heads, built in the model dtype, with
-    the same weights and inputs, on one rank (no process group)."""
+    the same weights and inputs, on one rank (no process group). The bias goes
+    through the drafter's logits processor as served (FP32 head dtype)."""
     from tests.models.deepseek_v41.sm80.construct import set_groups
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead, DSparkMarkovHead
+    from vllm.sm80.kernels.exl3.quant import Exl3HeadLogitsProcessor
     from vllm.utils.torch_utils import set_default_torch_dtype
 
     set_groups(monkeypatch, 1, 0)
@@ -1356,6 +1381,11 @@ def test_dspark_heads(record_property, monkeypatch):
         port_markov = DSparkMarkovHead(vocab, vocab, rank, prefix="markov_head")
         port_conf = DSparkConfidenceHead(args.dim + rank, prefix="confidence_head")
         processor = LogitsProcessor(vocab)
+    # The drafter's processor: the head dtype the plugin's model-config hook
+    # gives the checkpoint's config, served by the fork's EXL3-head processor
+    # (sm80_model.DSparkDeepseekV4ForCausalLM).
+    processor.head_dtype = served_head_dtype()
+    Exl3HeadLogitsProcessor.adopt(processor)
     for param, name in ((port_markov.markov_w1.weight, "markov_head.embed.weight"),
                         (port_markov.markov_w2.weight, "markov_head.head.weight"),
                         (port_conf.proj.weight, "confidence_head.proj.weight")):
