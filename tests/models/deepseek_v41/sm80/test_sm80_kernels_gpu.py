@@ -21,7 +21,7 @@ from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
 from vllm.models.deepseek_v41.nvidia.ops.sm80_act_quant import fp4_qdq
 
 from . import test_attn_layers as layers
-from .dsv41_ref import LayerSpec, RefArgs, make_weights
+from .dsv41_ref import LayerSpec, RefArgs, make_weights, ref_sparse_attn
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -157,6 +157,121 @@ def test_kernels_int64_offsets() -> None:
     )
     torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-3)
 
+def _gather_rows(cfg, caches, batch):
+    """The rows each token attends to (window slots, then selected
+    compressed positions) and their validity: [T, K, D], [T, K]."""
+    T = batch.num_tokens
+    blk, off = core._paged(caches.swa, batch.swa_indices.clamp_min(0))
+    rows, valid = [caches.swa[blk, off]], [batch.swa_indices >= 0]
+    if cfg.compress_ratio:
+        local = caches.topk[:T]
+        req = batch.token_to_req.to(torch.int64)[:, None].expand_as(local)
+        rows.append(
+            core.gather_compressed_rows(
+                caches.comp, batch.comp_block_table, req, local.clamp_min(0)
+            )
+        )
+        valid.append(local >= 0)
+    return torch.cat(rows, dim=1), torch.cat(valid, dim=1)
+
+
+def _fp64_attention(q, rows, valid, sink, scale):
+    """Sink attention in FP64: softmax over the valid rows with the sink in
+    the denominator; a token without valid rows gets zeros."""
+    s = torch.einsum("thd,tkd->thk", q.double(), rows.double()) * scale
+    s = s.masked_fill(~valid[:, None, :], float("-inf"))
+    sink = sink.double()[None, : q.shape[1]]
+    m = torch.maximum(s.amax(-1), sink)
+    p = torch.exp(s - m[..., None])
+    denom = p.sum(-1) + torch.exp(sink - m)
+    return torch.einsum("thk,tkd->thd", p, rows.double()) / denom[..., None]
+
+
+def _inverse_rope_fp64(o, positions, freqs):
+    """The output's inverse RoPE in FP64 (same fp32 angles as the layer)."""
+    rd = 2 * freqs.numel()
+    angles = (positions.to(torch.float32)[:, None] * freqs).double()
+    cis = torch.polar(torch.ones_like(angles), angles).conj()[:, None, :]
+    out = o.double().clone()
+    tail = torch.view_as_complex(out[..., -rd:].contiguous().unflatten(-1, (-1, 2)))
+    out[..., -rd:] = torch.view_as_real(tail * cis).flatten(-2)
+    return out
+
+
+class _Fp64Errors:
+    """Pooled |x - fp64| of every attend_layer call (all layers, steps and
+    tokens of the test, padding rows excluded), measured BEFORE the FP8 qdq:
+    on the BF16 attention output after its inverse RoPE, the tensor the qdq
+    takes. ``sm80`` is the layer's own CUDA path (Triton sparse attention);
+    ``reference`` is the reference kernel's arithmetic (``ref_sparse_attn``,
+    torch on CUDA) on the same q, rows, selections and sink."""
+
+    def __init__(self):
+        self.sum = {"sm80": 0.0, "reference": 0.0}
+        self.max = {"sm80": 0.0, "reference": 0.0}
+        self.count = 0
+
+    def mean(self, name: str) -> float:
+        return self.sum[name] / max(self.count, 1)
+
+    def measure(self, cfg, weights, caches, batch, q) -> None:
+        T = batch.num_tokens
+        if T == 0:
+            return
+        q = q[:T]
+        pos, freqs = batch.positions, weights.freqs
+        rows, valid = _gather_rows(cfg, caches, batch)
+        exact = _inverse_rope_fp64(
+            _fp64_attention(q, rows, valid, weights.attn_sink, cfg.softmax_scale),
+            pos,
+            freqs,
+        )
+        sm80 = core.sparse_attention(
+            q, caches.swa, batch.swa_indices, caches.comp, batch.comp_block_table,
+            caches.topk[:T] if cfg.compress_ratio else None,
+            batch.token_to_req, weights.attn_sink, cfg.softmax_scale,
+        )
+        idx = torch.where(
+            valid, torch.arange(valid.shape[1], device=valid.device), -1
+        ).int()[:, None, :]
+        with torch.device(q.device):
+            ref = ref_sparse_attn(
+                q[:, None], rows, weights.attn_sink[: q.shape[1]], idx,
+                cfg.softmax_scale,
+            )[:, 0]
+        for name, o in (("sm80", sm80), ("reference", ref)):
+            err = (core.rope(o, pos, freqs, inverse=True).double() - exact).abs()
+            self.sum[name] += float(err.sum())
+            self.max[name] = max(self.max[name], float(err.max()))
+        self.count += exact.numel()
+
+    def report(self) -> str:
+        return (
+            f"wo_a input before FP8 qdq vs FP64 over {self.count} elements: "
+            f"sm80 mean {self.mean('sm80'):.4g} max {self.max['sm80']:.4g}; "
+            f"reference mean {self.mean('reference'):.4g} "
+            f"max {self.max['reference']:.4g}; ratios mean "
+            f"{self.mean('sm80') / max(self.mean('reference'), 1e-30):.3f} "
+            f"max {self.max['sm80'] / max(self.max['reference'], 1e-30):.3f}"
+        )
+
+    def assert_within(self) -> None:
+        print(self.report())
+        assert self.count > 0
+        assert self.mean("sm80") <= 1.10 * self.mean("reference"), self.report()
+        assert self.max["sm80"] <= 1.25 * self.max["reference"], self.report()
+
+
+def _spy_attend_layer(monkeypatch, errors: _Fp64Errors) -> None:
+    attend = core.attend_layer
+
+    def spy(cfg, weights, caches, batch, q, out):
+        attend(cfg, weights, caches, batch, q, out)
+        errors.measure(cfg, weights, caches, batch, q)
+
+    monkeypatch.setattr(core, "attend_layer", spy)
+
+
 
 @pytest.mark.parametrize(
     "specs",
@@ -170,28 +285,28 @@ def test_kernels_int64_offsets() -> None:
         ],
     ],
 )
-def test_layer_on_cuda_matches_reference(specs) -> None:
-    """The sm_80 layer on CUDA against the reference run on CUDA: the same
-    bitwise contract as on CPU (caches, top-k sets)."""
+def test_layer_on_cuda_matches_reference(specs, monkeypatch) -> None:
+    """The sm_80 layer on CUDA against the reference run on CUDA: cache rows
+    bitwise and top-k sets equal. Attention outputs are judged against FP64
+    (pooled over the test): the sm80 path's mean error at most 1.10x and its
+    max error at most 1.25x those of the reference kernel's arithmetic on
+    the same inputs. Run with -s to see both errors."""
     args = RefArgs()
     weights = [make_weights(args, s, 100 + i) for i, s in enumerate(specs)]
     xs = layers.make_inputs(args, len(specs), 5)
     schedule = layers.make_schedule(11)
+    errors = _Fp64Errors()
+    _spy_attend_layer(monkeypatch, errors)
     run, outs, topks = layers.run_sm80(args, specs, weights, xs, schedule, "cuda")
     ref = layers.run_reference(args, specs, weights, xs, "cuda")
-    layers.check(args, specs, run, outs, topks, *ref)
+    layers.check(args, specs, run, outs, topks, *ref, compare_outputs=False)
+    errors.assert_within()
 
-    # Against the reference run on CPU only to tolerance: the two devices'
-    # libm (cos/sin/exp/rsqrt) and fp32 reduction orders differ by ulps,
-    # which a BF16 or FP4/FP8 rounding can turn into one grid step, and a
-    # rare near-tie of index scores into a different top-k member.
-    _, cpu_outs, cpu_topks = layers.run_reference(args, specs, weights, xs)
-    n_far = n_total = 0
-    for key, want in cpu_outs.items():
-        got = outs[key].float()
-        far = (got - want.float()).abs() > 1e-3 + 0.13 * want.float().abs()
-        n_far += int(far.sum())
-        n_total += far.numel()
-    assert n_far <= 0.01 * n_total, f"{n_far}/{n_total} elements beyond tolerance"
+    # Against the reference run on CPU the selections may differ in a rare
+    # near-tie of index scores: the two devices' libm (cos/sin/exp/rsqrt)
+    # and fp32 reduction orders differ by ulps, which a BF16 or FP4/FP8
+    # rounding can turn into one grid step.
+    _, _, cpu_topks = layers.run_reference(args, specs, weights, xs)
     same = sum(topks[k] == v for k, v in cpu_topks.items())
+    print(f"top-k sets equal to the CPU reference: {same}/{len(cpu_topks)}")
     assert same >= 0.95 * len(cpu_topks), f"{same}/{len(cpu_topks)} top-k sets equal"

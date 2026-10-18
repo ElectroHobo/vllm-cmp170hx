@@ -150,7 +150,15 @@ def run_reference(args, specs, weights, xs, device="cpu"):
     return layers, outs, topks
 
 
-def check(args, specs, run, outs, topks, ref_layers, ref_outs, ref_topks):
+def check(
+    args, specs, run, outs, topks, ref_layers, ref_outs, ref_topks,
+    compare_outputs: bool = True,
+):
+    """Caches bitwise and top-k sets equal; with ``compare_outputs`` also the
+    wo_a inputs to the per-element bound and the <= 2 % mismatch gate (CPU
+    against CPU, where the reference kernel's arithmetic is the sm_80 one
+    up to the BF16 probability rounding). The GPU test compares outputs
+    against an FP64 reference instead."""
     # Top-k selections: identical sets (both sorted ascending).
     for key, want in ref_topks.items():
         assert topks[key] == want, f"top-k differs at (layer, req, pos) {key}"
@@ -193,6 +201,12 @@ def check(args, specs, run, outs, topks, ref_layers, ref_outs, ref_topks):
     # block, not of the element: near-zero elements may move by one BF16
     # ulp of their block's amax. Larger elements may cross one FP8 rounding
     # boundary (an E4M3 step, at most 12.5 % of the element).
+    nonzero = sum(int((v != 0).sum()) for v in outs.values())
+    n_total = sum(v.numel() for v in outs.values())
+    assert nonzero > 0.9 * n_total, "outputs are mostly zero"
+    assert all(bool(torch.isfinite(v.float()).all()) for v in outs.values())
+    if not compare_outputs:
+        return
     n_diff = n_total = 0
     for key, want in ref_outs.items():
         got = outs[key]
@@ -213,8 +227,6 @@ def check(args, specs, run, outs, topks, ref_layers, ref_outs, ref_topks):
             f"{tol[worst].item():.4g} (block amax {amax[worst // 32].item():.4g})"
         )
     assert n_diff <= 0.02 * n_total, f"{n_diff}/{n_total} wo_a input elements differ"
-    nonzero = sum(int((v != 0).sum()) for v in outs.values())
-    assert nonzero > 0.9 * n_total, "outputs are mostly zero"
 
 
 @pytest.mark.parametrize(
