@@ -856,9 +856,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # Diagnostic: log the counters of each sm_80 Engram table (rows, cache
     # hits and misses, page-cache and storage bytes, host read and wait
-    # time) every N lookups of that table, one lookup per step, and at
-    # close and exit (vllm/models/deepseek_v41/nvidia/sm80_engram.py). The
-    # counters are kept either way. Default 0: never logged.
+    # time) every N steps, and at close and exit
+    # (vllm/models/deepseek_v41/nvidia/sm80_engram.py). The counters are
+    # kept either way. Default 0: never logged.
     "VLLM_ENGRAM_TELEMETRY_STEPS": lambda: int(
         os.getenv("VLLM_ENGRAM_TELEMETRY_STEPS", "0")
     ),
