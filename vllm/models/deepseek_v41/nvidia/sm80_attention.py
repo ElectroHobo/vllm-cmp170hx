@@ -19,8 +19,12 @@ selector. :func:`sm80_dspark_context_kv` wraps the drafter's context-KV
 insertion so its window rows go through the same rounding.
 
 The attention region (KV writes, compressor, indexer, top-k, sparse attention,
-output RoPE and quantize-dequantize) runs eagerly under a CUDA-graph break;
-the input projections and ``wo_a`` / ``wo_b`` stay in the graph.
+output RoPE and quantize-dequantize) runs eagerly under a piecewise CUDA-graph
+break and is captured whole in FULL graphs (uniform decode under
+FULL_AND_PIECEWISE): it reads only the metadata builders' persistent buffers
+and does no host reads, and in a FULL graph the indexer scores the fixed
+width ``max_model_len // ratio``. The input projections and ``wo_a`` /
+``wo_b`` are in the graph either way.
 """
 
 import functools
@@ -32,11 +36,11 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -325,7 +329,11 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         self._sm80_rope_params = _rope_params(
             config, self.compress_ratio, self.rope_head_dim
         )
-        self._sm80_freqs: dict[torch.device, torch.Tensor] = {}
+        # Built here, eagerly, on the device: a first use inside a graph
+        # capture would allocate it from that graph's private pool.
+        self._sm80_freqs = core.rope_freqs(
+            *self._sm80_rope_params, device=current_platform.device_type
+        )
         self._sm80_chunk_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         if self.indexer is not None and vllm_config.kernel_config.enable_jit_warmup:
             from vllm.models.deepseek_v41.nvidia.ops.sm80_index_scores import (
@@ -351,10 +359,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
     # -- pieces -------------------------------------------------------------
 
     def _sm80_weights(self, device: torch.device) -> core.Sm80AttnWeights:
-        freqs = self._sm80_freqs.get(device)
-        if freqs is None:
-            freqs = core.rope_freqs(*self._sm80_rope_params, device=device)
-            self._sm80_freqs[device] = freqs
+        freqs = self._sm80_freqs.to(device)
         w = core.Sm80AttnWeights(
             q_norm=self.q_norm.weight,
             kv_norm=self.kv_norm.weight,
@@ -398,13 +403,19 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             parts.append(swa.decode_swa_indices.reshape(nd, -1))
         if npf:
             parts.append(swa.prefill_swa_indices.reshape(npf, -1))
-        width = max([p.shape[1] for p in parts] + [1])
-        swa_indices = torch.cat(
-            [
-                torch.nn.functional.pad(p, (0, width - p.shape[1]), value=-1)
-                for p in parts
-            ]
-        ) if parts else torch.empty(0, 1, dtype=torch.int32, device=positions.device)
+        if len(parts) == 1:
+            # Decode-only or prefill-only: the builder's buffer itself.
+            swa_indices = parts[0]
+        else:
+            width = max([p.shape[1] for p in parts] + [1])
+            swa_indices = torch.cat(
+                [
+                    torch.nn.functional.pad(p, (0, width - p.shape[1]), value=-1)
+                    for p in parts
+                ]
+            ) if parts else torch.empty(
+                0, 1, dtype=torch.int32, device=positions.device
+            )
         batch = core.Sm80AttnBatch(
             positions=positions[:T],
             token_to_req=swa.token_to_req_indices[:T],
@@ -415,6 +426,10 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         if self.compress_ratio:
             comp = cast(Any, attn_metadata[self.compressed_cache_prefix])
             batch.comp_block_table = comp.block_table
+            # A FULL graph replays its capture's score width for every step.
+            batch.max_seq_len = (
+                self.max_model_len if _in_full_graph() else comp.max_seq_len
+            )
             if self.is_kv_source:
                 batch.comp_slots = comp.slot_mapping[:T]
         if self.indexer is not None:
@@ -626,6 +641,14 @@ def wo_b_all_reduce(partial: torch.Tensor, bf16_when_custom: bool) -> torch.Tens
     if bf16_when_custom and custom_all_reduce_takes(partial):
         return tensor_model_parallel_all_reduce(partial)
     return tensor_model_parallel_all_reduce(partial.float()).to(partial.dtype)
+
+def _in_full_graph() -> bool:
+    """Whether this forward runs (or is captured) as a FULL CUDA graph."""
+    return (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+    )
+
 
 def _first(linear: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
     """Call a ``(output, bias)``-returning linear for its output."""

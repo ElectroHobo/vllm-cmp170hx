@@ -65,7 +65,11 @@ MUTATIONS = {
     # The ring keeps no rows: a group closed across steps pools a stale row.
     "ring_not_written": (
         "compressor_ring",
-        (CORE, "    if bool(tail.any()):", "    if False:"),
+        (
+            CORE,
+            "    store_rows(ring, torch.where(tail, batch.ring_slots, -1), kv_score[:T])",
+            "    pass",
+        ),
         {"ring_carry_reads_own_row", "compressed_rows_match_uninterrupted"},
     ),
     # The top-k keeps one compressed position past the visible ones: a row

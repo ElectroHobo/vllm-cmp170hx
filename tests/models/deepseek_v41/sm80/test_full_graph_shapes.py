@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""What a FULL CUDA graph of the sm_80 DeepSeek-V4.1 attention relies on.
+
+* The indexer's score width is fixed per graph (``max_model_len // ratio``):
+  scoring at that width gives the same caches, selections and outputs, bit
+  for bit, as scoring at each step's own bound.
+* A decode step's batch reads the metadata builders' buffers themselves, so
+  a replay sees the contents the builders wrote in place; in a FULL graph the
+  width bound is ``max_model_len``.
+
+    pytest -q tests/models/deepseek_v41/sm80/test_full_graph_shapes.py
+"""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn as nn
+
+from vllm.models.deepseek_v41.nvidia import sm80_attention as sm80
+
+from . import test_attn_layers as layers
+from .dsv41_ref import LayerSpec, PagedRun, RefArgs, make_weights
+
+
+@pytest.mark.parametrize(
+    "specs",
+    [
+        [LayerSpec(2, kv_source=True, index_source=True), LayerSpec(2)],
+        [
+            LayerSpec(1, kv_source=True, index_source=True, candidate_source=True),
+            LayerSpec(1),
+            LayerSpec(1, index_source=True, uses_candidates=True),
+        ],
+    ],
+)
+def test_fixed_score_width_changes_nothing(monkeypatch, specs) -> None:
+    args = RefArgs()
+    weights = [make_weights(args, s, 100 + i) for i, s in enumerate(specs)]
+    xs = layers.make_inputs(args, len(specs), 5)
+    schedule = layers.make_schedule(11)
+    variable = layers.run_sm80(args, specs, weights, xs, schedule)
+
+    build = PagedRun.build
+
+    def fixed_width(self, sched):
+        batch = build(self, sched)
+        batch.max_seq_len = args.max_seq_len  # the graph's bound
+        return batch
+
+    monkeypatch.setattr(PagedRun, "build", fixed_width)
+    fixed = layers.run_sm80(args, specs, weights, xs, schedule)
+
+    (run_v, outs_v, topk_v), (run_f, outs_f, topk_f) = variable, fixed
+    assert topk_v == topk_f
+    for key in outs_v:
+        assert torch.equal(outs_v[key].view(torch.int16), outs_f[key].view(torch.int16))
+    for a, b in zip(
+        [run_v.comp, run_v.idxk, run_v.ring, *run_v.swa_caches],
+        [run_f.comp, run_f.idxk, run_f.ring, *run_f.swa_caches],
+    ):
+        assert torch.equal(a, b)
+
+
+def _layer(**attrs) -> sm80.DeepseekV41Sm80Attention:
+    layer = object.__new__(sm80.DeepseekV41Sm80Attention)
+    nn.Module.__init__(layer)
+    for k, v in attrs.items():
+        object.__setattr__(layer, k, v)
+    return layer
+
+
+def _metadata(T: int, cap: int = 16):
+    """Decode-step metadata as the builders hold it: slices of persistent
+    buffers sized for the largest batch."""
+    buf = dict(
+        swa_idx=torch.zeros(cap, 1, 8, dtype=torch.int32),
+        t2r=torch.zeros(cap, dtype=torch.int32),
+        qsl=torch.zeros(cap + 1, dtype=torch.int32),
+        slots=torch.zeros(cap, dtype=torch.int64),
+        comp_slots=torch.zeros(cap, dtype=torch.int64),
+        idxk_slots=torch.zeros(cap, dtype=torch.int64),
+        ring_slots=torch.zeros(cap, dtype=torch.int64),
+        bt=torch.zeros(cap, 4, dtype=torch.int32),
+    )
+    md = {
+        "swa": SimpleNamespace(
+            num_decode_tokens=T,
+            num_prefill_tokens=0,
+            decode_swa_indices=buf["swa_idx"][:T],
+            prefill_swa_indices=None,
+            token_to_req_indices=buf["t2r"][:T],
+            query_start_loc=buf["qsl"][: T + 1],
+            slot_mapping=buf["slots"][:T],
+        ),
+        "comp": SimpleNamespace(
+            block_table=buf["bt"], slot_mapping=buf["comp_slots"][:T], max_seq_len=37
+        ),
+        "idxk": SimpleNamespace(block_table=buf["bt"], slot_mapping=buf["idxk_slots"][:T]),
+        "ring": SimpleNamespace(slot_mapping=buf["ring_slots"][:T]),
+    }
+    return md, buf
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_decode_batch_reads_persistent_buffers(monkeypatch, full) -> None:
+    monkeypatch.setattr(sm80, "_in_full_graph", lambda: full)
+    layer = _layer(
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+        compress_ratio=2,
+        compressed_cache_prefix="comp",
+        is_kv_source=True,
+        max_model_len=4096,
+        indexer=SimpleNamespace(k_cache=SimpleNamespace(prefix="idxk")),
+        compressor=SimpleNamespace(state_cache=SimpleNamespace(prefix="ring")),
+    )
+    positions = torch.arange(16, dtype=torch.int64)
+    md, buf = _metadata(8)
+    first = layer._sm80_batch(md, positions)
+    # Every tensor the core reads is (a view of) a builder buffer: what a
+    # replay reads after the builders wrote the next step in place.
+    pairs = [
+        (first.swa_indices, buf["swa_idx"]),
+        (first.token_to_req, buf["t2r"]),
+        (first.query_start_loc, buf["qsl"]),
+        (first.swa_slots, buf["slots"]),
+        (first.comp_slots, buf["comp_slots"]),
+        (first.idxk_slots, buf["idxk_slots"]),
+        (first.ring_slots, buf["ring_slots"]),
+        (first.comp_block_table, buf["bt"]),
+        (first.idxk_block_table, buf["bt"]),
+        (first.positions, positions),
+    ]
+    for view, base in pairs:
+        assert view.data_ptr() == base.data_ptr()
+    assert first.swa_indices.shape == (8, 8)
+    # The score-width bound: the graph's in FULL, the step's otherwise.
+    assert first.max_seq_len == (4096 if full else 37)
+
+    md2, _ = _metadata(8)
+    md2["comp"].max_seq_len = 1000
+    for name in ("swa", "comp", "idxk", "ring"):
+        for attr, value in vars(md[name]).items():
+            if isinstance(value, torch.Tensor):
+                setattr(md2[name], attr, value)
+    second = layer._sm80_batch(md2, positions)
+    assert second.max_seq_len == (4096 if full else 1000)
+    assert all(
+        getattr(first, f).data_ptr() == getattr(second, f).data_ptr()
+        for f in ("swa_indices", "swa_slots", "comp_slots", "token_to_req")
+    )
+
+
+def test_full_graph_flag_follows_the_forward_context(monkeypatch) -> None:
+    from vllm.config import CUDAGraphMode
+
+    monkeypatch.setattr(sm80, "is_forward_context_available", lambda: False)
+    assert not sm80._in_full_graph()
+    monkeypatch.setattr(sm80, "is_forward_context_available", lambda: True)
+    for mode, want in (
+        (CUDAGraphMode.FULL, True),
+        (CUDAGraphMode.PIECEWISE, False),
+        (CUDAGraphMode.NONE, False),
+    ):
+        monkeypatch.setattr(
+            sm80,
+            "get_forward_context",
+            lambda mode=mode: SimpleNamespace(cudagraph_runtime_mode=mode),
+        )
+        assert sm80._in_full_graph() is want
+

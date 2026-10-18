@@ -198,7 +198,7 @@ def qdq_fp4_tile(x, E4M3_SCALE: tl.constexpr):
     return round_e2m1_tl(v) * s[:, None]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_blocks"])
 def _qdq_kernel(
     x_ptr,
     y_ptr,

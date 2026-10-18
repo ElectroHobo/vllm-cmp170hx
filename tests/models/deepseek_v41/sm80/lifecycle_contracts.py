@@ -636,6 +636,7 @@ class Stack:
             query_start_loc=qsl_t,
             swa_slots=swa_slots,
             swa_indices=swa_idx[:T],
+            max_seq_len=int(seq_lens.max()),
         )
         if self.ratio:
             e, r = self.comp_e, self.ratio

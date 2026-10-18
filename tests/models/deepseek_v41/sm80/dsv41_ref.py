@@ -650,6 +650,7 @@ class PagedRun:
             idxk_slots=torch.tensor(idxk_slots, dtype=torch.int64, device=dev),
             idxk_block_table=table("idxk"),
             ring_slots=torch.tensor(ring_slots, dtype=torch.int64, device=dev),
+            max_seq_len=max(r.length for r in reqs),
         )
         self.last_reqs = reqs
         return batch
