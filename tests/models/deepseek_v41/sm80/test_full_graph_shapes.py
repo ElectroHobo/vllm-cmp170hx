@@ -170,3 +170,71 @@ def test_full_graph_flag_follows_the_forward_context(monkeypatch) -> None:
         )
         assert sm80._in_full_graph() is want
 
+
+
+def _full_graph_padding(build, pad: int):
+    """``PagedRun.build`` with ``pad`` padding tokens appended the way a FULL
+    graph replays a smaller batch: the metadata covers the padded token count,
+    the padding tokens fall past the last request's query and so map to
+    request 0 (``compute_token_to_req_indices``), their window, compressed and
+    index-key slots are PAD, their positions are stale (here: request 0's own,
+    the worst case), and the ring slot kernel gives them request 0's ring
+    block. Their input rows are the garbage rows ``run_sm80`` appends."""
+
+    def padded(self, sched):
+        batch = build(self, sched)
+        dev = batch.positions.device
+        p0 = batch.positions[:1].expand(pad)
+        minus = torch.full((pad,), -1, dtype=torch.int64, device=dev)
+        batch.positions = torch.cat([batch.positions, p0])
+        batch.token_to_req = torch.cat(
+            [batch.token_to_req, torch.zeros(pad, dtype=batch.token_to_req.dtype)]
+        )
+        batch.swa_slots = torch.cat([batch.swa_slots, minus])
+        batch.swa_indices = torch.cat(
+            [batch.swa_indices, torch.full_like(batch.swa_indices[:1], -1).expand(pad, -1)]
+        )
+        for name in ("comp_slots", "idxk_slots"):
+            setattr(batch, name, torch.cat([getattr(batch, name), minus]))
+        req0 = self.last_reqs[0]
+        cap = self.ring.shape[1]
+        ring = req0.ring * cap + p0 % cap if req0.ring >= 0 else minus
+        batch.ring_slots = torch.cat([batch.ring_slots, ring])
+        return batch
+
+    return padded
+
+
+@pytest.mark.parametrize(
+    "specs",
+    [
+        [LayerSpec(0)],
+        [LayerSpec(2, kv_source=True, index_source=True), LayerSpec(2)],
+        [
+            LayerSpec(1, kv_source=True, index_source=True, candidate_source=True),
+            LayerSpec(1),
+            LayerSpec(1, index_source=True, uses_candidates=True),
+        ],
+    ],
+)
+def test_full_graph_padding_rows_change_nothing(monkeypatch, specs) -> None:
+    """A FULL graph replays a batch of fewer requests with padding tokens in
+    the attention region (PIECEWISE runs it on the real tokens only): the
+    padding must change no cache row, selection or output."""
+    args = RefArgs()
+    weights = [make_weights(args, s, 100 + i) for i, s in enumerate(specs)]
+    xs = layers.make_inputs(args, len(specs), 5)
+    schedule = layers.make_schedule(11)
+    plain = layers.run_sm80(args, specs, weights, xs, schedule)
+    monkeypatch.setattr(PagedRun, "build", _full_graph_padding(PagedRun.build, 3))
+    padded = layers.run_sm80(args, specs, weights, xs, schedule)
+    (run_a, outs_a, topk_a), (run_b, outs_b, topk_b) = plain, padded
+    assert topk_a == topk_b
+    for key in outs_a:
+        assert torch.equal(outs_a[key].view(torch.int16), outs_b[key].view(torch.int16)), key
+    for name, a, b in zip(
+        ["comp", "idxk", "ring", "swa"],
+        [run_a.comp, run_a.idxk, run_a.ring, run_a.swa_caches[0]],
+        [run_b.comp, run_b.idxk, run_b.ring, run_b.swa_caches[0]],
+    ):
+        assert torch.equal(a, b), name

@@ -314,8 +314,11 @@ def compress(
     latent = rms_norm(pooled.to(torch.bfloat16), norm_weight, cfg.eps)
 
     # Ring tail: only the last `capacity` tokens of each request, so no two
-    # writes land on one ring row.
-    tail = (batch.ring_slots >= 0) & (t >= qsl[req + 1] - capacity)
+    # writes land on one ring row. A FULL graph's padding tokens lie past the
+    # last request's query and map to request 0 with a ring slot of its block;
+    # they are not in any request's query and write nothing.
+    end = qsl[req + 1]
+    tail = (batch.ring_slots >= 0) & (t >= end - capacity) & (t < end)
     store_rows(ring, torch.where(tail, batch.ring_slots, -1), kv_score[:T])
     return closes, latent
 
