@@ -78,7 +78,7 @@ def export(capture, checkpoint, out):
             path = Path(row["path"])
             if sha(path) != row["sha256"]:
                 raise ValueError(f"capture hash changed: {path}")
-            obj = torch.load(path, map_location="cpu", weights_only=True)
+            obj = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
             meta = obj["meta"]
             key = (meta["rank"], meta["step"], meta["owner"], meta["call_id"])
             if key in records:
@@ -151,7 +151,7 @@ def export(capture, checkpoint, out):
         frozen = compact_state(dict(obj, meta=meta))
         meta = frozen["meta"]
         if path.exists():
-            prior = torch.load(path, map_location="cpu", weights_only=True)
+            prior = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
             if prior["meta"] != meta or prior["tensors"].keys() != frozen["tensors"].keys():
                 raise ValueError(f"frozen source metadata changed: {path}")
             for name, value in frozen["tensors"].items():
@@ -190,7 +190,7 @@ def export(capture, checkpoint, out):
         if crosses_tp(key):
             deferred.append(list(key))
             continue
-        frozen_meta = torch.load(path, map_location="cpu", weights_only=True)["meta"]
+        frozen_meta = torch.load(path, map_location="cpu", weights_only=True, mmap=True)["meta"]
         if frozen_meta.get("parent_sources"):
             local_ops[key[0]].add(meta["op"])
             for output in meta["outputs"]:
@@ -224,7 +224,7 @@ def export(capture, checkpoint, out):
             if name == "hybrid-consumer":
                 adjusted = []
                 for source in paths:
-                    obj = torch.load(source, map_location="cpu", weights_only=True)
+                    obj = torch.load(source, map_location="cpu", weights_only=True, mmap=True)
                     dest = Path(source).with_name("consumer-" + Path(source).name)
                     if not dest.exists():
                         torch.save(dict(obj, family=family), dest)
