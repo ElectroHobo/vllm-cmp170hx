@@ -300,3 +300,7 @@ def install():
     for name in ("forward", "compute_logits"):
         setattr(DSparkDeepseekV4ForCausalLM, name,
                 draft_scope(getattr(DSparkDeepseekV4ForCausalLM, name)))
+
+
+    from vllm.models.deepseek_v41.nvidia import sm80_pipeline_capture
+    sm80_pipeline_capture.install()

@@ -1050,7 +1050,9 @@ def case_row(
     if len(set(sources)) != len(sources):
         raise ValueError("duplicate captured source path")
     for path in sources:
-        expected_hash = (case.get("source_sha256") or {}).get(path)
+        expected_hash = (case.get("captured_sha256") or {}).get(path)
+        if expected_hash is not None:
+            expected_hash = expected_hash.removeprefix("sha256:")
         if expected_hash is not None:
             with open(path, "rb") as source_file:
                 actual_hash = hashlib.file_digest(source_file, "sha256").hexdigest()

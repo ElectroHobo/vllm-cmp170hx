@@ -71,7 +71,8 @@ def install():
             return original(self, qr_kv, kv_score, index_weights, positions, out)
         rec = capture.begin('attn', 'attn_pipeline', self.prefix + '.pipeline',
                             qr_kv.shape[0], cfg=dataclasses.asdict(self.sm80_cfg),
-                            layer_prefix=self.prefix, drafter=self._sm80_is_draft_layer)
+                            layer_prefix=self.prefix, drafter=self._sm80_is_draft_layer,
+                            point_phase='draft' if self._sm80_is_draft_layer else None)
         if rec is None:
             return original(self, qr_kv, kv_score, index_weights, positions, out)
         batch = dataclasses.replace(core.pad_batch(self._sm80_batch(metadata, positions), qr_kv.shape[0]))

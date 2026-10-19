@@ -9,6 +9,7 @@ preflight before any captured validation row may run.
 import argparse
 import collections
 import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -61,6 +62,50 @@ def load(rec):
     return obj
 
 
+def save_once(path, value):
+    buf = io.BytesIO()
+    torch.save(value, buf)
+    data = buf.getbuffer()
+    if path.exists():
+        if digest(path) != hashlib.sha256(data).hexdigest():
+            raise ValueError(f'refusing to replace frozen source {path}')
+        return
+    with path.open('xb') as f:
+        f.write(data)
+
+
+def compact(obj):
+    a = dict(obj['tensors'])
+    for name, table_name, slot_name, index_name in (
+            ('swa', None, 'swa_slots', 'swa_indices'),
+            ('comp', 'comp_block_table', 'comp_slots', None),
+            ('idxk', 'idxk_block_table', 'idxk_slots', None),
+            ('ring', None, 'ring_slots', None)):
+        ids = a.get('blocks.' + name)
+        if ids is None:
+            continue
+        unique, inverse = torch.unique(ids, sorted=True, return_inverse=True)
+        first = torch.full((unique.numel(),), ids.numel(), dtype=torch.int64)
+        first.scatter_reduce_(0, inverse, torch.arange(ids.numel()), reduce='amin')
+        for key in (name, 'post.' + name):
+            cache = a[key]
+            if not bitwise(cache[first][inverse], cache):
+                raise ValueError(f'aliased captured {key} blocks disagree')
+            a[key] = cache[first]
+        entries = a[name].shape[1]
+        for key, slot in ((table_name, False), (slot_name, True), (index_name, True)):
+            if key is None or a.get('batch.' + key) is None:
+                continue
+            value = a['batch.' + key]
+            blocks = value.long().clamp_min(0) // entries if slot else value.long().clamp_min(0)
+            mapped = inverse[blocks]
+            if slot:
+                mapped = mapped * entries + value.long().clamp_min(0) % entries
+            a['batch.' + key] = torch.where(value >= 0, mapped, -1).to(value.dtype)
+        a['blocks.' + name] = unique
+    return dict(obj, tensors=a)
+
+
 def _key(meta):
     return (meta['rank'], meta['step'], meta['owner'], meta['rows'])
 
@@ -97,7 +142,7 @@ def export(root, out, checkpoint):
     sources = out / 'sources'
     sources.mkdir(exist_ok=True)
     for ordinal, rec in enumerate(pipeline):
-        obj = load(rec)
+        obj = compact(load(rec))
         a, meta = obj['tensors'], obj['meta']
         cfg = meta['cfg']
         if meta['rows'] > 48 or (meta['phase'] == 'prefill' and not meta['drafter']):
@@ -131,15 +176,15 @@ def export(root, out, checkpoint):
                 if cfg['uses_candidates'] else 'index_source' if cfg['is_index_source'] else 'shared')
         kinds.add(kind)
         shape = (meta['phase'], meta['rows'], meta['rank'], meta['drafter'], meta['context'],
-                 cfg['compress_ratio'], kind, meta['owner'])
+                 cfg['compress_ratio'], kind, meta['owner'], len(meta['query_lens']))
         source = sources / f'pipeline-{ordinal}.pt'
-        torch.save(obj, source)
+        save_once(source, obj)
         for output in _outputs(cfg):
             pools[('attn_pipeline', output, shape)].append(str(source))
         joined = dict(obj, family='attn_wo_a_consumer', tensors=dict(a,
             wo_a_input=consumer['tensors']['x'], wo_a_output=consumer['tensors']['out']))
         cpath = sources / f'consumer-{ordinal}.pt'
-        torch.save(joined, cpath)
+        save_once(cpath, joined)
         pools[('attn_wo_a_consumer', None, shape)].append(str(cpath))
         provenance.append({'id': ordinal, 'attention': rec['path'], 'attention_sha256': rec['sha256'],
                            'wo_a': consumer_rec['path'], 'wo_a_sha256': consumer_rec['sha256']})
@@ -149,7 +194,7 @@ def export(root, out, checkpoint):
                                candidates=a['candidates'] if cfg['uses_candidates'] and not cfg['is_candidate_source'] else None,
                                block_size=cfg['candidate_block_size'])
             spath = sources / f'select-{ordinal}.pt'
-            torch.save(dict(obj, family='index_select', tensors=select_args), spath)
+            save_once(spath, dict(obj, family='index_select', tensors=select_args))
             pools[('index_select', None, shape)].append(str(spath))
     expected = [ranks == {0, 1, 2, 3}, roles == {False, True}, {'decode', 'verify', 'draft'} <= phases,
                 {'short', 'long'} <= contexts, {0, 1, 2} <= ratios,
@@ -160,15 +205,22 @@ def export(root, out, checkpoint):
     cases = []
     for (family, output, shape), paths in sorted(pools.items(), key=str):
         cases.append(dict(id=f'{family}/{output or "out"}/' + '/'.join(map(str, shape)),
-            family=family, **({'output': output} if output else {}), phase=shape[0], rows=shape[1],
+            family=family, **({'output': output} if output else {}),
+            phase='prefill' if shape[0] == 'prefill' else 'decode', scheduler_phase=shape[0],
+            concurrency=shape[8], rows=shape[1],
             rank=shape[2], drafter=shape[3], context=shape[4], captured_sources=paths,
-            source_sha256={path: digest(Path(path)) for path in paths}))
+            captured_sha256={path: 'sha256:' + digest(Path(path)) for path in paths}))
     for name, keep in [('attention-pipeline', lambda c: c['family'] != 'attn_wo_a_consumer'),
                        ('attention-wo-a', lambda c: c['family'] == 'attn_wo_a_consumer')]:
         doc = dict(schema='served_cases/1', checkpoint={'hybrid': str(checkpoint)},
                    cases=[c for c in cases if keep(c)], provenance=provenance,
                    scope='coupled preparation/cache/selection/output from the unified hybrid capture')
-        (out / (name + '.json')).write_text(json.dumps(doc, indent=2) + '\n')
+        path = out / (name + '.json')
+        text = json.dumps(doc, indent=2) + '\n'
+        if path.exists() and path.read_text() != text:
+            raise ValueError(f'refusing to replace frozen case file {path}')
+        if not path.exists():
+            path.write_text(text)
     return cases
 
 
@@ -182,7 +234,7 @@ def validate(path):
             raise ValueError('duplicate case ID')
         ids.add(case['id'])
         for path in case['captured_sources']:
-            expected = case['source_sha256'][path]
+            expected = case['captured_sha256'][path].removeprefix('sha256:')
             if path not in hashes:
                 hashes[path] = digest(Path(path))
             actual = hashes[path]
