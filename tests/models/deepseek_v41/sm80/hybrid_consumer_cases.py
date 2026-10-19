@@ -172,10 +172,11 @@ def _outputs(value, prefix="out"):
 
 
 def load_source(path, sha):
-    raw = Path(path).read_bytes()
-    if hashlib.sha256(raw).hexdigest() != sha:
+    with Path(path).open("rb") as stream:
+        actual_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    if actual_sha != sha:
         raise ValueError(f"consumer source hash changed: {path}")
-    return torch.load(path, map_location="cpu", weights_only=True)
+    return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
 
 
 def _owned_state(op, args, outputs):
