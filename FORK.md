@@ -415,7 +415,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/core/test_scheduler_failed_inputs.py` | 108 |
 | `tests/v1/kv_connector/conftest.py` | 17 |
 | `tests/v1/spec_decode/test_adaptive_k.py` | 223 |
-| `tests/v1/spec_decode/test_dspark_width.py` | 255 |
+| `tests/v1/spec_decode/test_dspark_width.py` | 256 |
 | `tests/v1/spec_decode/test_dspark_zero_draft.py` | 391 |
 | `tests/v1/spec_decode/test_glm5_dflash_accept_depth.py` | 378 |
 | `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 453 |
@@ -430,7 +430,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **178 files** | **88,734** |
+| **178 files** | **88,735** |
 
 #### `tools/`
 

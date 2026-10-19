@@ -233,7 +233,8 @@ def test_capture_geometry_and_k5_descriptors_unchanged(drafter, monkeypatch):
     for width, manager in drafter._cg_managers.items():
         manager._graphs_captured = True
         for n in (4, 6, 8):
-            desc = manager.dispatch(n, n * width, uniform_token_count=width)
+            desc = manager.dispatch(n, n * width, uniform_token_count=width,
+                                    num_active_loras=0)
             assert desc.cg_mode == CUDAGraphMode.FULL
             assert (desc.num_tokens, desc.num_reqs, desc.uniform_token_count) == (
                 n * width, n, width)
