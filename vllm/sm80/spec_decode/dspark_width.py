@@ -46,6 +46,13 @@ class PerKDSparkSpeculator(DSparkSpeculator):
     """
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        spec = vllm_config.speculative_config
+        assert spec is not None
+        if not getattr(spec.draft_model_config.hf_config, "sample_from_anchor", True):
+            raise ValueError(
+                "VLLM_DSPARK_PER_K_WIDTH requires sample_from_anchor=True; "
+                "fill-in graph descriptors are not restricted to the selected width"
+            )
         super().__init__(vllm_config, device)
         self._anchor_indices_by_width = {self.max_width: self._anchor_idx}
         self._confidence_by_width = {
@@ -59,10 +66,9 @@ class PerKDSparkSpeculator(DSparkSpeculator):
         for width in self.widths:
             if width in self._anchor_indices_by_width:
                 continue
-            query_len = width + int(not self.sample_from_anchor)
             self._anchor_indices_by_width[width] = (
                 torch.arange(self.max_num_reqs, dtype=torch.int64, device=self.device)
-                * query_len
+                * width
             )
             self._confidence_by_width[width] = full_confidence[:, :width]
 

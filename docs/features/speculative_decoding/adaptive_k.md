@@ -142,15 +142,17 @@ already on hand and discards the tail.
   `num_speculative_tokens_per_batch_size` (or `adaptive_k.draft_by_load`) at
   its actual width. For example, `[[1,3,5],[4,8,3]]` drafts three query rows
   per request at batch sizes four through eight for anchor-sampling models,
-  instead of five. Fill-in models use K+1 query rows. Zero-K context-only
-  steps and the target verification/acceptance policy are unchanged.
+  instead of five. This switch requires `sample_from_anchor=True`; fill-in
+  models are refused before device allocation because their graph descriptors
+  are not yet restricted to the selected width. Zero-K context-only steps and
+  the target verification/acceptance policy are unchanged.
   Per-width anchor tensors and graph managers are created before capture;
   switching widths allocates no new device storage. Logits keep their
   maximum-width request/column layout for probabilistic rejection sampling.
-  Capture sizes remain the configured **token** sizes: include enough tokens
-  for each batch and query width (e.g. 24 for eight width-three requests;
-  40 for the width-five control). The width-five path retains its original
-  layout, graph descriptors and sampling order. A non-causal backbone can
+  Capture sizes remain the configured **token** sizes; uncovered shapes run
+  eagerly. Keep the capture ladder unchanged when comparing this switch so
+  the baseline dispatch does not change. The width-five path retains its
+  original layout, graph descriptors and sampling order. A non-causal backbone can
   produce different narrow-block proposals; compare acceptance and end-to-end
   output quality rather than assuming prefix identity with a wider block.
 

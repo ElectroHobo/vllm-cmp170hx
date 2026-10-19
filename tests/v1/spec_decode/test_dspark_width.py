@@ -25,6 +25,7 @@ def _config(schedule=((1, 3, 5), (4, 8, 3))):
         num_speculative_tokens=5,
         num_speculative_tokens_per_batch_size=list(schedule),
         adaptive_k_config=None,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         uses_dynamic_speculative_decoding=lambda: bool(schedule),
     )
     return SimpleNamespace(
@@ -85,6 +86,21 @@ def test_default_off_is_original_class(monkeypatch):
     assert result.widths == (3, 5)
 
 
+def test_non_anchor_mode_is_refused_before_base_initialization(monkeypatch):
+    config = _config()
+    config.speculative_config.draft_model_config.hf_config.sample_from_anchor = False
+    base_init = MagicMock(return_value=None)
+    monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", base_init)
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", True)
+    with pytest.raises(ValueError, match="requires sample_from_anchor=True"):
+        width_module.create_dspark_speculator(config, torch.device("cpu"))
+    base_init.assert_not_called()
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
+    result = width_module.create_dspark_speculator(config, torch.device("cpu"))
+    assert type(result) is upstream.DSparkSpeculator
+    base_init.assert_called_once()
+
+
 @pytest.mark.parametrize("schedule,expected", [
     (((1, 3, 5), (4, 8, 3)), (3, 5)),
     (((1, 2, 8), (4, 6, 2), (7, 8, 0)), (2, 5)),
@@ -104,21 +120,14 @@ def test_adaptive_widths_require_draft_by_load():
         assert width_module.draft_widths(cfg) == expected
 
 
-@pytest.mark.parametrize("anchor", [True, False])
-def test_anchors_and_views_survive_width_transitions(drafter, anchor):
-    if not anchor:
-        drafter.sample_from_anchor = False
-        drafter.num_query_per_req = 6
-        drafter._anchor_idx = torch.arange(8) * 6
-        drafter._anchor_indices_by_width = {5: drafter._anchor_idx}
-        drafter.enable_draft_widths((3, 5))
+def test_anchors_and_views_survive_width_transitions(drafter):
     anchors = {w: a.clone() for w, a in drafter._anchor_indices_by_width.items()}
     pointers = {w: a.data_ptr() for w, a in drafter._anchor_indices_by_width.items()}
     logits = drafter.draft_logits = torch.empty(8, 5, 11)
     managers = drafter._cg_managers = {3: object(), 5: object()}
     for requested, selected in ((3, 3), (5, 5), (3, 3), (0, 5), (4, 5)):
         drafter.set_width(requested)
-        qlen = selected + int(not anchor)
+        qlen = selected
         assert drafter.num_query_per_req == qlen
         assert drafter.num_speculative_steps == selected
         assert drafter.query_cudagraph_manager is managers[selected]

@@ -146,7 +146,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
 | `vllm/sm80/spec_decode/aux_fc_fold.py` | 173 |
 | `vllm/sm80/spec_decode/dflash2_model.py` | 425 |
-| `vllm/sm80/spec_decode/dspark_width.py` | 84 |
+| `vllm/sm80/spec_decode/dspark_width.py` | 90 |
 | `vllm/sm80/spec_decode/lilicorr_model.py` | 31 |
 | `vllm/sm80/spec_decode/warmup.py` | 184 |
 | `vllm/sm80/spec_decode/zero_draft.py` | 29 |
@@ -157,7 +157,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **40 files** | **10,193** |
+| **40 files** | **10,199** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -236,8 +236,8 @@ Files added elsewhere, grouped by top-level directory.
 | `docs/THIRD_PARTY.md` | 85 |
 | `docs/UPSTREAM_README.md` | 111 |
 | `docs/features/quantization/exl3.md` | 88 |
-| `docs/features/speculative_decoding/adaptive_k.md` | 166 |
-| **4 files** | **450** |
+| `docs/features/speculative_decoding/adaptive_k.md` | 168 |
+| **4 files** | **452** |
 
 #### `plugins/`
 
@@ -415,7 +415,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/core/test_scheduler_failed_inputs.py` | 108 |
 | `tests/v1/kv_connector/conftest.py` | 17 |
 | `tests/v1/spec_decode/test_adaptive_k.py` | 223 |
-| `tests/v1/spec_decode/test_dspark_width.py` | 256 |
+| `tests/v1/spec_decode/test_dspark_width.py` | 265 |
 | `tests/v1/spec_decode/test_dspark_zero_draft.py` | 391 |
 | `tests/v1/spec_decode/test_glm5_dflash_accept_depth.py` | 378 |
 | `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 453 |
@@ -430,7 +430,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **178 files** | **88,735** |
+| **178 files** | **88,744** |
 
 #### `tools/`
 
@@ -686,11 +686,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 150 |
-| Fork-added product lines | 46,568 |
+| Fork-added product lines | 46,574 |
 | Patched upstream files | 94 |
 | Patched upstream lines | +4,134 / -797 |
 | Patched upstream product files | 72 |
 | Patched upstream product lines | +3,562 / -247 |
-| Product lines added (new files and patches) | 50,130 |
+| Product lines added (new files and patches) | 50,136 |
 | Fork environment variables (flags) | 100 |
 | Unreferenced fork definitions | 2 (23 lines) |
