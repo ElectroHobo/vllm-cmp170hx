@@ -207,3 +207,36 @@ def test_padding_no_host_reads_and_no_cross_layer_selection_reuse():
     assert counter.syncs == []
     assert F.bits_equal(caches.topk, selected)
     assert F.bits_equal(caches.candidates, candidates)
+
+
+def test_preprofile_runner_scratch_survives_capture_streams_without_growth(monkeypatch):
+    from types import SimpleNamespace
+    from vllm.v1.worker import workspace as wm
+    from vllm.models.deepseek_v41.nvidia.sm80_attention import DeepseekV41Sm80Attention
+
+    manager = wm.WorkspaceManager(torch.device('cuda'), num_lanes=2)
+    monkeypatch.setattr(wm, 'current_workspace_manager', lambda: manager)
+    layer = SimpleNamespace(_sm80_pipeline_execution_stream=None,
+        _sm80_pipeline_max_rows=48, max_model_len=512, q_lora_rank=128,
+        _sm80_pipeline_owner=('runner', False))
+    get = lambda: DeepseekV41Sm80Attention._sm80_pipeline_workspace(layer, 'cuda')
+    original = get()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # An independently executable direct caller gets disjoint storage.
+        independent = pipe.workspace(48, 512, 128, 'cuda', ('runner', False))
+        assert independent.scores.data_ptr() != original.scores.data_ptr()
+    with wm.use_workspace_lane(1):
+        assert get().scores.data_ptr() != original.scores.data_ptr()
+    manager.lock()
+    allocated = torch.cuda.memory_allocated()
+    for _ in range(3):
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            # Profiling and real capture are sequential transports of the
+            # already-reserved runner/lane execution context, even when locked.
+            assert get() is original
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        assert torch.cuda.memory_allocated() == allocated

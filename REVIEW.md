@@ -23,8 +23,11 @@ prefill merely because its row count is small. Context writes and
   RoPE/QDQ output directly, retaining BF16 probability and output stores.
 - `sm80_index_scores.py`: one shared score tile preserves head/rank arithmetic.
 - Runner workspace resources are separated by execution owner, lane and
-  stream; maximum configured context bounds all scratch. Source top-k and
-  candidates remain persistent until their final sharing consumer.
+  execution stream; maximum configured context bounds all scratch before
+  graph profiling. Temporary profiling/capture streams transport the same
+  serialized runner/lane and reuse that reservation; independently executable
+  callers retain stream-disjoint resources. Source top-k and candidates remain
+  persistent until their final sharing consumer.
 - Core modes are explicit: seed fused returns pre-RoPE queries; pipeline
   returns post-RoPE queries. Selecting both modes raises before launching.
 
@@ -43,7 +46,10 @@ host-sync observation. Existing seed behavior is retained.
 `fp64_cases.py` adds `index_select`, `attn_pipeline` and
 `attn_wo_a_consumer`. The coupled exporter rejects absent pre-state, changed
 hashes, duplicate sources, missing coverage and a non-unique or non-byte-linked
-actual grouped output consumer. Independent FP64 references retain BF16
+actual grouped output consumer. Coverage includes every reached supported
+padded count in each rank's scheduler census, with target/draft short/long
+contexts. Aliased physical cache blocks are checked and compacted; exports
+are immutable and use the existing captured_sha256/concurrency protocol. Independent FP64 references retain BF16
 storage points and official weights. Preselected captures can screen the
 output epilogue only; they are never complete pipeline evidence.
 
@@ -53,8 +59,8 @@ GPU tests are written, not executed. No speed or numerical PASS is claimed.
 Fresh coupled hybrid captures are required for full preparation/index and
 actual hybrid grouped-output qualification. Inspect Triton resource usage,
 all reached specialization keys, both-arm graph accounting and the complete
-captured case matrix before enabling the switch. The staged pipeline is a
-starting implementation, not a qualified speed default. It removes torch
+captured case matrix before enabling the switch. The pipeline remains
+unqualified and default-off until those GPU gates pass. It removes torch
 compressor/postprocessing/mask/top-k/full candidate-sort launches only on its
 supported path; existing oracles and unsupported paths remain intentional.
 

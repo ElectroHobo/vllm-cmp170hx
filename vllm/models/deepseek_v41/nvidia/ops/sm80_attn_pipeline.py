@@ -220,10 +220,11 @@ class PipelineWorkspace:
                 + SelectionWorkspace.bytes(rows, width))
 
 
-def workspace(rows, width, qdim, device, owner):
+def workspace(rows, width, qdim, device, owner, *, execution_stream=None):
     from vllm.v1.worker.workspace import current_workspace_manager
 
-    stream = torch.cuda.current_stream(device).cuda_stream
+    stream = (torch.cuda.current_stream(device).cuda_stream
+              if execution_stream is None else execution_stream)
     key = ('deepseek_attention_pipeline', owner, stream, rows, width, qdim)
     return current_workspace_manager().get_persistent_resource(key,
         lambda: PipelineWorkspace(rows, width, qdim, device))

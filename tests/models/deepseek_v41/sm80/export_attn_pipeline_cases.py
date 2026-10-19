@@ -138,6 +138,9 @@ def export(root, out, checkpoint):
         raise ValueError('no coupled attention captures; preselected r5 attention is not sufficient')
     ranks, roles, phases, contexts, ratios, kinds = set(), set(), set(), set(), set(), set()
     pools = collections.defaultdict(list)
+    by_rank = collections.defaultdict(set)
+    reached = collections.defaultdict(set)
+    censuses = {}
     out.mkdir(parents=True, exist_ok=True)
     sources = out / 'sources'
     sources.mkdir(exist_ok=True)
@@ -177,6 +180,8 @@ def export(root, out, checkpoint):
         kinds.add(kind)
         shape = (meta['phase'], meta['rows'], meta['rank'], meta['drafter'], meta['context'],
                  cfg['compress_ratio'], kind, meta['owner'], len(meta['query_lens']))
+        by_rank[meta['rank']].add(shape)
+        reached[meta['rank']].add((meta['phase'], meta['rows']))
         source = sources / f'pipeline-{ordinal}.pt'
         save_once(source, obj)
         for output in _outputs(cfg):
@@ -202,6 +207,35 @@ def export(root, out, checkpoint):
     if not all(expected):
         raise ValueError(f'incomplete coupled coverage: ranks={ranks}, roles={roles}, phases={phases}, '
                          f'contexts={contexts}, ratios={ratios}, kinds={kinds}')
+    # Saved samples are not a census: every reached supported padded shape
+    # must have source evidence on each rank, including eager draft calls.
+    for rank in range(4):
+        census_path = root / f'r{rank}' / 'rows_seen.json'
+        census = json.loads(census_path.read_text())
+        if census.get('schema') != 'capture-rows-seen/1':
+            raise ValueError(f'invalid row census {census_path}')
+        censuses[str(census_path)] = digest(census_path)
+        expected_rows = set()
+        for record in census['eager_calls'] + census['graph_replays']:
+            if record.get('family', 'attn') != 'attn':
+                continue
+            phase, count = record['phase'], record['rows']
+            if phase in ('decode', 'verify', 'draft') and 0 < count <= 48:
+                expected_rows.add((phase, count))
+        if not expected_rows or not expected_rows <= reached[rank]:
+            raise ValueError(f'missing supported reached row counts r{rank}: {expected_rows - reached[rank]}')
+        shapes = by_rank[rank]
+        for axis, required, label in ((0, {'decode', 'verify', 'draft'}, 'phase'),
+                (3, {False, True}, 'target/draft'), (4, {'short', 'long'}, 'context'),
+                (5, {0, 1, 2}, 'compression ratio'),
+                (6, {'candidate_source', 'candidate_consumer', 'shared'}, 'source role')):
+            found = {shape[axis] for shape in shapes}
+            if not required <= found:
+                raise ValueError(f'missing pipeline {label} r{rank}: {required - found}')
+        for draft in (False, True):
+            found = {shape[4] for shape in shapes if shape[3] == draft}
+            if found != {'short', 'long'}:
+                raise ValueError(f'missing context coverage r{rank}, draft={draft}: {found}')
     cases = []
     for (family, output, shape), paths in sorted(pools.items(), key=str):
         cases.append(dict(id=f'{family}/{output or "out"}/' + '/'.join(map(str, shape)),
@@ -213,7 +247,7 @@ def export(root, out, checkpoint):
     for name, keep in [('attention-pipeline', lambda c: c['family'] != 'attn_wo_a_consumer'),
                        ('attention-wo-a', lambda c: c['family'] == 'attn_wo_a_consumer')]:
         doc = dict(schema='served_cases/1', checkpoint={'hybrid': str(checkpoint)},
-                   cases=[c for c in cases if keep(c)], provenance=provenance,
+                   cases=[c for c in cases if keep(c)], provenance=provenance, row_censuses=censuses,
                    scope='coupled preparation/cache/selection/output from the unified hybrid capture')
         path = out / (name + '.json')
         text = json.dumps(doc, indent=2) + '\n'
@@ -229,6 +263,16 @@ def validate(path):
     if doc.get('schema') != 'served_cases/1' or not doc.get('cases') or not doc.get('provenance'):
         raise ValueError('missing nonempty coupled served_cases manifest/provenance')
     ids, hashes = set(), {}
+    for record in doc['provenance']:
+        for role in ('attention', 'wo_a'):
+            source_path = record[role]
+            if source_path not in hashes:
+                hashes[source_path] = digest(Path(source_path))
+            if hashes[source_path] != record[role + '_sha256']:
+                raise ValueError(f'changed raw capture: {source_path}')
+    for source_path, expected in doc['row_censuses'].items():
+        if digest(Path(source_path)) != expected:
+            raise ValueError(f'changed reached-row census: {source_path}')
     for case in doc['cases']:
         if case['id'] in ids:
             raise ValueError('duplicate case ID')

@@ -366,6 +366,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             self.layer_id >= vllm_config.model_config.hf_text_config.num_hidden_layers
         )
         self._sm80_pipeline_owner = (id(vllm_config), self._sm80_is_draft_layer)
+        self._sm80_pipeline_execution_stream = None
         self._sm80_attn_pipeline_enabled = bool(envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE)
         self._sm80_pipeline_reserved = self._sm80_attn_pipeline_enabled or (
             os.getenv("VLLM_DEV_AB_SWITCH") == "dsv41_attn_pipeline"
@@ -465,8 +466,16 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
     def _sm80_pipeline_workspace(self, device):
         from vllm.models.deepseek_v41.nvidia.ops.sm80_attn_pipeline import workspace
 
+        # A runner/lane executes serially. Its temporary profiling/capture
+        # streams join the execution stream and are not independent runners.
+        # Bind that execution owner before graph profiling, not one scratch
+        # allocation for every short-lived capture stream. Separate runners,
+        # target/drafter owners and WorkspaceManager ubatch/lanes stay disjoint.
+        if self._sm80_pipeline_execution_stream is None:
+            self._sm80_pipeline_execution_stream = torch.cuda.current_stream(device).cuda_stream
         return workspace(self._sm80_pipeline_max_rows, self.max_model_len,
-                         self.q_lora_rank, device, self._sm80_pipeline_owner)
+                         self.q_lora_rank, device, self._sm80_pipeline_owner,
+                         execution_stream=self._sm80_pipeline_execution_stream)
 
     def _sm80_pipeline_call(self, qr_kv, kv_score, index_weights, batch, caches):
         if not (self._sm80_attn_pipeline_enabled and self._sm80_attn_pipeline_eligible):
