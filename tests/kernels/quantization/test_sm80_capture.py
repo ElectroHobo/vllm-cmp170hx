@@ -30,6 +30,7 @@ def test_off_by_default(monkeypatch):
 def on(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", str(tmp_path))
     monkeypatch.setenv("VLLM_SM80_CAPTURE_MATCH", r"layers\.3\.")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "dense,moe,attn,mhc")
     monkeypatch.setenv("VLLM_SM80_CAPTURE_ROWS", "6")
     monkeypatch.setenv("VLLM_SM80_CAPTURE_PER_KEY", "1")
     monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_CALLS", "2")
@@ -196,3 +197,40 @@ def test_moe_point_names_operator(on):
     assert obj["family"] == "exl3_moe_out_v2"
     assert obj["tensors"]["bits_x2"] == 6 and obj["tensors"]["swiglu_limit"] == 10.0
     assert obj["meta"]["module_prefix"] == "model.layers.3.ffn.experts"
+
+
+def test_mhc_proxy_records_call_and_outputs(on):
+    """The decoder layer's mHC ops proxy: the attention-side call is named
+    hc_attn, the FFN-side hc_ffn; arguments and outputs are recorded and the
+    op's outputs pass through unchanged."""
+    from vllm.models.deepseek_v41.nvidia.sm80_model import _CapturedMhc
+
+    attn_fn, ffn_fn = torch.ones(3), torch.zeros(3)
+    outs = tuple(torch.full((2, 1), float(i)) for i in range(6))
+
+    class Ops:
+        def mhc_fused_post_pre_delayed(self, *args, **kwargs):
+            return outs
+
+        def mhc_post(self):
+            return "post"
+
+    layer = SimpleNamespace(attn=SimpleNamespace(prefix="model.layers.3.attn"),
+                            hc_attn_fn=attn_fn, hc_ffn_fn=ffn_fn)
+    proxy = _CapturedMhc(Ops(), layer)
+    assert proxy.mhc_post() == "post"
+    _step([1, 1])
+    x = torch.randn(2, 4)
+    for fn in (attn_fn, ffn_fn):
+        got = proxy.mhc_fused_post_pre_delayed(
+            x, torch.randn(2, 4, 4), torch.rand(2, 4), torch.rand(2, 16), fn,
+            torch.ones(3), torch.zeros(24), 1e-6, 1e-6, 1e-6, 2.0, 20,
+            pre_mix=None, norm_weight=torch.ones(4), norm_eps=1e-6,
+        )
+        assert got is outs
+    lines = _index(on)
+    assert sorted(x["prefix"] for x in lines) == ["model.layers.3.hc_attn", "model.layers.3.hc_ffn"]
+    obj = torch.load(lines[0]["path"], weights_only=True)
+    assert obj["family"] == "mhc_delayed" and obj["tensors"]["sinkhorn_repeat"] == 20
+    assert torch.equal(obj["tensors"]["x"], x)
+    assert torch.equal(obj["tensors"]["out_pre"], outs[4])

@@ -999,7 +999,7 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # stream: diagnostic boots only. Default empty: nothing is captured and
     # nothing is patched.
     "VLLM_SM80_CAPTURE_DIR": lambda: os.getenv("VLLM_SM80_CAPTURE_DIR", ""),
-    # Comma-separated capture families: dense, moe, attn.
+    # Comma-separated capture families: dense, moe, attn, mhc.
     "VLLM_SM80_CAPTURE_FAMILIES": lambda: os.getenv(
         "VLLM_SM80_CAPTURE_FAMILIES", "dense,moe,attn"
     ),
