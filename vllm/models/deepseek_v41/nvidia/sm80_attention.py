@@ -706,12 +706,18 @@ def wo_b_all_reduce(
     if bf16_in_pieces:
         pieces = custom_all_reduce_pieces(partial)
         if pieces is not None:
-            ca = get_tp_group().device_communicator.ca_comm
-            out = torch.empty_like(partial)
-            for piece, dst in zip(pieces, out.view(-1).split(pieces[0].numel())):
-                ca.all_reduce(piece, out=dst)
-            return out
+            return all_reduce_in_pieces(partial, pieces)
     return tensor_model_parallel_all_reduce(partial.float()).to(partial.dtype)
+
+
+def all_reduce_in_pieces(t: torch.Tensor, pieces: list[torch.Tensor]) -> torch.Tensor:
+    """All-reduce ``t`` through the TP group's custom all-reduce, one call per
+    piece of :func:`custom_all_reduce_pieces`, into one output like ``t``."""
+    ca = get_tp_group().device_communicator.ca_comm
+    out = torch.empty_like(t)
+    for piece, dst in zip(pieces, out.view(-1).split(pieces[0].numel())):
+        ca.all_reduce(piece, out=dst)
+    return out
 
 def _in_full_graph() -> bool:
     """Whether this forward runs (or is captured) as a FULL CUDA graph."""

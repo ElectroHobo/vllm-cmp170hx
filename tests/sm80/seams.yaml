@@ -1210,6 +1210,20 @@ seams:
   sha256: 90b653eeb223b37da75a5ecc6a3ba5bea05530e945c301f5117d3d5576ad4c0d
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''', use_sequence_parallel: bool = False, *, num_hash_layers: int, reduce_results: bool = True, n_routed_experts: int | None = None, n_activated_experts: int | None = None, image_sentinel_lo: int = 129257)'
 
+- id: dsv41-moe-forward
+  kind: method
+  target: vllm.models.deepseek_v4.nvidia.model:DeepseekV4MoE.forward
+  why: with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE sm80_moe.Sm80DeepseekV41MoE calls it with (hidden_states, input_ids, mega_gate_metadata) and all-reduces the [tokens, hidden] output it returns, which on the modular (non-MegaMoE) path is the runner's output with the final all-reduce skipped
+  sha256: 53c36c52f5aec0d99b54534382463313148f151f77e01f0f57fb4da3e9dd946b
+  signature: '(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None, mega_gate_metadata: vllm.models.deepseek_v4.nvidia.model.MegaGateRoutingMetadata | None = None) -> torch.Tensor'
+
+- id: dsv41-moe-runner-final-all-reduce
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner._maybe_reduce_final_output
+  why: sm80_moe sets moe_config.skip_final_all_reduce after construction; the runner then returns the un-reduced combined routed + shared output (TP or EP > 1, no sequence parallelism, a fused output not reduced by the kernel) and the layer does the one all-reduce the runner would have done
+  sha256: 6a699287ced46d4ada35e4a7dcd1c173af1fae2c45e4110878d74fa765108ffe
+  signature: '(self, states: torch.Tensor, trunc_size: int | None, output_is_reduced: bool | None = None) -> torch.Tensor'
+
 - id: dsv41-topk-bias-router-init
   kind: method
   target: vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router:FusedTopKBiasRouter.__init__

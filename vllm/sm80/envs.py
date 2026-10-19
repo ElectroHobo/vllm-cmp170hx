@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE: bool = False
+    VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
@@ -839,6 +840,24 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
     "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: all-reduce the MoE output partial (routed experts
+    # plus the shared-expert shard, BF16) that is too large for the custom
+    # all-reduce to take whole (prefill and mixed steps) through that custom
+    # all-reduce in pieces, as VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE does
+    # for wo_b, instead of NCCL's BF16 ring. Precision: NCCL's ring stores every
+    # hop's sum in BF16, so a TP4 element is rounded three times (CPU emulation:
+    # about a third of the elements differ from one rounding of the FP32 sum);
+    # the custom all-reduce sums each element in FP32 in a fixed order and rounds
+    # once, as it already does for the decode-sized messages it takes whole and
+    # as the reference all-reduces its MoE output in FP32. Speed: the custom
+    # all-reduce moves the same BF16 bytes more slowly than NCCL at these sizes.
+    # The layer does the reduction the runner would do (skip_final_all_reduce);
+    # every other message takes the communicator's usual path. Eager steps
+    # only. Default OFF: unset, the runner all-reduces the MoE output as today.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: run the decoder layers' delayed mHC (the fused
     # post + pre at every sublayer boundary and the pre-only entries) through
