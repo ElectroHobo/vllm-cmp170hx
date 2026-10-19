@@ -60,34 +60,7 @@ def compact_state(obj):
     return dict(obj, tensors=tensors, meta=dict(obj["meta"], observed_blocks=unique.tolist()))
 
 
-def served_phase_policy(spec_path):
-    required = {"prefill", "decode", "verify", "draft"}
-    if spec_path is None:
-        return required, {}
-    raw = Path(spec_path).read_bytes()
-    spec = json.loads(raw)
-    settings = spec["arms"]["cand"]["set"]
-    config = json.loads(settings["args.speculative-config"])
-    maximum = int(settings["args.max-num-seqs"])
-    table = config.get("num_speculative_tokens_per_batch_size")
-    if config.get("method") != "dspark" or table is None:
-        return required, {}
-    from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
-    lookup = build_dynamic_sd_schedule_lookup(table, maximum, config["num_speculative_tokens"])
-    if not all(value > 0 for value in lookup[1:]):
-        return required, {}
-    required.remove("decode")
-    return required, {"decode": {
-        "status": "not_served", "reason": "positive DSpark K for every admitted batch; no per-request no-spec control",
-        "capture_spec_sha256": hashlib.sha256(raw).hexdigest(),
-        "max_num_seqs": maximum, "k_by_batch_size": lookup[1:],
-        "evidence": ["vllm/v1/spec_decode/dynamic/utils.py:140-146",
-                     "vllm/v1/core/sched/scheduler.py:349-354",
-                     "vllm/sampling_params.py:412-415"]}}
-
-
-def export(capture, checkpoint, out, capture_spec=None):
-    required_phases, phase_na = served_phase_policy(capture_spec)
+def export(capture, checkpoint, out):
     indexes = sorted(capture.glob("r*/index.jsonl"))
     if not indexes:
         raise ValueError("missing hybrid captures: no rank index")
@@ -232,12 +205,10 @@ def export(capture, checkpoint, out, capture_spec=None):
             raise ValueError(f"missing hybrid captures: rank {rank} roles {absent}")
         phases = {phase for phase, _ in dimensions[rank]}
         contexts = {context for _, context in dimensions[rank]}
-        if not required_phases <= phases or not {"short", "long"} <= contexts:
+        if not {"prefill", "decode", "verify", "draft"} <= phases or not {"short", "long"} <= contexts:
             raise ValueError(f"missing hybrid captures: rank {rank} phase/context coverage {sorted(dimensions[rank])}")
         if not {"rms_norm", "swiglu", "store_rows", "compress_rows"} <= local_ops[rank]:
             raise ValueError(f"missing hybrid captures: rank {rank} actual local consumers {sorted(local_ops[rank])}")
-    if any("decode" == phase for pairs in dimensions.values() for phase, _ in pairs):
-        phase_na.pop("decode", None)
     if not deferred:
         raise ValueError("missing hybrid captures: actual TP boundaries")
     if not pools["hybrid-consumer"]:
@@ -271,7 +242,6 @@ def export(capture, checkpoint, out, capture_spec=None):
         "local_consumer_ops": {str(k): sorted(v) for k, v in local_ops.items()},
         "deferred_tp_consumers": deferred,
         "consumer_scope": "local rank; actual TP snapshots retained for distributed replay",
-        "phase_not_applicable": phase_na,
         "case_counts": {k: len(v) for k, v in pools.items()}})
     return {name: len(cases) for name, cases in pools.items()}
 
@@ -281,10 +251,9 @@ def main():
     ap.add_argument("--capture", type=Path, required=True)
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--capture-spec", type=Path, required=True)
     args = ap.parse_args()
     try:
-        print(json.dumps(export(args.capture, args.checkpoint, args.out, args.capture_spec), sort_keys=True))
+        print(json.dumps(export(args.capture, args.checkpoint, args.out), sort_keys=True))
     except (ValueError, KeyError, OSError) as exc:
         ap.exit(1, f"{exc}\n")
 

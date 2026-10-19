@@ -689,33 +689,6 @@ def test_hybrid_fp32_router_is_not_a_changed_projection(monkeypatch):
     assert not hasattr(model, "_hybrid_capture")
 
 
-def test_hybrid_phase_coverage_uses_real_schedule_tail(tmp_path):
-    import hashlib
-    import importlib.util
-    import json
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[4] / "tools/sm80/export_hybrid_cases.py"
-    module_spec = importlib.util.spec_from_file_location("hybrid_phase_export", path)
-    exporter = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(exporter)
-    config = {"method": "dspark", "num_speculative_tokens": 5,
-              "num_speculative_tokens_per_batch_size": [[1, 3, 5], [4, 8, 3]]}
-    settings = {"args.max-num-seqs": 16, "args.speculative-config": json.dumps(config)}
-    spec = tmp_path / "capture.json"
-    spec.write_text(json.dumps({"arms": {"cand": {"set": settings}}}))
-    required, na = exporter.served_phase_policy(spec)
-    assert required == {"prefill", "verify", "draft"}
-    assert na["decode"]["k_by_batch_size"][11] == 3
-    assert na["decode"]["k_by_batch_size"][15] == 3
-    assert na["decode"]["capture_spec_sha256"] == hashlib.sha256(spec.read_bytes()).hexdigest()
-    config["num_speculative_tokens_per_batch_size"].append([9, 16, 0])
-    settings["args.speculative-config"] = json.dumps(config)
-    spec.write_text(json.dumps({"arms": {"cand": {"set": settings}}}))
-    required, na = exporter.served_phase_policy(spec)
-    assert "decode" in required and not na
-
-
 # ---------------------------------------------------------------- GPU
 
 
