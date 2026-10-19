@@ -36,8 +36,9 @@ The check: candidate mean error at most 1.10x and max error at most 1.25x
 the reference path's, exact where the reference path is exact.
 ``bitwise``: the candidate equals the reference path bit for bit.
 ``row_invariance``: the first, middle and last rows (tokens; the first and
-last request for the compressor; for moe_out_prefill, which takes no fewer
-than MOE_PREFILL_MIN_ROWS rows, the first and last calls of that size) give
+last request for the compressor; for moe_out_prefill and moe_out_prefill_v2,
+which take no fewer than MOE_PREFILL_MIN_ROWS rows, the first and last calls
+of that size) give
 the same bits run alone as in the whole call. ``numel``: output elements.
 A case whose sources cannot be run gets no line and its reason goes to
 stderr; the driver then exits 1 once every other case is written, so the
@@ -70,16 +71,18 @@ unless named in full.
 - ``engram_dequant``: ``sm80_engram_dequant:dequant_engram_rows`` (values,
   scales) -> Triton / ``dequant_engram_rows_reference`` on CPU / the E4M3 x
   E8M0 product in FP64. Exact: bitwise.
-- ``exl3_moe_out``, ``exl3_moe_out_v2``, ``exl3_moe_out_prefill``:
-  ``vllm.sm80.kernels.exl3.ops:moe_out`` / ``moe_out_v2`` /
-  ``moe_out_prefill`` (x, topk_ids, topk_weights, packed_meta, expert_map,
+- ``exl3_moe_out``, ``exl3_moe_out_v2``, ``exl3_moe_out_prefill``,
+  ``exl3_moe_out_prefill_v2``: ``vllm.sm80.kernels.exl3.ops:moe_out`` /
+  ``moe_out_v2`` / ``moe_out_prefill`` / ``moe_out_prefill_v2`` (x,
+  topk_ids, topk_weights, packed_meta, expert_map,
   intermediate_size, swiglu_limit) -> that operator / ``moe_out`` / the
   routed experts in FP64 (``exl3_real_cases.moe_fp64`` with the SwiGLU
   clamp). The local experts are read from the ``target`` checkpoint by the
   layer's expert matrix names (the model's EXL3 layout applied to
   ``meta.module_prefix`` and the expert map); their layout must equal the
-  recorded ``packed_meta``. moe_out_v2 also records ``bits_x2``, the layer's
-  one routed bit width, which must be the one in ``packed_meta``.
+  recorded ``packed_meta``. moe_out_v2 and moe_out_prefill_v2 also record
+  ``bits_x2``, the layer's one routed bit width, which must be the one in
+  ``packed_meta``.
   ``moe_out`` is its own reference path.
 - ``mhc_delayed``: ``sm80_mhc:mhc_fused_post_pre_delayed`` (x, residual,
   post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
@@ -450,6 +453,7 @@ _WORKSPACE = {
     "moe_out": "moe_workspace_size",
     "moe_out_v2": "moe_workspace_size_v2",
     "moe_out_prefill": "moe_workspace_size_prefill",
+    "moe_out_prefill_v2": "moe_workspace_size_prefill_v2",
 }
 
 
@@ -528,11 +532,11 @@ def _exl3_moe(name: str, a: dict, device: torch.device, src: Source) -> Call:
         checkpoint, prefix, a["expert_map"], a["packed_meta"], device
     )
     extra = {}
-    if name == "moe_out_v2":
+    if name in ("moe_out_v2", "moe_out_prefill_v2"):
         # The layer's one routed bit width (the dispatch's gate checks it).
         bits = sorted({int(b) for b in a["packed_meta"][..., 2].flatten()})
         if len(bits) != 1 or int(a.get("bits_x2", bits[0])) != bits[0]:
-            raise ValueError(f"moe_out_v2 bits_x2 {a.get('bits_x2')} for routed "
+            raise ValueError(f"{name} bits_x2 {a.get('bits_x2')} for routed "
                              f"matrices of bits_x2 {bits}")
         extra = {"bits_x2": bits[0]}
 
@@ -553,7 +557,7 @@ def _exl3_moe(name: str, a: dict, device: torch.device, src: Source) -> Call:
     ref = run("moe_out", slice(None))
     exact = moe_exact(x, ids, tw, emap, weights, meta, inter, limit)
     n = x.shape[0]
-    if name == "moe_out_prefill":
+    if name in ("moe_out_prefill", "moe_out_prefill_v2"):
         lo = ops.MOE_PREFILL_MIN_ROWS
         subs = [slice(0, lo), slice(n - lo, n)] if n > lo else []
     else:
@@ -742,7 +746,7 @@ FAMILIES = {
     "engram_dequant": engram_dequant,
     **{
         f"exl3_{op}": functools.partial(_exl3_moe, op)
-        for op in ("moe_out", "moe_out_v2", "moe_out_prefill")
+        for op in ("moe_out", "moe_out_v2", "moe_out_prefill", "moe_out_prefill_v2")
     },
     "mhc_delayed": mhc_delayed,
     "mhc_pre_delayed": mhc_pre_delayed,
@@ -777,6 +781,8 @@ POINTS = {
     "exl3_moe_out": ("vllm.sm80.kernels.exl3.ops:moe_out", _MOE_ARGS),
     "exl3_moe_out_v2": ("vllm.sm80.kernels.exl3.ops:moe_out_v2", _MOE_ARGS + ["bits_x2"]),
     "exl3_moe_out_prefill": ("vllm.sm80.kernels.exl3.ops:moe_out_prefill", _MOE_ARGS),
+    "exl3_moe_out_prefill_v2": ("vllm.sm80.kernels.exl3.ops:moe_out_prefill_v2",
+                                _MOE_ARGS + ["bits_x2"]),
     "mhc_delayed": (f"{_MHC}:mhc_fused_post_pre_delayed",
                     ["x", "residual", "post_layer_mix", "comb_res_mix", *_MHC_ARGS]),
     "mhc_pre_delayed": (f"{_MHC}:mhc_pre_delayed", ["residual", *_MHC_ARGS]),
