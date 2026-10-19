@@ -101,6 +101,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
+    VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
+    VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -852,6 +854,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # padded step) a layer call may have to take the fused path.
     "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "48")
+    ),
+    # Complete decode/verify attention preparation, stable index selection,
+    # and ordered-value output epilogue. Independent of the qualified seed.
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE", "0"))
+    ),
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS", "48")
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.

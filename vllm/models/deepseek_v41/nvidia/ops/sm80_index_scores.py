@@ -42,6 +42,37 @@ def _row(s, hidx, h: tl.constexpr):
     return tl.sum(tl.where(hidx[:, None] == h, s, 0.0), axis=0)
 
 
+@triton.jit
+def score_tile(q_ptr, w_ptr, req_ptr, k_ptr, bt_ptr, t, cols, n_vis,
+               stride_qt, stride_qh, stride_wt, stride_kb, stride_ke, stride_bt,
+               ENTRIES: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+               HPR: tl.constexpr, BLOCK_N: tl.constexpr):
+    valid = cols < n_vis
+    req = tl.load(req_ptr + t).to(tl.int64)
+    blk = tl.load(bt_ptr + req * stride_bt + cols // ENTRIES, mask=valid, other=0)
+    koff = blk.to(tl.int64) * stride_kb + (cols % ENTRIES).to(tl.int64) * stride_ke
+    d = tl.arange(0, D)
+    k = tl.load(k_ptr + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0)
+    hidx = tl.arange(0, H)
+    q = tl.load(q_ptr + t * stride_qt + hidx[:, None] * stride_qh + d[None, :])
+    s = tl.dot(q, tl.trans(k))  # [H, BLOCK_N] fp32
+    s = tl.maximum(s.to(tl.bfloat16).to(tl.float32), 0.0)
+    w = tl.load(w_ptr + t * stride_wt + hidx).to(tl.float32)
+    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
+    total = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for r in tl.static_range(H // HPR):
+        part = _row(s, hidx, r * HPR)
+        for i in tl.static_range(1, HPR):
+            part = part + _row(s, hidx, r * HPR + i)
+        part = part.to(tl.bfloat16).to(tl.float32)
+        if r == 0:
+            total = part
+        else:
+            total = (total + part).to(tl.bfloat16).to(tl.float32)
+    total = tl.where(valid, total, float("-inf"))
+    return total
+
+
 @triton.jit(do_not_specialize=["n_cols", "stride_bt"])
 def _index_scores_kernel(
     q_ptr,
@@ -78,29 +109,9 @@ def _index_scores_kernel(
             mask=cols < n_cols,
         )
         return
-    valid = cols < n_vis
-    req = tl.load(req_ptr + t).to(tl.int64)
-    blk = tl.load(bt_ptr + req * stride_bt + cols // ENTRIES, mask=valid, other=0)
-    koff = blk.to(tl.int64) * stride_kb + (cols % ENTRIES).to(tl.int64) * stride_ke
-    d = tl.arange(0, D)
-    k = tl.load(k_ptr + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0)
-    hidx = tl.arange(0, H)
-    q = tl.load(q_ptr + t * stride_qt + hidx[:, None] * stride_qh + d[None, :])
-    s = tl.dot(q, tl.trans(k))  # [H, BLOCK_N] fp32
-    s = tl.maximum(s.to(tl.bfloat16).to(tl.float32), 0.0)
-    w = tl.load(w_ptr + t * stride_wt + hidx).to(tl.float32)
-    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
-    total = tl.zeros([BLOCK_N], dtype=tl.float32)
-    for r in tl.static_range(H // HPR):
-        part = _row(s, hidx, r * HPR)
-        for i in tl.static_range(1, HPR):
-            part = part + _row(s, hidx, r * HPR + i)
-        part = part.to(tl.bfloat16).to(tl.float32)
-        if r == 0:
-            total = part
-        else:
-            total = (total + part).to(tl.bfloat16).to(tl.float32)
-    total = tl.where(valid, total, float("-inf"))
+    total = score_tile(q_ptr, w_ptr, req_ptr, k_ptr, bt_ptr, t, cols, n_vis,
+        stride_qt, stride_qh, stride_wt, stride_kb, stride_ke, stride_bt,
+        ENTRIES, H, D, HPR, BLOCK_N)
     tl.store(out_ptr + t * stride_ot + cols, total, mask=cols < n_cols)
 
 

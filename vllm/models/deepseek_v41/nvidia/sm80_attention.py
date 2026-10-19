@@ -28,6 +28,7 @@ width ``max_model_len // ratio``. The input projections and ``wo_a`` /
 """
 
 import functools
+import os
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
@@ -344,6 +345,23 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             *self._sm80_rope_params, device=current_platform.device_type
         )
         self._sm80_chunk_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        # Eligibility is independent of the active arm; in-boot capture must
+        # be able to select either arm on both target and drafter modules.
+        self._sm80_pipeline_max_rows = envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS
+        self._sm80_max_decode_query_len = max_decode_query_len(vllm_config)
+        self._sm80_is_draft_layer = (
+            self.layer_id >= vllm_config.model_config.hf_text_config.num_hidden_layers
+        )
+        self._sm80_pipeline_owner = (id(vllm_config), self._sm80_is_draft_layer)
+        self._sm80_attn_pipeline_enabled = bool(envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE)
+        self._sm80_pipeline_reserved = self._sm80_attn_pipeline_enabled or (
+            os.getenv("VLLM_DEV_AB_SWITCH") == "dsv41_attn_pipeline"
+        )
+        self._sm80_attn_pipeline_eligible = self._sm80_pipeline_gate()
+        if self._sm80_pipeline_reserved and self._sm80_attn_pipeline_eligible:
+            from vllm.models.deepseek_v41.nvidia.ops.sm80_attn_pipeline import PIPELINE_WARMUP
+
+            PIPELINE_WARMUP.register_warmup(self)
         if self.indexer is not None and vllm_config.kernel_config.enable_jit_warmup:
             from vllm.models.deepseek_v41.nvidia.ops.sm80_index_scores import (
                 INDEX_SCORES_WARMUP,
@@ -415,6 +433,58 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         return self._sm80_is_draft_layer or not prefill_step(
             self._sm80_max_decode_query_len
         )
+
+    def _sm80_pipeline_gate(self) -> bool:
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_fused, sm80_attn_pipeline
+
+        reason = sm80_attn_fused.supports(self.n_local_heads, self.head_dim,
+            self.rope_head_dim, self.n_local_groups, self.window_size,
+            self.sm80_cfg.index_topk, self.compress_ratio, self.kv_cache_torch_dtype,
+            current_platform.get_device_capability())
+        reason = reason or sm80_attn_pipeline.supports(self.sm80_cfg,
+            self._sm80_pipeline_max_rows, self.max_model_len, self.q_lora_rank,
+            min(self._sm80_chunk_bytes, core.DEFAULT_SCORE_CHUNK_BYTES))
+        if reason is not None and self._sm80_pipeline_reserved:
+            logger.warning_once("DeepSeek-V4.1 attention pipeline disabled: %s",
+                                reason, scope="global")
+        return reason is None
+
+    def _sm80_pipeline_workspace(self, device):
+        from vllm.models.deepseek_v41.nvidia.ops.sm80_attn_pipeline import workspace
+
+        return workspace(self._sm80_pipeline_max_rows, self.max_model_len,
+                         self.q_lora_rank, device, self._sm80_pipeline_owner)
+
+    def _sm80_pipeline_call(self, qr_kv, kv_score, index_weights, batch, caches):
+        if not (self._sm80_attn_pipeline_enabled and self._sm80_attn_pipeline_eligible):
+            return False
+        if qr_kv.shape[0] > self._sm80_pipeline_max_rows:
+            return False
+        if not self._sm80_is_draft_layer and prefill_step(self._sm80_max_decode_query_len):
+            return False
+        reason = None
+        if qr_kv.dtype != torch.bfloat16 or not qr_kv.is_cuda:
+            reason = "queries must be CUDA BF16"
+        elif batch.max_seq_len > self.max_model_len:
+            reason = "context exceeds reserved workspace"
+        elif batch.swa_indices.shape[1] > self.window_size:
+            reason = "window exceeds supported width"
+        elif self.is_kv_source and (kv_score is None or
+                kv_score.dtype != torch.float32 or kv_score.stride(1) != 1):
+            reason = "compressor projection must be contiguous FP32 rows"
+        elif self.is_index_source and (index_weights is None or
+                index_weights.dtype != torch.bfloat16 or index_weights.stride(1) != 1):
+            reason = "index weights must have contiguous heads"
+        for cache in (caches.swa, caches.comp, caches.idxk):
+            if cache is not None and (cache.dtype != torch.bfloat16 or cache.stride(2) != 1):
+                reason = "cache rows must be BF16 with contiguous channels"
+        if caches.ring is not None and (caches.ring.dtype != torch.float32 or
+                                       caches.ring.stride(2) != 1):
+            reason = "ring rows must be contiguous FP32"
+        if reason is not None:
+            logger.warning_once("DeepSeek-V4.1 attention pipeline call stays unfused: %s",
+                                reason, scope="global")
+        return reason is None
 
     def _sm80_weights(self, device: torch.device) -> core.Sm80AttnWeights:
         freqs = self._sm80_freqs.to(device)
@@ -540,6 +610,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             # Profile run: no caches yet. Reserve what the indexer's score
             # chunk (scores, candidate mask, sort) can take at its bound.
             out.zero_()
+            if self._sm80_pipeline_reserved and self._sm80_attn_pipeline_eligible:
+                self._sm80_pipeline_workspace(out.device)
             if self.is_index_source and out.is_cuda:
                 torch.empty(
                     3 * self._sm80_chunk_bytes, dtype=torch.uint8, device=out.device
@@ -548,19 +620,22 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         batch = core.pad_batch(
             self._sm80_batch(attn_metadata, positions), qr_kv.shape[0]
         )
-        fused = self._sm80_fused_attn_call(qr_kv.shape[0])
+        caches = self._sm80_caches()
+        pipeline = self._sm80_pipeline_call(qr_kv, kv_score, index_weights, batch, caches)
+        workspace = self._sm80_pipeline_workspace(out.device) if pipeline else None
+        fused = not pipeline and self._sm80_fused_attn_call(qr_kv.shape[0])
         q = core.prepare_layer(
             self.sm80_cfg,
             self._sm80_weights(out.device),
-            self._sm80_caches(),
+            caches,
             batch,
             qr_kv,
             kv_score,
             index_weights,
             self._sm80_chunk_bytes,
-            fused=fused,
+            fused=fused, pipeline=pipeline, workspace=workspace,
         )
-        self._sm80_attend(batch, q, out, fused=fused)
+        self._sm80_attend(batch, q, out, fused=fused, pipeline=pipeline, workspace=workspace)
 
     def forward_mqa(
         self,
@@ -581,11 +656,12 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         self._sm80_attend(batch, q, output)
 
     def _sm80_attend(
-        self, batch, q: torch.Tensor, out: torch.Tensor, fused: bool = False
+        self, batch, q: torch.Tensor, out: torch.Tensor, fused: bool = False,
+        pipeline: bool = False, workspace=None,
     ) -> None:
         core.attend_layer(
             self.sm80_cfg, self._sm80_weights(out.device), self._sm80_caches(),
-            batch, q, out, fused=fused,
+            batch, q, out, fused=fused, pipeline=pipeline, workspace=workspace,
         )
 
     def forward_kv(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> None:

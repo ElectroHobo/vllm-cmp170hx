@@ -96,11 +96,13 @@ def _prologue_kernel(
             tl.store(cache_ptr + off + d * stride_cd, rows.to(tl.bfloat16), d < D)
 
 
-def fused_prologue(qr_kv, q_norm, kv_norm, positions, freqs, swa_cache, swa_slots, eps):
+def fused_prologue(qr_kv, q_norm, kv_norm, positions, freqs, swa_cache, swa_slots, eps,
+                   *, qr_out=None):
     t = positions.shape[0]
     d = swa_cache.shape[-1]
     qd = qr_kv.shape[1] - d
-    qr = torch.empty((t, qd), dtype=qr_kv.dtype, device=qr_kv.device)
+    qr = qr_out if qr_out is not None else torch.empty(
+        (t, qd), dtype=qr_kv.dtype, device=qr_kv.device)
     if t:
         _prologue_kernel[(t, 2)](
             qr_kv, q_norm, kv_norm, positions, freqs, swa_cache, swa_slots, qr, eps,
@@ -245,6 +247,9 @@ def _ordered_value_kernel(
     req_ptr,
     sink_ptr,
     out_ptr,
+    positions_ptr,
+    freqs_ptr,
+    n_tokens,
     n_heads,
     n_window,
     n_comp,
@@ -258,6 +263,10 @@ def _ordered_value_kernel(
     stride_ci,
     stride_ot,
     stride_oh,
+    stride_pos: tl.constexpr,
+    stride_freq: tl.constexpr,
+    RD: tl.constexpr,
+    EPILOGUE: tl.constexpr,
     SWA_E: tl.constexpr,
     COMP_E: tl.constexpr,
     HAS_COMP: tl.constexpr,
@@ -274,6 +283,10 @@ def _ordered_value_kernel(
     hmask = heads < n_heads
     d = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     dmask = d < D
+    if EPILOGUE and t >= n_tokens:
+        tl.store(out_ptr + t * stride_ot + heads[:, None] * stride_oh + d[None, :],
+                 0.0, hmask[:, None] & dmask[None, :])
+        return
     m = tl.full([BLOCK_H], -1.0e30, dtype=tl.float32)
     l = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
@@ -325,6 +338,21 @@ def _ordered_value_kernel(
     sink = tl.load(sink_ptr + heads, mask=hmask, other=float("-inf"))
     l = l + tl.exp(sink - m)
     o = acc / l[:, None]
+    if EPILOGUE:
+        # The value result is stored to BF16 BEFORE inverse RoPE and QDQ.
+        o = o.to(tl.bfloat16).to(tl.float32)
+        if tl.program_id(2) * BLOCK_D >= D - RD:
+            local = tl.arange(0, BLOCK_D)
+            partner = tl.broadcast_to((local ^ 1)[None, :], (BLOCK_H, BLOCK_D))
+            b = tl.gather(o, partner, 1)
+            angle = tl.load(positions_ptr + t * stride_pos).to(tl.float32) * tl.load(
+                freqs_ptr + ((d - (D - RD)) // 2) * stride_freq)
+            sine = libdevice.sin(angle)
+            rotated = libdevice.add_rn(libdevice.mul_rn(o, libdevice.cos(angle)[None, :]),
+                libdevice.mul_rn(b, tl.where(d % 2 == 0, sine, -sine)[None, :]))
+            o = rotated.to(tl.bfloat16).to(tl.float32)
+        o = tl.reshape(qdq_fp8_tile(tl.reshape(o, (BLOCK_H * BLOCK_D // 32, 32))),
+                       (BLOCK_H, BLOCK_D))
     tl.store(
         out_ptr + t * stride_ot + heads[:, None] * stride_oh + d[None, :],
         o.to(out_ptr.dtype.element_ty),
@@ -344,11 +372,16 @@ def sparse_attention_triton(
     req: torch.Tensor,
     attn_sink: torch.Tensor,
     scale: float,
+    *, post_rope: bool = False, final_out=None, scores_out=None,
 ) -> torch.Tensor:
-    """Rotate pre-RoPE BF16 queries and attend to window/compressed cache rows."""
+    """Attend with the seed schedule; optionally consume post-RoPE queries
+    and absorb the output rounding/RoPE/QDQ into the ordered-value store."""
     n, h, d = q.shape
-    out = torch.empty((n, h, d), dtype=torch.bfloat16, device=q.device)
+    out = final_out if final_out is not None else torch.empty(
+        (n, h, d), dtype=torch.bfloat16, device=q.device)
     if n == 0:
+        if final_out is not None:
+            out.zero_()
         return out
     assert q.stride(2) == 1 and swa_cache.stride(2) == 1
     assert swa_indices.stride(1) == 1
@@ -374,16 +407,20 @@ def sparse_attention_triton(
     window_tiles = triton.cdiv(n_window, _BLOCK_N)
     score_tiles = max(window_tiles + triton.cdiv(n_comp, _BLOCK_N), 1)
     score_width = score_tiles * _BLOCK_N
-    scores = torch.empty((n, h, score_width), dtype=torch.float32, device=q.device)
-    rotated_q = torch.empty((n, h, d), dtype=torch.bfloat16, device=q.device)
-    req_i32 = req.to(torch.int32).contiguous()
+    scores = (scores_out[:n, :, :score_width] if scores_out is not None else
+              torch.empty((n, h, score_width), dtype=torch.float32, device=q.device))
+    # The kernels address scores with this physical head stride.
+    score_width = scores.stride(1)
+    rotated_q = q if post_rope else torch.empty((n, h, d), dtype=torch.bfloat16, device=q.device)
+    req_i32 = req if post_rope else req.to(torch.int32).contiguous()
     grid = (n, triton.cdiv(h, _BLOCK_H))
-    _query_rope_kernel[(n, h)](
-        q, positions, freqs, rotated_q,
-        q.stride(0), q.stride(1), positions.stride(0), freqs.stride(0),
-        rotated_q.stride(0), rotated_q.stride(1),
-        D=d, RD=2 * freqs.numel(), num_warps=4,
-    )
+    if not post_rope:
+        _query_rope_kernel[(n, h)](
+            q, positions, freqs, rotated_q,
+            q.stride(0), q.stride(1), positions.stride(0), freqs.stride(0),
+            rotated_q.stride(0), rotated_q.stride(1),
+            D=d, RD=2 * freqs.numel(), num_warps=4,
+        )
     _score_prepass_kernel[(*grid, score_tiles)](
         rotated_q,
         swa_cache,
@@ -417,7 +454,8 @@ def sparse_attention_triton(
         num_warps=8,
         num_stages=3,
     )
-    _ordered_value_kernel[(*grid, triton.cdiv(d, _BLOCK_D))](
+    value_grid = (out.shape[0], grid[1]) if final_out is not None else grid
+    _ordered_value_kernel[(*value_grid, triton.cdiv(d, _BLOCK_D))](
         scores,
         swa_cache,
         swa_indices,
@@ -427,6 +465,9 @@ def sparse_attention_triton(
         req_i32,
         attn_sink,
         out,
+        positions,
+        freqs,
+        n,
         h,
         n_window,
         n_comp,
@@ -440,6 +481,10 @@ def sparse_attention_triton(
         s_ci,
         out.stride(0),
         out.stride(1),
+        stride_pos=positions.stride(0),
+        stride_freq=freqs.stride(0),
+        RD=2 * freqs.numel(),
+        EPILOGUE=final_out is not None,
         SWA_E=swa_cache.shape[1],
         COMP_E=comp_e,
         HAS_COMP=has_comp,
