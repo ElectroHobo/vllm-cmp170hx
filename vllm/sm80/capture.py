@@ -43,13 +43,17 @@ Selection (vllm.sm80.envs):
 - VLLM_SM80_CAPTURE_MAX_MB: bytes of tensors written per process; past it
   the index says ``saved: false``.
 
-The phase is the scheduler's, from the step the model runner executes: a
-step that schedules some request more than 1 + num_speculative_tokens
+The step phase is the scheduler's, from the step the model runner executes:
+a step that schedules some request more than 1 + num_speculative_tokens
 tokens is ``prefill``, one token per request ``decode``, otherwise
-``verify``; ``meta.query_lens`` holds every request's scheduled tokens. The
-owner is ``eager`` or the class of the CUDA graph manager that replayed the
-call (the target's or the drafter's), with the graph's descriptor in
-``meta.graph``. Profile runs, warm-ups and dummy steps are never recorded.
+``verify``; ``meta.query_lens`` holds every request's scheduled tokens. A
+record's ``phase`` is the step phase for an eager call; a call replayed in a
+CUDA graph gets the graph's own phase (the target model's graphs: ``decode``
+for one token per request, else ``verify``; a speculator's graphs:
+``draft``), since a drafter graph also runs in prefill steps with draft
+rows; ``meta.step_phase`` always holds the step phase. The owner is
+``eager`` or the class of the CUDA graph manager that replayed the call,
+with the graph's descriptor in ``meta.graph``. Profile runs, warm-ups and dummy steps are never recorded.
 """
 
 from __future__ import annotations
@@ -219,7 +223,7 @@ class Record:
         if self.in_graph:
             _pending.append(self)
         else:
-            _write([self], "eager", None)
+            _write([self], _step["phase"], "eager", None)
 
 
 def begin(
@@ -244,26 +248,31 @@ def begin(
         if _prefill_calls[key] not in cfg.prefill_calls:
             return None
         meta = dict(meta, prefill_call=_prefill_calls[key])
-    elif not cfg.match.search(prefix) or _full(family, prefix, rows, "eager"):
+    elif not cfg.match.search(prefix) or _full(
+        family, prefix, rows, _step["phase"], "eager"
+    ):
         return None
     return Record(family, point, prefix, rows, meta)
 
 
-def _key(family: str, prefix: str, rows: int, owner: str) -> tuple:
-    return (family, prefix, rows, _step["phase"], owner, _step.get("context"))
+def _key(family: str, prefix: str, rows: int, phase: str, owner: str) -> tuple:
+    return (family, prefix, rows, phase, owner, _step.get("context"))
 
 
-def _full(family: str, prefix: str, rows: int, owner: str) -> bool:
-    if _step["phase"] == "prefill":
+def _full(family: str, prefix: str, rows: int, phase: str, owner: str) -> bool:
+    if phase == "prefill":
         return False
-    return _counts.get(_key(family, prefix, rows, owner), 0) >= config().per_key
+    key = _key(family, prefix, rows, phase, owner)
+    return _counts.get(key, 0) >= config().per_key
 
 
 def _host(value: Any) -> Any:
     return value.cpu() if isinstance(value, torch.Tensor) else value
 
 
-def _write(records: list[Record], owner: str, graph: dict | None) -> None:
+def _write(
+    records: list[Record], phase: str, owner: str, graph: dict | None
+) -> None:
     cfg = config()
     sm_count = (
         torch.cuda.get_device_properties(
@@ -274,9 +283,9 @@ def _write(records: list[Record], owner: str, graph: dict | None) -> None:
     )
     lines = []
     for rec in records:
-        if _full(rec.family, rec.prefix, rec.rows, owner):
+        if _full(rec.family, rec.prefix, rec.rows, phase, owner):
             continue
-        key = _key(rec.family, rec.prefix, rec.rows, owner)
+        key = _key(rec.family, rec.prefix, rec.rows, phase, owner)
         n = _counts.get(key, 0)
         tensors = {k: _host(v) for k, v in rec.tensors.items()}
         size = sum(
@@ -286,14 +295,16 @@ def _write(records: list[Record], owner: str, graph: dict | None) -> None:
         )
         line = {
             "family": rec.family, "point": rec.point, "prefix": rec.prefix,
-            "rows": rec.rows, "phase": _step["phase"], "owner": owner,
+            "rows": rec.rows, "phase": phase, "step_phase": _step["phase"],
+            "owner": owner,
             "step": _step["step"], "context": _step.get("context"), "bytes": size,
             "saved": False,
         }
         if _bytes[0] + size <= cfg.max_bytes:
             meta = dict(
                 rec.meta, module_prefix=rec.prefix, rank=cfg.rank,
-                tp_rank=cfg.tp_rank, phase=_step["phase"], owner=owner,
+                tp_rank=cfg.tp_rank, phase=phase, step_phase=_step["phase"],
+                owner=owner,
                 step=_step["step"], query_lens=list(_step["query_lens"]),
                 context_lens=list(_step["context_lens"]),
                 rows=rec.rows, graph=graph, sm_count=sm_count,
@@ -303,7 +314,7 @@ def _write(records: list[Record], owner: str, graph: dict | None) -> None:
             os.makedirs(folder, exist_ok=True)
             path = os.path.join(
                 folder,
-                f"{name}-M{rec.rows}-{_step['phase']}-{owner}-s{_step['step']}-{n}.pt",
+                f"{name}-M{rec.rows}-{phase}-{owner}-s{_step['step']}-{n}.pt",
             )
             payload = {"schema": SCHEMA, "family": rec.point, "meta": meta,
                        "tensors": tensors}
@@ -360,12 +371,24 @@ def _bind(manager) -> None:
     _pending.clear()
 
 
+def _graph_phase(manager, desc) -> str:
+    """The phase of the calls a FULL graph replays: ``draft`` for a
+    speculator's graphs, else ``decode`` (one token per request) or
+    ``verify``."""
+    from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+
+    if not isinstance(manager, ModelCudaGraphManager):
+        return "draft"
+    return "decode" if desc.uniform_token_count == 1 else "verify"
+
+
 def _drain(manager, desc) -> None:
     records = getattr(manager.graphs.get(desc), "_sm80_capture_records", None)
     if not records or not _step["real"]:
         return
     owner = type(manager).__name__
-    if all(_full(r.family, r.prefix, r.rows, owner) for r in records):
+    phase = _graph_phase(manager, desc)
+    if all(_full(r.family, r.prefix, r.rows, phase, owner) for r in records):
         return
     torch.cuda.current_stream().synchronize()
     graph = {
@@ -375,7 +398,7 @@ def _drain(manager, desc) -> None:
         "max_query_len": desc.max_query_len,
         "mode": str(desc.cg_mode),
     }
-    _write(records, owner, graph)
+    _write(records, phase, owner, graph)
 
 
 def _install() -> None:
