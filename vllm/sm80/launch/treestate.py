@@ -24,7 +24,8 @@ The manifest rules are those of the shared provenance verifier
   block on adopted ones, the ``tracked`` inventory only in an image;
 * a non-null native manifest digest names the native manifest file
   (``native_manifest_path``), which is re-hashed; a path without a digest
-  is invalid;
+  is invalid. Native Git trees also re-check source-input identities even
+  when native bytes already exist; Git-free images use their build record;
 * ``built_in_place`` names a retained build record whose file list equals
   the map; the fork natives in its map (``*.so`` entries matching
   ``data/link_written.toml``) need a native manifest, and a native
@@ -44,8 +45,10 @@ The manifest rules are those of the shared provenance verifier
 * the build stamp is required and names the tree's commit (natively
   ``HEAD``; in a Git-free image ``provenance.json``) and the manifest's
   hashes;
-* artefacts of another commit are compatible only when no build input
-  changed between the two commits (``data/build_inputs.toml``).
+* artefacts of another commit are compatible only when every changed build
+  input is vouched for by its consuming artefact. ``data/native_inputs.toml``
+  attributes proven exclusive native inputs to that native build; all other
+  ``data/build_inputs.toml`` inputs retain the wheel-commit comparison.
 
 build-owned/1 fields: schema, source, commit, files, native_manifest_sha256,
 native_manifest_path?, build_owned_sha256, linked_from? (linked),
@@ -382,7 +385,7 @@ def tree_state(tree: str, *, image: bool = False, cache: HashCache | None = None
             if st.commit is None:
                 st.commit = prov.get("engine_commit")
     if native and manifest is not None:
-        _check_artefact_commit(st, manifest.get("commit"))
+        _check_artefact_commit(st, manifest.get("commit"), manifest, cache)
     for name in sorted(provenance_names):
         p = os.path.join(tree, name)
         if os.path.isfile(p):
@@ -433,7 +436,7 @@ def manifest_problems(manifest: dict | None, tree: str, exempt_rx: list[re.Patte
             problems.append(f"{rel}: exempt or provenance path in the owned map")
     if "tracked" in manifest and not image:
         problems.append("tracked inventory present: image manifests are checked under the image contract")
-    problems += _native_problems(manifest, tree, cache)
+    problems += _native_problems(manifest, tree, cache, check_source=not image)
     if manifest.get("source") == "linked":
         lf = manifest.get("linked_from")
         if not isinstance(lf, dict) or not all(isinstance(lf.get(k), str)
@@ -453,7 +456,8 @@ def manifest_problems(manifest: dict | None, tree: str, exempt_rx: list[re.Patte
     return problems
 
 
-def _native_problems(manifest: dict, tree: str, cache: HashCache) -> list[str]:
+def _native_problems(manifest: dict, tree: str, cache: HashCache, *,
+                     check_source: bool = True) -> list[str]:
     nsha, npath = manifest.get("native_manifest_sha256"), manifest.get("native_manifest_path")
     if nsha is None:
         return [] if npath is None else ["native_manifest_path without native_manifest_sha256"]
@@ -462,7 +466,65 @@ def _native_problems(manifest: dict, tree: str, cache: HashCache) -> list[str]:
     if not isinstance(npath, str) or not npath:
         return ["native_manifest_sha256 without native_manifest_path"]
     actual = _safe_hash(cache, _resolve(tree, npath))
-    return [] if actual == nsha else [f"native manifest {npath}: sha256 {actual} is not {nsha}"]
+    if actual != nsha:
+        return [f"native manifest {npath}: sha256 {actual} is not {nsha}"]
+    path = _resolve(tree, npath)
+    data = _read_json(path) or {}
+    return _native_source_problems(tree, path) if check_source and data.get("artefacts") else []
+
+
+def _native_source_problems(tree: str, path: str) -> list[str]:
+    source = (_read_json(path) or {}).get("source")
+    inputs = source.get("inputs") if isinstance(source, dict) else None
+    if not isinstance(inputs, dict) or not inputs:
+        return [f"native manifest {path}: no source.inputs (not a native_build.py build manifest)"]
+    out = []
+    for name, expected in sorted(inputs.items()):
+        if not isinstance(expected, str) or not HEX40.fullmatch(expected) or not name \
+                or name.startswith("/") or any(p in (".", "..", "") for p in name.split("/")):
+            out.append(f"native manifest {path}: invalid source input {name!r}: {expected!r}")
+            continue
+        try:
+            actual = _git(tree, "rev-parse", "--verify", "--quiet", f"HEAD:{name}").strip()
+        except Refusal:
+            actual = None
+        if actual != expected:
+            out.append(f"native manifest {path}: built from {name} {expected}, HEAD has {actual}")
+    return out
+
+
+def _native_input_roots(tree: str, manifest: dict, cache: HashCache) -> list[str]:
+    """Attribute exclusive input roots only to exact native bytes and source.
+
+    The mapping is byte-identical to the tools verifier's canonical contract;
+    incomplete proof leaves the inputs with the wheel rather than exempting them.
+    """
+    if not isinstance(manifest.get("files"), dict) or not manifest.get("native_manifest_sha256"):
+        return []
+    if _native_problems(manifest, tree, cache):
+        return []
+    written = load_patterns("link_written.toml", "link-written")
+    installed = {p: sha for p, sha in manifest["files"].items() if _is_native(p, written)}
+    if not installed or _native_set_problems(manifest, tree, installed, "installed natives"):
+        return []
+    if any(_safe_hash(cache, os.path.join(tree, p)) != sha for p, sha in installed.items()):
+        return []
+    native = _read_json(_resolve(tree, manifest["native_manifest_path"]))
+    inputs = native["source"]["inputs"]
+    extensions = native.get("extensions")
+    if not isinstance(extensions, dict):
+        return []
+    roots = []
+    for rule in _data("native_inputs.toml", "native-inputs")["extensions"]:
+        found = [p for p in installed if glob_regex(rule["artifact"]).match(p)]
+        if len(found) != 1 or not set(rule["source_inputs"]) <= inputs.keys():
+            continue
+        extension = extensions.get(found[0])
+        if not isinstance(extension, dict) or extension.get("builder") != rule["builder"]:
+            continue
+        if all(any(root == p or root.startswith(p + "/") for p in inputs) for root in rule["paths"]):
+            roots.extend(rule["paths"])
+    return roots
 
 
 def _build_record_problems(manifest: dict, tree: str) -> list[str]:
@@ -704,10 +766,10 @@ def _env_module_changed(tree: str, a: str, b: str, path: str, names: set[str],
         return True
 
 
-def _check_artefact_commit(st: TreeState, art) -> None:
-    """Artefacts built at another commit: compatible only when no build input
-    changed in between (data/build_inputs.toml: path patterns, and for the
-    environment modules everything but what their runtime variables defer)."""
+def _check_artefact_commit(st: TreeState, art, manifest: dict, cache: HashCache) -> None:
+    """Every changed build input needs the proof of the artefact consuming it.
+
+    Shared/core inputs always retain the wheel-commit comparison."""
     if not isinstance(art, str) or not HEX40.match(art) or st.commit is None or art == st.commit:
         return
     try:
@@ -721,7 +783,10 @@ def _check_artefact_commit(st: TreeState, art) -> None:
     env_paths, names = set(env.get("paths", [])), set(env.get("names", []))
     tables = set(env.get("tables", []))
     hits = []
+    native_roots = _native_input_roots(st.tree, manifest, cache)
     for p in changed:
+        if any(p == root or p.startswith(root + "/") for root in native_roots):
+            continue
         if not p:
             continue
         if matches(inputs, p):

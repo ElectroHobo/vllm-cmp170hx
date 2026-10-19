@@ -45,6 +45,7 @@ SUPPORTED_SCHEMAS = {
     "tree-exempt": {1},
     "build-inputs": {4},
     "link-written": {1},
+    "native-inputs": {1},
 }
 
 POINTER = "validated"
