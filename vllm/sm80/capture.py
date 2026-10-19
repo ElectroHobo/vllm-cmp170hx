@@ -54,6 +54,14 @@ for one token per request, else ``verify``; a speculator's graphs:
 rows; ``meta.step_phase`` always holds the step phase. The owner is
 ``eager`` or the class of the CUDA graph manager that replayed the call,
 with the graph's descriptor in ``meta.graph``. Profile runs, warm-ups and dummy steps are never recorded.
+
+Row counts seen, selected or not: ``<dir>/r<rank>/rows_seen.json``
+{"schema": "capture-rows-seen/1", "steps", "eager_calls": [{family, phase,
+rows, calls}], "graph_replays": [{owner, phase, step_phase, rows,
+replays}]}: every eager call of a captured family in a real step, and every
+replay of a FULL graph in a real step, rewritten at the start of every
+SEEN_EVERY-th step (the last step's own counts land with the next one) and
+with every record written.
 """
 
 from __future__ import annotations
@@ -169,6 +177,27 @@ _counts: dict[tuple, int] = {}
 _prefill_calls: dict[tuple[str, str], int] = {}
 _bytes = [0]
 _weights: dict[int, dict] = {}
+# Row counts seen (module docstring) and how often they are written.
+_seen: dict[tuple, int] = {}
+SEEN_EVERY = 1
+
+
+def _dump_seen() -> None:
+    if _cfg is None:
+        return
+    eager, graphs = [], []
+    for key, n in sorted(_seen.items(), key=lambda kv: tuple(map(str, kv[0]))):
+        if key[0] == "eager":
+            eager.append(dict(zip(("family", "phase", "rows"), key[1:]), calls=n))
+        else:
+            graphs.append(
+                dict(zip(("owner", "phase", "step_phase", "rows"), key[1:]), replays=n)
+            )
+    path = os.path.join(_cfg.root, "rows_seen.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump({"schema": "capture-rows-seen/1", "steps": _step["step"],
+                   "eager_calls": eager, "graph_replays": graphs}, f, indent=1)
+    os.replace(path + ".tmp", path)
 
 
 def set_step(scheduler_output, decode_len: int, dummy: bool) -> None:
@@ -191,6 +220,8 @@ def set_step(scheduler_output, decode_len: int, dummy: bool) -> None:
     _step.update(real=bool(lens), step=_step["step"] + 1, phase=phase,
                  query_lens=lens, context_lens=context,
                  context="long" if longest >= LONG_CONTEXT else "short")
+    if _step["step"] % SEEN_EVERY == 0:
+        _dump_seen()
 
 
 def _capturing() -> bool:
@@ -240,6 +271,8 @@ def begin(
         return Record(family, point, prefix, rows, meta, in_graph=True)
     if not _step["real"]:
         return None
+    seen = ("eager", family, _step["phase"], rows)
+    _seen[seen] = _seen.get(seen, 0) + 1
     if _step["phase"] == "prefill":
         if rows < cfg.prefill_min_rows or not cfg.prefill_match.search(prefix):
             return None
@@ -329,6 +362,7 @@ def _write(
     if lines:
         with open(os.path.join(cfg.root, "index.jsonl"), "a") as f:
             f.writelines(lines)
+        _dump_seen()
 
 
 # ------------------------------------------------------------------ weights
@@ -383,11 +417,15 @@ def _graph_phase(manager, desc) -> str:
 
 
 def _drain(manager, desc) -> None:
-    records = getattr(manager.graphs.get(desc), "_sm80_capture_records", None)
-    if not records or not _step["real"]:
+    if not _step["real"]:
         return
     owner = type(manager).__name__
     phase = _graph_phase(manager, desc)
+    seen = ("graph", owner, phase, _step["phase"], desc.num_tokens)
+    _seen[seen] = _seen.get(seen, 0) + 1
+    records = getattr(manager.graphs.get(desc), "_sm80_capture_records", None)
+    if not records:
+        return
     if all(_full(r.family, r.prefix, r.rows, phase, owner) for r in records):
         return
     torch.cuda.current_stream().synchronize()
