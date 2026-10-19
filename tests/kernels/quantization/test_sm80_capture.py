@@ -39,7 +39,7 @@ def on(monkeypatch, tmp_path):
     monkeypatch.setattr(cap, "_install", lambda: None)
     monkeypatch.setattr(cap, "_capturing", lambda: False)
     for name, value in (("_pending", []), ("_counts", {}), ("_prefill_calls", {}),
-                        ("_bytes", [0]), ("_weights", {})):
+                        ("_bytes", [0]), ("_weights", {}), ("_seen", {})):
         monkeypatch.setattr(cap, name, value)
     monkeypatch.setattr(
         cap, "_step", {"real": False, "step": 0, "phase": None, "query_lens": []}
@@ -83,6 +83,7 @@ def test_prefill_ordinals_and_dummy_steps(on):
 
 def test_decode_per_key(on):
     _step([1, 1])
+    cap.begin("dense", "exl3_linear", "layers.9.attn.wq_a", 2)  # not selected, still seen
     assert cap._step["phase"] == "decode"
     for _ in range(3):
         rec = cap.begin("moe", "exl3_moe_out_v2", "model.layers.3.ffn.experts", 2)
@@ -93,6 +94,8 @@ def test_decode_per_key(on):
     rec = cap.begin("moe", "exl3_moe_out_v2", "model.layers.3.ffn.experts", 2)
     rec.put(x=torch.ones(2, 3)).done()
     assert [x["context"] for x in _index(on)] == ["short", "long"]
+    seen = json.loads((on / "rows_seen.json").read_text())
+    assert {"family": "dense", "phase": "decode", "rows": 2, "calls": 1} in seen["eager_calls"]
     assert cap.begin("moe", "exl3_moe_out_v2", "model.layers.3.ffn.experts", 2) is None
     _step([6])
     assert cap._step["phase"] == "verify"
@@ -165,6 +168,11 @@ def test_drafter_graph_in_prefill_step_is_draft_and_bounded(on, monkeypatch):
     assert (line["phase"], line["step_phase"]) == ("draft", "prefill")
     obj = torch.load(line["path"], weights_only=True)
     assert (obj["meta"]["phase"], obj["meta"]["step_phase"]) == ("draft", "prefill")
+    # every replay counts in the row histogram, recorded or not
+    _step([1])  # the next step writes the counts
+    seen = json.loads((on / "rows_seen.json").read_text())
+    assert seen["graph_replays"] == [{"owner": "DrafterManager", "phase": "draft",
+                                      "step_phase": "prefill", "rows": 6, "replays": 3}]
 
 
 def test_moe_point_names_operator(on):
