@@ -30,6 +30,7 @@ SOURCES = (
     "ple_read.cpp", "engram_fetch.cpp", "reference.cu",
     "module.cpp",
     "dense_prefill_tc.cu",
+    "moe_prefill_v2.cu",
 )
 
 

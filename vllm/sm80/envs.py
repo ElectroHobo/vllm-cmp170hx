@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
+    VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -393,8 +394,7 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # pure function of the shape. Read when those modules are imported; other
     # devices keep normal autotuning. Off by default.
     "VLLM_FLA_PIN_AUTOTUNE": lambda: bool(
-        int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))
-    ),
+        int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))    ),
     # With pinning off, the vendored flash-linear-attention autotuners on sm_80
     # build each config before timing it and skip (never launch) one whose
     # build needs more than the context's default 1,024 B of local memory per
@@ -852,6 +852,18 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # padded step) a layer call may have to take the fused path.
     "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "48")
+    ),
+    # DeepSeek-V4.1 on sm_80: the routed experts of the decoder layers run MoE
+    # calls of 65..2048 rows in prefill steps on the tensor cores
+    # (csrc/exl3/moe_prefill_v2.cu, ops.moe_out_prefill_v2) at tensor parallel
+    # size 4, with every routed matrix of a layer at bits_x2 6 or 4, codebook 2,
+    # and 16-byte-aligned trellis bases, when no decode step of a parallel
+    # drafter can carry 65 rows (vllm/sm80/kernels/exl3/quant.py). Other calls
+    # and every call of a decode step keep their kernels. Results differ from
+    # moe_out in the last bits. Default OFF: unset, prefill calls take moe_out.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MOE_PREFILL_TC", "0"))
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.

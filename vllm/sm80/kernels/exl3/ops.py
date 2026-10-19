@@ -43,6 +43,13 @@ MOE_V2_CONFIGS = {
 MOE_PREFILL_CONFIGS = {(2560, 640, 10, 256, 512): (10,)}
 MOE_PREFILL_MIN_ROWS = MOE_V2_MAX_ROWS + 1
 MOE_PREFILL_MAX_ROWS = 3460
+# moe_out_prefill_v2 (csrc/exl3/moe_prefill_v2.cu) covers the hidden-5120
+# configuration: the DeepSeek-V4.1-Flash routed experts at expert parallel
+# size 4, bits_x2 6 or 4. It serves calls of MOE_PREFILL_MIN_ROWS to
+# MOE_PREFILL_V2_MAX_ROWS rows (the validated range: one 2048-token prefill
+# chunk).
+MOE_PREFILL_V2_CONFIGS = {(5120, 2304, 6, 96, 384): (6, 4)}
+MOE_PREFILL_V2_MAX_ROWS = 2048
 
 
 # Output dtypes of the dense linear: BF16 rounds the FP32 result once; FP32
@@ -396,6 +403,30 @@ def moe_prefill_closed_reason(
     )
 
 
+def moe_prefill_v2_closed_reason(
+    capability: tuple[int, int] | None,
+    dtype: torch.dtype,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    local_experts: int,
+    global_experts: int,
+    metadata: list[list[list[int]]],
+) -> str | None:
+    """moe_v2_closed_reason for moe_out_prefill_v2 (MOE_PREFILL_V2_CONFIGS)."""
+    return _moe_closed_reason(
+        MOE_PREFILL_V2_CONFIGS,
+        capability,
+        dtype,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        local_experts,
+        global_experts,
+        metadata,
+    )
+
+
 def linear_out(
     x,
     trellis,
@@ -681,6 +712,136 @@ def warmup_moe_prefill(
     )
     torch.cuda.synchronize(device)
     _moe_prefill_warm_devices.add(device)
+
+
+_moe_prefill_v2_fake_registered = False
+
+
+def require_moe_prefill_v2() -> None:
+    """Refuse a library without moe_out_prefill_v2 (built from a tree before
+    it) and register the operator's fake implementation once per process."""
+    global _moe_prefill_v2_fake_registered
+    ensure_extension()
+    for name in ("moe_out_prefill_v2", "moe_workspace_size_prefill_v2"):
+        try:
+            torch._C._dispatch_find_schema_or_throw(f"_exl3_C::{name}", "")
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"VLLM_DEEPSEEK_V41_MOE_PREFILL_TC needs _exl3_C::{name}: rebuild "
+                "the EXL3 extension from this tree (python "
+                "csrc/exl3/build_standalone.py --out vllm), or unset the flag. "
+                f"Detail: {exc}"
+            ) from exc
+    if not _moe_prefill_v2_fake_registered:
+        torch.library.register_fake("_exl3_C::moe_out_prefill_v2")(_moe_v2_fake)
+        _moe_prefill_v2_fake_registered = True
+
+
+@lru_cache(maxsize=None)
+def moe_workspace_size_prefill_v2(
+    max_rows: int,
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    local_experts: int,
+) -> int:
+    """FP32 workspace elements of moe_out_prefill_v2 for calls of up to
+    ``max_rows`` rows (they run in row chunks of at most 512 rows)."""
+    ensure_extension()
+    return torch.ops._exl3_C.moe_workspace_size_prefill_v2(
+        max_rows, hidden_size, intermediate_size, topk, local_experts
+    )
+
+
+def moe_out_prefill_v2(
+    x,
+    topk_ids,
+    topk_weights,
+    packed_ptrs,
+    packed_meta,
+    expert_map,
+    intermediate_size: int,
+    out,
+    workspace,
+    swiglu_limit: float = 0.0,
+    *,
+    bits_x2: int,
+) -> None:
+    """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of
+    a MOE_PREFILL_V2_CONFIGS configuration; see csrc/exl3/moe_prefill_v2.cu.
+    ``bits_x2`` is the one bit width of every routed matrix of the layer."""
+    ensure_extension()
+    torch.ops._exl3_C.moe_out_prefill_v2(
+        x,
+        topk_ids,
+        topk_weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        bits_x2,
+        out,
+        workspace,
+        swiglu_limit,
+    )
+
+
+# (device, hidden, intermediate, bits_x2) warmed by warmup_moe_prefill_v2.
+_moe_prefill_v2_warm: set[tuple] = set()
+
+
+def warmup_moe_prefill_v2(
+    packed_ptrs: torch.Tensor,
+    packed_meta: torch.Tensor,
+    expert_map: torch.Tensor,
+    global_expert_ids: list[int],
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    bits_x2: int,
+    swiglu_limit: float = 0.0,
+) -> None:
+    """Run moe_out_prefill_v2 once per device, shape and bits_x2 before any
+    CUDA graph capture.
+    Each GEMM kernel sets its shared-memory limit on its first call, and the
+    operator launches the same kernels at every row count (route tiles are
+    chosen on the device), so one call of MOE_PREFILL_MIN_ROWS rows, all with
+    local routes, loads every kernel it can launch for the layer's bits_x2.
+    The temporary buffers are freed again.
+    """
+    device = packed_ptrs.device
+    key = (device, hidden_size, intermediate_size, bits_x2)
+    if key in _moe_prefill_v2_warm:
+        return
+    rows = MOE_PREFILL_MIN_ROWS
+    ids = torch.tensor(
+        [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
+    )
+    weights = torch.full((rows, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+    x = torch.ones((rows, hidden_size), dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x)
+    workspace = torch.empty(
+        moe_workspace_size_prefill_v2(
+            rows, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+    moe_out_prefill_v2(
+        x,
+        ids,
+        weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        out,
+        workspace,
+        swiglu_limit=swiglu_limit,
+        bits_x2=bits_x2,
+    )
+    torch.cuda.synchronize(device)
+    _moe_prefill_v2_warm.add(key)
 
 
 def ple_decode_out(

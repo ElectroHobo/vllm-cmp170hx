@@ -512,7 +512,8 @@ def mixed_checkpoint(tmp_path_factory):
 def _cpu_operators(monkeypatch):
     """CPU stand-ins for the EXL3 MoE operators (CUDA only): the routed
     experts of the weights the driver loaded, in FP64 rounded to BF16. They
-    record the bits_x2 each moe_out_v2 call received."""
+    record the bits_x2 each moe_out_v2 and moe_out_prefill_v2 call
+    received."""
     from vllm.sm80.kernels.exl3 import ops
 
     loaded, seen = {}, []
@@ -526,7 +527,7 @@ def _cpu_operators(monkeypatch):
     def operator(name):
         def run(x, ids, tw, ptrs, meta, emap, inter, out, workspace,
                 swiglu_limit=0.0, *, bits_x2=None):
-            assert (bits_x2 is not None) == (name == "moe_out_v2"), name
+            assert (bits_x2 is not None) == name.endswith("_v2"), name
             if bits_x2 is not None:
                 assert {int(b) for b in meta[..., 2].flatten()} == {bits_x2}
                 seen.append(bits_x2)
@@ -535,19 +536,20 @@ def _cpu_operators(monkeypatch):
         return run
 
     monkeypatch.setattr(F, "expert_set", remember)
-    for name in ("moe_out", "moe_out_v2", "moe_out_prefill"):
+    for name in ("moe_out", "moe_out_v2", "moe_out_prefill", "moe_out_prefill_v2"):
         monkeypatch.setattr(ops, name, operator(name))
     for size in ("moe_workspace_size", "moe_workspace_size_v2",
-                 "moe_workspace_size_prefill"):
+                 "moe_workspace_size_prefill", "moe_workspace_size_prefill_v2"):
         monkeypatch.setattr(ops, size, lambda *args: 1)
     return seen
 
 
 def test_moe_families_run_at_both_bit_widths(tmp_path, mixed_checkpoint, monkeypatch):
-    """exl3_moe_out_v2 cases of a bits_x2 6 and a bits_x2 4 layer, and an
-    exl3_moe_out case, run through fp64_cases.run end to end (operators
-    replaced by CPU stand-ins): one line each, moe_out_v2 given each layer's
-    width; a recorded width that is not the layer's refuses its case."""
+    """exl3_moe_out_v2 and exl3_moe_out_prefill_v2 cases of a bits_x2 6 and a
+    bits_x2 4 layer, and an exl3_moe_out case, run through fp64_cases.run end
+    to end (operators replaced by CPU stand-ins): one line each, the v2
+    operators given each layer's width; a recorded width that is not the
+    layer's refuses its case."""
     from tests.kernels.quantization import exl3_real_cases as real
 
     seen = _cpu_operators(monkeypatch)
@@ -580,21 +582,31 @@ def test_moe_families_run_at_both_bit_widths(tmp_path, mixed_checkpoint, monkeyp
     cases = [
         source("v2_bits6", "exl3_moe_out_v2", 0, bits=6),
         source("v2_bits4", "exl3_moe_out_v2", 1, bits=4),
+        source("pv2_bits6", "exl3_moe_out_prefill_v2", 0, bits=6),
+        source("pv2_bits4", "exl3_moe_out_prefill_v2", 1, bits=4),
         source("v1_bits6", "exl3_moe_out", 0),
     ]
+    family = {
+        "v2": "exl3_moe_out_v2",
+        "pv2": "exl3_moe_out_prefill_v2",
+        "v1": "exl3_moe_out",
+    }
     rc, _, rows = _run(tmp_path, cases, target=mixed_checkpoint)
-    assert rc == 0 and set(rows) == {"v2_bits6", "v2_bits4", "v1_bits6"}
+    assert rc == 0 and set(rows) == {c["id"] for c in cases}
     for cid, row in rows.items():
         _well_formed(row)
-        assert row["family"] == ("exl3_moe_out_v2" if cid.startswith("v2") else "exl3_moe_out")
+        assert row["family"] == family[cid.split("_")[0]]
         assert row["bitwise"] and row["row_invariance"], cid
         assert row["fp64"]["cand_max"] == row["fp64"]["ref_max"] > 0, cid
-    # Whole call, moe_out reference, then three rows alone, per v2 case.
-    assert sorted(set(seen)) == [4, 6] and seen.count(6) == seen.count(4) == 4
+    # Per v2 case the whole call, then three rows alone; per prefill v2 case
+    # (3 rows, fewer than it takes alone) the whole call only.
+    assert sorted(set(seen)) == [4, 6] and seen.count(6) == seen.count(4) == 5
 
-    wrong = source("v2_wrong_bits", "exl3_moe_out_v2", 1, bits=6)
-    rc, _, rows = _run(tmp_path, [wrong], target=mixed_checkpoint)
-    assert rc == 1 and rows == {}
+    for name, fam in (("v2_wrong_bits", "exl3_moe_out_v2"),
+                      ("pv2_wrong_bits", "exl3_moe_out_prefill_v2")):
+        wrong = source(name, fam, 1, bits=6)
+        rc, _, rows = _run(tmp_path, [wrong], target=mixed_checkpoint)
+        assert rc == 1 and rows == {}, name
 
 
 # ---------------------------------------------------------------- GPU

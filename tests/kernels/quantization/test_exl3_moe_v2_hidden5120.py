@@ -163,6 +163,7 @@ def test_apply_passes_the_layer_bits_to_moe_out_v2(monkeypatch):
     experts.moe_out_rows = experts.max_rows
     experts.moe_v2_bits_x2 = 4
     experts.prefill_decode_len = 0
+    experts.prefill_v2_bits_x2 = 0
     experts.swiglu_limit = SWIGLU_LIMIT
     workspace2 = torch.zeros(8, dtype=torch.bfloat16)
     for rows in (1, 48, 64, 65):

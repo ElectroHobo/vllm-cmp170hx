@@ -57,6 +57,7 @@ def _experts(moe_out_rows, max_rows=2048, moe_v2_rows=0, prefill_decode_len=0):
     experts.moe_v2_rows = moe_v2_rows
     experts.moe_v2_bits_x2 = 10
     experts.prefill_decode_len = prefill_decode_len
+    experts.prefill_v2_bits_x2 = 0
     experts.swiglu_limit = 7.0
     return experts
 
