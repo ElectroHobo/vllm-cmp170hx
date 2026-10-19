@@ -99,31 +99,40 @@ def test_decode_per_key(on):
     assert cap.begin("moe", "exl3_moe_out_v2", "model.layers.3.ffn.experts", 6)
 
 
-def test_graph_records_follow_their_graph(on, monkeypatch):
-    class TargetManager:
-        def __init__(self):
-            self.graphs = {}
+class Graph:
+    pass
 
-    class Graph:
-        pass
 
-    manager = TargetManager()
+def _graph_record(manager, desc, monkeypatch, prefix="model.layers.3.attn"):
+    """A record captured with ``manager``'s graph ``desc``, stored with it."""
     cap._bind(manager)
-    Desc = namedtuple("Desc", "num_tokens num_reqs uniform_token_count "
-                      "max_query_len cg_mode")
-    desc = Desc(6, 1, 6, 6, "FULL")
     monkeypatch.setattr(cap, "_capturing", lambda: True)
-    assert cap.begin("attn", "dsv41_attn_layer", "model.layers.3.attn", 8) is None
-    buffer = torch.zeros(6, 2)
-    rec = cap.begin("attn", "dsv41_attn_layer", "model.layers.3.attn", 6)
-    rec.put(q=buffer)
+    rec = cap.begin("attn", "dsv41_attn_layer", prefix, desc.num_tokens)
+    rec.put(q=torch.zeros(desc.num_tokens, 2))
     rec.done()
-    assert cap._pending == [rec]
     manager.graphs[desc] = Graph()
-    assert cap._pending == []
     monkeypatch.setattr(cap, "_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_stream",
                         lambda: SimpleNamespace(synchronize=lambda: None))
+    return rec
+
+
+Desc = namedtuple("Desc", "num_tokens num_reqs uniform_token_count max_query_len cg_mode")
+
+
+def test_graph_records_follow_their_graph(on, monkeypatch):
+    from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+
+    class TargetManager(ModelCudaGraphManager):
+        def __init__(self):
+            self.graphs = {}
+
+    manager = TargetManager()
+    desc = Desc(6, 1, 6, 6, "FULL")
+    monkeypatch.setattr(cap, "_capturing", lambda: True)
+    assert cap.begin("attn", "dsv41_attn_layer", "model.layers.3.attn", 8) is None
+    rec = _graph_record(manager, desc, monkeypatch)
+    assert cap._pending == []
     cap._drain(manager, desc)  # no real step yet: nothing written
     assert _index(on) == []
     _step([6])
@@ -132,9 +141,30 @@ def test_graph_records_follow_their_graph(on, monkeypatch):
     cap._drain(manager, desc)  # per key 1
     (line,) = _index(on)
     assert line["owner"] == "TargetManager" and line["phase"] == "verify"
+    assert line["step_phase"] == "verify"
     obj = torch.load(line["path"], weights_only=True)
     assert obj["meta"]["graph"]["num_tokens"] == 6
     assert torch.equal(obj["tensors"]["q"], torch.full((6, 2), 7.0))
+
+
+def test_drafter_graph_in_prefill_step_is_draft_and_bounded(on, monkeypatch):
+    """A speculator's graph replayed in a prefill step: phase draft (the
+    step's phase in step_phase), per-key bound applied."""
+
+    class DrafterManager:
+        def __init__(self):
+            self.graphs = {}
+
+    manager = DrafterManager()
+    desc = Desc(6, 2, 3, None, "FULL")  # rows in VLLM_SM80_CAPTURE_ROWS
+    _graph_record(manager, desc, monkeypatch, prefix="model.layers.3.attn")
+    _step([2048])
+    for _ in range(3):
+        cap._drain(manager, desc)
+    (line,) = _index(on)
+    assert (line["phase"], line["step_phase"]) == ("draft", "prefill")
+    obj = torch.load(line["path"], weights_only=True)
+    assert (obj["meta"]["phase"], obj["meta"]["step_phase"]) == ("draft", "prefill")
 
 
 def test_moe_point_names_operator(on):
