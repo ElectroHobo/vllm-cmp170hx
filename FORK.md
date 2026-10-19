@@ -236,9 +236,9 @@ Files added elsewhere, grouped by top-level directory.
 |---|---:|
 | `docs/THIRD_PARTY.md` | 85 |
 | `docs/UPSTREAM_README.md` | 111 |
-| `docs/features/quantization/exl3.md` | 88 |
+| `docs/features/quantization/exl3.md` | 90 |
 | `docs/features/speculative_decoding/adaptive_k.md` | 150 |
-| **4 files** | **434** |
+| **4 files** | **436** |
 
 #### `plugins/`
 
