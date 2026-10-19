@@ -612,6 +612,9 @@ def test_operator_refuses_calls_it_does_not_cover(synthetic):
             x, ids, weights, *args, INTERMEDIATE, out, small, bits_x2=synthetic.bits_x2
         )
     workspace = torch.empty(size, device=x.device)
+    # Shapes and widths without kernels are refused on the host. A width with
+    # kernels but not the layer's would stop the device (the kernels check
+    # packed_meta); the gate hands the operator the layer's own.
     for bits_x2, intermediate in ((8, INTERMEDIATE), (10, INTERMEDIATE), (6, 640)):
         with pytest.raises(RuntimeError, match="unsupported"):
             exl3_ops.moe_out_prefill_v2(
