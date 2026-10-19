@@ -203,8 +203,8 @@ Files added elsewhere, grouped by top-level directory.
 | `CITATION.cff` | 7 |
 | `COMMUNITY_RECIPES.md` | 68 |
 | `NOTICE` | 9 |
-| `REVIEW.md` | 97 |
-| **4 files** | **181** |
+| `REVIEW.md` | 141 |
+| **4 files** | **225** |
 
 #### `.github/`
 
@@ -424,7 +424,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/plugins_tests/conftest.py` | 17 |
 | `tests/sm80/round_once_allreduce_bits.py` | 207 |
 | `tests/sm80/round_once_unchecked.py` | 46 |
-| `tests/sm80/seams.yaml` | 1,385 |
+| `tests/sm80/seams.yaml` | 1,386 |
 | `tests/sm80/test_dev_ab.py` | 545 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
 | `tests/sm80/test_dev_ab_dynamic.py` | 423 |
@@ -485,7 +485,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **213 files** | **97,042** |
+| **213 files** | **97,043** |
 
 #### `tools/`
 
@@ -495,8 +495,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tools/sm80/build_override_sidecar.py` | 370 |
 | `tools/sm80/export_hybrid_cases.py` | 262 |
 | `tools/sm80/fork_map.py` | 706 |
-| `tools/sm80/upstream_edit_exceptions.yaml` | 237 |
-| **5 files** | **1,810** |
+| `tools/sm80/upstream_edit_exceptions.yaml` | 201 |
+| **5 files** | **1,774** |
 
 ## 2. Patched upstream files
 

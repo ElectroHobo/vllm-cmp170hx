@@ -1,3 +1,47 @@
+# Consolidated DeepSeek-V4.1 execution paths
+
+## Intent and ownership
+
+The existing default-off attention, MoE prefill, attention-pipeline, hybrid
+checkpoint, per-K draft width, reduction, early-Engram and expert-placement
+paths share one implementation tree. The scheduler progress correction is
+unconditional; the earlier PP state split is already in the base.
+
+Runtime-safe modes use the allowlisted adapters in `vllm/sm80/dev_ab.py`.
+MoE V2, MoE prefill and dense prefill must be constructed enabled to reserve
+and warm their resources before an off/on comparison. mHC finish requires
+its fused parent. Checkpoint/weight layout, draft-width construction,
+reduction ownership and communicator setup remain boot-bound.
+
+The capture guard is now an owned decorator, with the original capture
+body retained exactly. Ordinary and early-gather Engram projection share
+`nvidia/sm80_engram_projection.py`; no projection implementation remains in
+the upstream class and no common-to-adapter import cycle is introduced.
+Existing constructor/load/profile/output lifetimes retain content-scoped
+exceptions, each with a reason, owner and removal condition in
+`tools/sm80/upstream_edit_exceptions.yaml`; there are no blanket file waivers.
+
+## CPU contracts and limits
+
+The CPU commands cover `tests/sm80`, `tests/models/deepseek_v41/sm80`, the
+quantization MoE-prefill/placement/dense-prefill/capture tests, DSpark width
+and zero-draft tests, scheduler progress/fairness/alignment, Qwen PLE replay
+and deferred state copies. Source-identity tests retain the original shared
+graph bodies; unset controls do not touch the runner. Both GLM and Qwen
+plain EXL3 capture paths retain the original host materialization.
+
+The config registration fixture now starts from the original class even
+when earlier tests have installed its idempotent wrapper. FP64 metadata
+assertions include the actual reference arithmetic settings, and dense
+prefill warmup assertions cover each supported output dtype. No numerical
+tolerance or production default is changed to satisfy these tests.
+
+No GPU numerical, identity, quality or speed verdict is claimed. The shared
+executor/output hooks, dev_ab, deferred capture, scheduler and EXL3 paths
+require integrated code inspection and GLM/Qwen default-configuration GPU
+identity before adoption. The feature-specific numerical and speed gates
+remain required before any default is enabled.
+
 # Attention pipeline
 
 ## Intent and interface

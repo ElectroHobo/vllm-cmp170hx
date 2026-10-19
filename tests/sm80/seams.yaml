@@ -1270,7 +1270,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model
   why: the estimate split runner overrides it (keyword-only profile_only, returns the free-memory drop in bytes); the worker calls it once for the real capture after the KV cache is sized
-  sha256: c2a7f31dc64d0b1d10fc801eb0c1894add3ad9346649a90db0d7630dbfbfd239
+  sha256: 2a6e2e6d2db27b4e82333d5e2ad5ff4695496dbd26a5f2fdc22a47d67fe07e2d
   signature: '(self, *, profile_only: bool = False) -> int'
 
 - id: graphmem-runner-profile-cudagraph-memory
@@ -1356,6 +1356,7 @@ seams:
   why: the proof inventory resolves the actual target and draft descriptor with the same batch-query compatibility rule as dispatch
   sha256: 67db5906f69666159eba6290ae57a5bc1230c975ca012f9acecc79d702f8ffa5
   signature: '(desc: vllm.v1.worker.gpu.cudagraph_utils.BatchExecutionDescriptor, num_reqs: int, num_tokens: int, uniform_token_count: int | None, num_active_loras: int, max_query_len: int | None, num_ubatches: int) -> bool'
+
 - id: dsv41-dspark-sample-sequential
   kind: method
   target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential
