@@ -9,7 +9,9 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.sm80 import capture
 from vllm.sm80.kernels.exl3 import dense_prefill_tc
+from vllm.sm80.kernels.exl3 import capture_points
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -1027,6 +1029,8 @@ def _linear(
             out[start : start + row_chunk],
             workspace,
         )
+    if capture.active:
+        capture_points.linear(x, trellis, out, operator)
     return out
 
 

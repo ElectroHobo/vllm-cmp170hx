@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_EXL3_OVERRIDE: str = ""
     VLLM_EXL3_OVERRIDE_SHA256: str = ""
+    VLLM_EXL3_HYBRID: bool = False
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
@@ -102,6 +103,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
+    VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
+    VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -117,6 +120,15 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
     VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
+    VLLM_SM80_CAPTURE_DIR: str = ""
+    VLLM_SM80_CAPTURE_FAMILIES: str = "dense,moe,attn"
+    VLLM_SM80_CAPTURE_MATCH: str = ""
+    VLLM_SM80_CAPTURE_ROWS: str = ""
+    VLLM_SM80_CAPTURE_PER_KEY: int = 2
+    VLLM_SM80_CAPTURE_PREFILL_MATCH: str = ""
+    VLLM_SM80_CAPTURE_PREFILL_CALLS: str = "1"
+    VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS: int = 65
+    VLLM_SM80_CAPTURE_MAX_MB: int = 4096
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
     VLLM_DEV_AB_SWITCH: str = ""
@@ -798,6 +810,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_OVERRIDE_SHA256": lambda: os.getenv(
         "VLLM_EXL3_OVERRIDE_SHA256", ""
     ),
+    # Load an EXL3 checkpoint whose quantization_config routes module classes
+    # to EXL3, unquantized or a second registered method (module_quantization,
+    # non_routed_quantization; vllm/sm80/kernels/exl3/hybrid.py), its tensors
+    # selected by its index. Unset: such a config is refused; EXL3
+    # checkpoints without those keys load as before either way.
+    "VLLM_EXL3_HYBRID": lambda: bool(int(os.getenv("VLLM_EXL3_HYBRID", "0"))),
     # Order Qwen QSA's native-selected blocks before expansion/attention.
     # Set 0 to retain native traversal order without changing selection.
     "VLLM_QWEN_QSA_TOPK_SORTED": lambda: bool(
@@ -865,6 +883,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
     "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_MOE_PREFILL_TC", "0"))
+    ),
+    # Complete decode/verify attention preparation, stable index selection,
+    # and ordered-value output epilogue. Independent of the qualified seed.
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE", "0"))
+    ),
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS", "48")
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
@@ -980,6 +1006,41 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # its own input, so the output bits do not change. Default 0: whole calls.
     "VLLM_EXL3_MOE_CHUNK_ROWS": lambda: int(
         os.getenv("VLLM_EXL3_MOE_CHUNK_ROWS", "0")
+    ),
+    # Diagnostic: a directory to which selected served kernel calls (inputs
+    # and outputs) are saved (vllm/sm80/capture.py). Saving waits for the
+    # stream: diagnostic boots only. Default empty: nothing is captured and
+    # nothing is patched.
+    "VLLM_SM80_CAPTURE_DIR": lambda: os.getenv("VLLM_SM80_CAPTURE_DIR", ""),
+    # Comma-separated capture families: dense, moe, attn, mhc.
+    "VLLM_SM80_CAPTURE_FAMILIES": lambda: os.getenv(
+        "VLLM_SM80_CAPTURE_FAMILIES", "dense,moe,attn"
+    ),
+    # Regex searched in a call's prefix (checkpoint prefix for dense
+    # matrices, module prefix otherwise): the calls captured outside prefill
+    # steps. Default empty: every prefix.
+    "VLLM_SM80_CAPTURE_MATCH": lambda: os.getenv("VLLM_SM80_CAPTURE_MATCH", ""),
+    # Comma-separated row counts of the CUDA graphs whose calls are captured.
+    "VLLM_SM80_CAPTURE_ROWS": lambda: os.getenv("VLLM_SM80_CAPTURE_ROWS", ""),
+    # Files per (family, prefix, rows, phase, graph owner).
+    "VLLM_SM80_CAPTURE_PER_KEY": lambda: int(
+        os.getenv("VLLM_SM80_CAPTURE_PER_KEY", "2")
+    ),
+    # Regex of the prefixes captured in prefill steps (default: the MATCH one).
+    "VLLM_SM80_CAPTURE_PREFILL_MATCH": lambda: os.getenv(
+        "VLLM_SM80_CAPTURE_PREFILL_MATCH", ""
+    ),
+    # Comma-separated ordinals, per family and prefix from 1, of the prefill
+    # step calls (of at least _PREFILL_MIN_ROWS rows) that are saved.
+    "VLLM_SM80_CAPTURE_PREFILL_CALLS": lambda: os.getenv(
+        "VLLM_SM80_CAPTURE_PREFILL_CALLS", "1"
+    ),
+    "VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS", "65")
+    ),
+    # Most MiB of tensors one process saves; later calls are only indexed.
+    "VLLM_SM80_CAPTURE_MAX_MB": lambda: int(
+        os.getenv("VLLM_SM80_CAPTURE_MAX_MB", "4096")
     ),
     # Preserve BF16 router operands but accumulate and return logits in FP32.
     "VLLM_QWEN4_ROUTER_FP32": lambda: bool(

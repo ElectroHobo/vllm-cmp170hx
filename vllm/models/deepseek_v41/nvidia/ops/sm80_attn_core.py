@@ -790,6 +790,8 @@ def prepare_layer(
     index_weights: torch.Tensor | None,
     chunk_bytes: int = DEFAULT_SCORE_CHUNK_BYTES,
     fused: bool = False,
+    pipeline: bool = False,
+    workspace=None,
 ) -> torch.Tensor:
     """Everything before attention: norms, ``wq_b`` and the query RoPE, this
     step's KV writes, and at index sources the top-k (and candidate) buffers.
@@ -801,7 +803,15 @@ def prepare_layer(
 
     ``fused``: the norms and the window row run as one launch
     (``sm80_attn_fused.prologue``) and the returned query is ``wq_b``'s output
-    BEFORE RoPE, which :func:`attend_layer` with ``fused`` rotates."""
+    BEFORE RoPE, which :func:`attend_layer` with ``fused`` rotates.
+    ``pipeline`` is mutually exclusive with ``fused``: it uses reserved scratch,
+    fuses compressor/query/key/selection work and returns POST-RoPE queries."""
+    if pipeline:
+        if fused or workspace is None:
+            raise ValueError("pipeline needs workspace and excludes pre-RoPE fused mode")
+        from vllm.models.deepseek_v41.nvidia.ops.sm80_attn_pipeline import prepare
+
+        return prepare(cfg, weights, caches, batch, qr_kv, kv_score, index_weights, workspace)
     T = batch.num_tokens
     pos = batch.positions
     d = cfg.head_dim
@@ -843,6 +853,8 @@ def attend_layer(
     q: torch.Tensor,
     out: torch.Tensor,
     fused: bool = False,
+    pipeline: bool = False,
+    workspace=None,
 ) -> None:
     """Sparse attention of the post-RoPE ``q`` over the window slots and the
     selected compressed positions (``caches.topk``), then the output RoPE and
@@ -851,8 +863,20 @@ def attend_layer(
 
     ``fused``: ``q`` is the pre-RoPE query of :func:`prepare_layer` with
     ``fused``; the query RoPE, attention and output run as
-    ``sm80_attn_fused.attend``."""
+    ``sm80_attn_fused.attend``. ``pipeline`` consumes the POST-RoPE query
+    and writes inverse-RoPE/QDQ output in the ordered-value kernel itself."""
     T = batch.num_tokens
+    if pipeline:
+        if fused or workspace is None:
+            raise ValueError("pipeline needs workspace and excludes pre-RoPE fused mode")
+        from vllm.models.deepseek_v41.nvidia.ops.sm80_attn_fused import sparse_attention_triton
+
+        sparse_attention_triton(q[:T], batch.positions, weights.freqs, caches.swa,
+            batch.swa_indices, caches.comp, batch.comp_block_table,
+            caches.topk[:T] if cfg.compress_ratio else None, batch.token_to_req,
+            weights.attn_sink, cfg.softmax_scale, post_rope=True, final_out=out,
+            scores_out=workspace.attention_scores)
+        return
     if fused:
         from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_fused
 

@@ -122,6 +122,7 @@ unless named in full.
 
 import argparse
 import functools
+import hashlib
 import json
 import math
 import sys
@@ -878,6 +879,12 @@ def attn_attend(a: dict, device: torch.device, _src: Source) -> Call:
             return ref(rows)
         n = pos[rows].shape[0]
         out = t["out"][:n].clone()
+        if _src.meta.get("variant") == "pipeline_epilogue":
+            fused.sparse_attention_triton(q[rows], pos[rows], t["freqs"],
+                t["swa_cache"], t["swa_indices"][rows], t["comp_cache"],
+                t["comp_block_table"], None if local is None else local[rows],
+                t["req"][rows], t["attn_sink"], scale, final_out=out)
+            return out
         fused.attend(
             q[rows], pos[rows], t["freqs"], t["swa_cache"], t["swa_indices"][rows],
             t["comp_cache"], t["comp_block_table"],
@@ -918,10 +925,40 @@ def attn_attend(a: dict, device: torch.device, _src: Source) -> Call:
 
 
 # Families with several outputs: the case names the one it judges.
-MULTI_OUTPUT = {"mhc_delayed", "mhc_pre_delayed", "attn_prologue"}
+MULTI_OUTPUT = {"mhc_delayed", "mhc_pre_delayed", "attn_prologue", "attn_pipeline",
+                "hybrid_linear_consumer"}
+
+
+def index_select(a, device, src):
+    from tests.models.deepseek_v41.sm80.attn_pipeline_cases import index_select_case
+    return index_select_case(a, device, src)
+
+
+def attn_pipeline(a, device, src):
+    from tests.models.deepseek_v41.sm80.attn_pipeline_cases import attn_pipeline as replay
+    return replay(a, device, src)
+
+
+def attn_wo_a_consumer(a, device, src):
+    from tests.models.deepseek_v41.sm80.attn_pipeline_cases import attn_wo_a_consumer as replay
+    return replay(a, device, src)
+
+
+def hybrid_linear(a, device, src):
+    from tests.models.deepseek_v41.sm80.hybrid_linear_cases import hybrid_linear as run
+
+    return run(a, device, src)
+
+
+def hybrid_linear_consumer(a, device, src):
+    from tests.models.deepseek_v41.sm80.hybrid_consumer_cases import hybrid_linear_consumer as run
+
+    return run(a, device, src)
 
 
 FAMILIES = {
+    "hybrid_linear": hybrid_linear,
+    "hybrid_linear_consumer": hybrid_linear_consumer,
     "sparse_attention": sparse_attention,
     "index_scores": index_scores,
     "qdq_fp8": qdq_fp8,
@@ -937,6 +974,9 @@ FAMILIES = {
     "mhc_pre_delayed": mhc_pre_delayed,
     "attn_prologue": attn_prologue,
     "attn_attend": attn_attend,
+    "index_select": index_select,
+    "attn_pipeline": attn_pipeline,
+    "attn_wo_a_consumer": attn_wo_a_consumer,
 }
 
 
@@ -950,6 +990,17 @@ _MHC_ARGS = ["fn", "hc_scale", "hc_base", "rms_eps", "hc_pre_eps", "hc_sinkhorn_
              "hc_post_mult_value", "sinkhorn_repeat", "pre_mix", "norm_weight", "norm_eps"]
 _FUSED = "vllm.models.deepseek_v41.nvidia.ops.sm80_attn_fused"
 POINTS = {
+    # Coupled attention and consumer sources use the diagnostic model adapter
+    # to add flat pre-state tensors and loaded projection facts to these inputs.
+    "attn_pipeline": (
+        "vllm.models.deepseek_v41.nvidia.sm80_attention:DeepseekV41Sm80Attention._sm80_attention",
+        ["qr_kv", "kv_score", "index_weights", "positions", "out"]),
+    "attn_wo_a_consumer": (
+        "vllm.models.deepseek_v41.nvidia.sm80_attention:DeepseekV41Sm80Attention._o_proj",
+        ["attn_out", "positions"]),
+    "index_select": (f"{_CORE}:select_topk", ["scores", "n_vis", "k"]),
+    "hybrid_linear": ("vllm.model_executor.layers.quantization.modelopt:ModelOptLinearMethod.apply", ["x"]),
+    "hybrid_linear_consumer": ("vllm.models.deepseek_v41.nvidia.hybrid_capture:_record", ["op", "args"]),
     "sparse_attention": (f"{_CORE}:sparse_attention",
                          ["q", "swa_cache", "swa_indices", "comp_cache",
                           "comp_block_table", "comp_local", "req", "sink", "scale"]),
@@ -1002,7 +1053,17 @@ def case_row(
     count = numel = 0
     bitwise = invariant = True
     families = set()
+    if len(set(sources)) != len(sources):
+        raise ValueError("duplicate captured source path")
     for path in sources:
+        expected_hash = (case.get("captured_sha256") or {}).get(path)
+        if expected_hash is not None:
+            expected_hash = expected_hash.removeprefix("sha256:")
+        if expected_hash is not None:
+            with open(path, "rb") as source_file:
+                actual_hash = hashlib.file_digest(source_file, "sha256").hexdigest()
+            if actual_hash != expected_hash:
+                raise ValueError(f"{path}: captured source hash changed")
         obj = torch.load(path, map_location="cpu", weights_only=True)
         if obj.get("schema") != SOURCE_SCHEMA:
             raise ValueError(f"{path}: schema {obj.get('schema')!r} is not {SOURCE_SCHEMA}")
@@ -1054,6 +1115,12 @@ def header(device: torch.device) -> dict:
         "cuda": torch.version.cuda,
         "gpu": gpu,
         "sm_count": sms,
+        "reference_math": {
+            "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "allow_bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+            "allow_fp16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        },
     }
 
 
@@ -1065,6 +1132,10 @@ def run(cases: Path, out: Path, device: torch.device) -> int:
     if not isinstance(doc, dict) or doc.get("schema") not in SCHEMAS:
         print(f"{cases}: schema is not one of {SCHEMAS}", file=sys.stderr)
         return 2
+    if any(str(c.get("family", "")).startswith("hybrid_linear") for c in doc.get("cases", [])):
+        from tests.models.deepseek_v41.sm80.hybrid_linear_cases import reference_settings
+
+        reference_settings()
     with Path(out).open("w") as f, torch.inference_mode():
         f.write(json.dumps({"header": header(device)}) + "\n")
         checkpoint = doc.get("checkpoint") or {}

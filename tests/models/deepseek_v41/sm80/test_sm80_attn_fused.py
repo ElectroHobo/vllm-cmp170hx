@@ -33,6 +33,10 @@ def test_switches_default_off(monkeypatch):
     monkeypatch.delenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", raising=False)
     assert envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE is False
     assert envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS == 48
+    monkeypatch.delenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE", raising=False)
+    monkeypatch.delenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS", raising=False)
+    assert envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE is False
+    assert envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS == 48
     monkeypatch.setenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "1")
     monkeypatch.setenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "16")
     assert envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE is True
@@ -127,6 +131,7 @@ def test_the_layer_gate(monkeypatch):
 def test_the_layer_functions_default_to_the_unfused_path():
     for fn in (core.prepare_layer, core.attend_layer):
         assert inspect.signature(fn).parameters["fused"].default is False
+        assert inspect.signature(fn).parameters["pipeline"].default is False
     assert inspect.signature(core.store_kv).parameters["window"].default is True
     assert inspect.signature(core.forward_layer).parameters.get("fused") is None
 
@@ -182,3 +187,26 @@ def test_unfused_layer_on_cpu_is_unchanged():
     assert torch.equal(q.view(torch.int16), want_q.view(torch.int16))
     assert torch.equal(caches.swa.view(torch.int16), want_cache.view(torch.int16))
     assert torch.equal(out.view(torch.int16), want_out.view(torch.int16))
+
+
+@pytest.mark.parametrize("draft,prefill", [(False, False), (False, True), (True, False), (True, True)])
+def test_pipeline_call_uses_phase_and_static_eligibility(monkeypatch, draft, prefill):
+    monkeypatch.setattr(attn, "prefill_step", lambda _: prefill)
+    layer = SimpleNamespace(_sm80_attn_pipeline_enabled=True,
+        _sm80_attn_pipeline_eligible=True, _sm80_pipeline_max_rows=48,
+        _sm80_is_draft_layer=draft, _sm80_max_decode_query_len=6,
+        max_model_len=262144, window_size=128, is_kv_source=False, is_index_source=False)
+    x = SimpleNamespace(shape=(48, 1792), dtype=torch.bfloat16, is_cuda=True)
+    caches = SimpleNamespace(swa=torch.empty(1, 64, 512, dtype=torch.bfloat16),
+                             comp=None, idxk=None, ring=None)
+    batch = SimpleNamespace(max_seq_len=1024, swa_indices=torch.empty(48, 128))
+    call = attn.DeepseekV41Sm80Attention._sm80_pipeline_call
+    assert call(layer, x, None, None, batch, caches) is (draft or not prefill)
+    x.shape = (49, 1792)
+    assert call(layer, x, None, None, batch, caches) is False
+    x.shape = (1, 1792)
+    layer._sm80_attn_pipeline_eligible = False
+    assert call(layer, x, None, None, batch, caches) is False
+    layer._sm80_attn_pipeline_eligible = True
+    layer._sm80_attn_pipeline_enabled = False
+    assert call(layer, x, None, None, batch, caches) is False

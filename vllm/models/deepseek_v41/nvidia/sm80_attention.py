@@ -27,7 +27,9 @@ width ``max_model_len // ratio``. The input projections and ``wo_a`` /
 ``wo_b`` are in the graph either way.
 """
 
+import dataclasses
 import functools
+import os
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
@@ -46,6 +48,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.models.deepseek_v41.attention import (
     DeepseekV4Attention,
@@ -59,8 +62,10 @@ from vllm.models.deepseek_v41.sparse_mla import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.sm80 import capture
 from vllm.sm80.kernels.exl3.quant import set_output_dtype
 from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len, prefill_step
+from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -289,9 +294,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             )
         config = vllm_config.model_config.hf_config
         if self.compressor is not None:
-            # The compressor projection is quantized in the checkpoint, so it
-            # takes the model's quantization config (upstream builds it
-            # unquantized for its fp32 GEMM).
+            # The compressor projection takes the model's quantization config
+            # (an EXL3 checkpoint quantizes it; upstream builds it unquantized
+            # for its fp32 GEMM).
             c = self.compressor
             c.fused_wkv_wgate = MergedColumnParallelLinear(
                 c.hidden_size,
@@ -305,9 +310,18 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             if c.has_gate:
                 # Above ratio 1 the reference projects in FP32 for its FP32
                 # softmax pooling (wkv and wgate are FP32 linears applied to
-                # x.float(), exactly the BF16 x): the EXL3 linear returns its
-                # FP32 result unrounded. Ratio 1 stays BF16, as there.
+                # x.float(), exactly the BF16 x): the EXL3 or BF16 linear
+                # returns its FP32 result unrounded. Ratio 1 stays BF16, as
+                # there.
                 set_output_dtype(c.fused_wkv_wgate, torch.float32)
+        wo_a_method = self.wo_a.quant_method
+        if getattr(wo_a_method, "apply_grouped", None) is None and not isinstance(
+            wo_a_method, UnquantizedLinearMethod
+        ):
+            # A quantized dense wo_a (an FP8 one in a hybrid checkpoint) runs
+            # its groups as separate GEMMs of its own method (no batched
+            # kernel on sm_80; _o_proj calls apply_grouped).
+            GroupedLinearMethod.adopt(self.wo_a, self.n_local_groups)
         tp_size = self.n_heads // self.n_local_heads
         index_n_heads = getattr(config, "index_n_heads", 0)
         cand_source = self.candidate_source_layer
@@ -344,6 +358,24 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             *self._sm80_rope_params, device=current_platform.device_type
         )
         self._sm80_chunk_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        # Eligibility is independent of the active arm; in-boot capture must
+        # be able to select either arm on both target and drafter modules.
+        self._sm80_pipeline_max_rows = envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS
+        self._sm80_max_decode_query_len = max_decode_query_len(vllm_config)
+        self._sm80_is_draft_layer = (
+            self.layer_id >= vllm_config.model_config.hf_text_config.num_hidden_layers
+        )
+        self._sm80_pipeline_owner = (id(vllm_config), self._sm80_is_draft_layer)
+        self._sm80_pipeline_execution_stream = None
+        self._sm80_attn_pipeline_enabled = bool(envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE)
+        self._sm80_pipeline_reserved = self._sm80_attn_pipeline_enabled or (
+            os.getenv("VLLM_DEV_AB_SWITCH") == "dsv41_attn_pipeline"
+        )
+        self._sm80_attn_pipeline_eligible = self._sm80_pipeline_gate()
+        if self._sm80_pipeline_reserved and self._sm80_attn_pipeline_eligible:
+            from vllm.models.deepseek_v41.nvidia.ops.sm80_attn_pipeline import PIPELINE_WARMUP
+
+            PIPELINE_WARMUP.register_warmup(self)
         if self.indexer is not None and vllm_config.kernel_config.enable_jit_warmup:
             from vllm.models.deepseek_v41.nvidia.ops.sm80_index_scores import (
                 INDEX_SCORES_WARMUP,
@@ -415,6 +447,66 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         return self._sm80_is_draft_layer or not prefill_step(
             self._sm80_max_decode_query_len
         )
+
+    def _sm80_pipeline_gate(self) -> bool:
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_fused, sm80_attn_pipeline
+
+        reason = sm80_attn_fused.supports(self.n_local_heads, self.head_dim,
+            self.rope_head_dim, self.n_local_groups, self.window_size,
+            self.sm80_cfg.index_topk, self.compress_ratio, self.kv_cache_torch_dtype,
+            current_platform.get_device_capability())
+        reason = reason or sm80_attn_pipeline.supports(self.sm80_cfg,
+            self._sm80_pipeline_max_rows, self.max_model_len, self.q_lora_rank,
+            min(self._sm80_chunk_bytes, core.DEFAULT_SCORE_CHUNK_BYTES))
+        if reason is not None and self._sm80_pipeline_reserved:
+            logger.warning_once("DeepSeek-V4.1 attention pipeline disabled: %s",
+                                reason, scope="global")
+        return reason is None
+
+    def _sm80_pipeline_workspace(self, device):
+        from vllm.models.deepseek_v41.nvidia.ops.sm80_attn_pipeline import workspace
+
+        # A runner/lane executes serially. Its temporary profiling/capture
+        # streams join the execution stream and are not independent runners.
+        # Bind that execution owner before graph profiling, not one scratch
+        # allocation for every short-lived capture stream. Separate runners,
+        # target/drafter owners and WorkspaceManager ubatch/lanes stay disjoint.
+        if self._sm80_pipeline_execution_stream is None:
+            self._sm80_pipeline_execution_stream = torch.cuda.current_stream(device).cuda_stream
+        return workspace(self._sm80_pipeline_max_rows, self.max_model_len,
+                         self.q_lora_rank, device, self._sm80_pipeline_owner,
+                         execution_stream=self._sm80_pipeline_execution_stream)
+
+    def _sm80_pipeline_call(self, qr_kv, kv_score, index_weights, batch, caches):
+        if not (self._sm80_attn_pipeline_enabled and self._sm80_attn_pipeline_eligible):
+            return False
+        if qr_kv.shape[0] > self._sm80_pipeline_max_rows:
+            return False
+        if not self._sm80_is_draft_layer and prefill_step(self._sm80_max_decode_query_len):
+            return False
+        reason = None
+        if qr_kv.dtype != torch.bfloat16 or not qr_kv.is_cuda:
+            reason = "queries must be CUDA BF16"
+        elif batch.max_seq_len > self.max_model_len:
+            reason = "context exceeds reserved workspace"
+        elif batch.swa_indices.shape[1] > self.window_size:
+            reason = "window exceeds supported width"
+        elif self.is_kv_source and (kv_score is None or
+                kv_score.dtype != torch.float32 or kv_score.stride(1) != 1):
+            reason = "compressor projection must be contiguous FP32 rows"
+        elif self.is_index_source and (index_weights is None or
+                index_weights.dtype != torch.bfloat16 or index_weights.stride(1) != 1):
+            reason = "index weights must have contiguous heads"
+        for cache in (caches.swa, caches.comp, caches.idxk):
+            if cache is not None and (cache.dtype != torch.bfloat16 or cache.stride(2) != 1):
+                reason = "cache rows must be BF16 with contiguous channels"
+        if caches.ring is not None and (caches.ring.dtype != torch.float32 or
+                                       caches.ring.stride(2) != 1):
+            reason = "ring rows must be contiguous FP32"
+        if reason is not None:
+            logger.warning_once("DeepSeek-V4.1 attention pipeline call stays unfused: %s",
+                                reason, scope="global")
+        return reason is None
 
     def _sm80_weights(self, device: torch.device) -> core.Sm80AttnWeights:
         freqs = self._sm80_freqs.to(device)
@@ -540,6 +632,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             # Profile run: no caches yet. Reserve what the indexer's score
             # chunk (scores, candidate mask, sort) can take at its bound.
             out.zero_()
+            if self._sm80_pipeline_reserved and self._sm80_attn_pipeline_eligible:
+                self._sm80_pipeline_workspace(out.device)
             if self.is_index_source and out.is_cuda:
                 torch.empty(
                     3 * self._sm80_chunk_bytes, dtype=torch.uint8, device=out.device
@@ -548,19 +642,32 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         batch = core.pad_batch(
             self._sm80_batch(attn_metadata, positions), qr_kv.shape[0]
         )
-        fused = self._sm80_fused_attn_call(qr_kv.shape[0])
+        weights = self._sm80_weights(out.device)
+        caches = self._sm80_caches()
+        pipeline = self._sm80_pipeline_call(qr_kv, kv_score, index_weights, batch, caches)
+        workspace = self._sm80_pipeline_workspace(out.device) if pipeline else None
+        fused = not pipeline and self._sm80_fused_attn_call(qr_kv.shape[0])
+        record = None
+        if capture.active:
+            record = capture.begin(
+                "attn", "dsv41_attn_layer", self.prefix, qr_kv.shape[0]
+            )
+        if record is not None:
+            weights = _capture_attention_inputs(record, batch, caches, weights, qr_kv)
         q = core.prepare_layer(
             self.sm80_cfg,
-            self._sm80_weights(out.device),
-            self._sm80_caches(),
+            weights,
+            caches,
             batch,
             qr_kv,
             kv_score,
             index_weights,
             self._sm80_chunk_bytes,
-            fused=fused,
+            fused=fused, pipeline=pipeline, workspace=workspace,
         )
-        self._sm80_attend(batch, q, out, fused=fused)
+        self._sm80_attend(batch, q, out, fused=fused, pipeline=pipeline, workspace=workspace)
+        if record is not None:
+            _capture_attention_outputs(record, self.sm80_cfg, batch, caches, out)
 
     def forward_mqa(
         self,
@@ -581,11 +688,12 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         self._sm80_attend(batch, q, output)
 
     def _sm80_attend(
-        self, batch, q: torch.Tensor, out: torch.Tensor, fused: bool = False
+        self, batch, q: torch.Tensor, out: torch.Tensor, fused: bool = False,
+        pipeline: bool = False, workspace=None,
     ) -> None:
         core.attend_layer(
             self.sm80_cfg, self._sm80_weights(out.device), self._sm80_caches(),
-            batch, q, out, fused=fused,
+            batch, q, out, fused=fused, pipeline=pipeline, workspace=workspace,
         )
 
     def forward_kv(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> None:
@@ -665,6 +773,67 @@ _PREEMPTING_BACKENDS = (
     "fi_pcie_ipc_ar_comm",
     "aiter_ar_comm",
 )
+
+
+def _window_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    """Rows of window slots ``slots`` (-1: row of slot 0, masked by the
+    slots themselves)."""
+    slots = slots.clamp_min(0).to(torch.int64)
+    return cache[slots // cache.shape[1], slots % cache.shape[1]]
+
+
+def _capture_attention_inputs(record, batch, caches, weights, qr_kv: torch.Tensor):
+    """Record the attention core's inputs before the layer writes its caches
+    (the window rows the step attends to, as they were), and return weights
+    whose ``wq_b`` records its input (the normalised query latent) and its
+    output (the query before RoPE)."""
+    record.put(
+        qr_kv=qr_kv,
+        positions=batch.positions,
+        token_to_req=batch.token_to_req,
+        query_start_loc=batch.query_start_loc,
+        swa_slots=batch.swa_slots,
+        swa_indices=batch.swa_indices,
+        swa_rows_before=_window_rows(caches.swa, batch.swa_indices),
+        q_norm=weights.q_norm,
+        kv_norm=weights.kv_norm,
+        attn_sink=weights.attn_sink,
+        freqs=weights.freqs,
+    )
+    wq_b = weights.wq_b
+
+    def recording_wq_b(qr: torch.Tensor) -> torch.Tensor:
+        q = wq_b(qr)
+        record.put(qr=qr, q=q)
+        return q
+
+    return dataclasses.replace(weights, wq_b=recording_wq_b)
+
+
+def _capture_attention_outputs(record, cfg, batch, caches, out: torch.Tensor) -> None:
+    """Record what attention read after the layer's cache writes (window
+    rows; at compressed layers the selected positions and their rows) and
+    the ``wo_a`` input it wrote."""
+    T = batch.num_tokens
+    values: dict[str, Any] = dict(
+        swa_rows=_window_rows(caches.swa, batch.swa_indices),
+        out=out,
+        num_tokens=T,
+        compress_ratio=int(cfg.compress_ratio),
+        n_groups=int(cfg.n_local_groups),
+        scale=float(cfg.softmax_scale),
+        eps=float(cfg.eps),
+    )
+    if cfg.compress_ratio:
+        local = caches.topk[:T]
+        req = batch.token_to_req.to(torch.int64)[:, None].expand_as(local)
+        values.update(
+            comp_local=local,
+            comp_rows=core.gather_compressed_rows(
+                caches.comp, batch.comp_block_table, req, local.clamp_min(0)
+            ),
+        )
+    record.put(**values).done()
 
 
 def _preempting_backends(comm: Any) -> list[str]:
