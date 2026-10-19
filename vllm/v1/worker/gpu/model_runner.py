@@ -67,6 +67,7 @@ from vllm.sm80.spec_decode.aux_fc_fold import (
     mark_drafter_aux_fc_folded,
     maybe_configure_aux_fc_fold,
 )
+from vllm.sm80.dev_ab import capture_model_per_arm
 from vllm.sm80.worker import mem_attribution
 from vllm.sm80.worker.pp_draft_tail import DraftTailController
 from vllm.tasks import SupportedTask
@@ -1128,6 +1129,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
+        per_arm = capture_model_per_arm(self, profile_only)
+        if per_arm is not None:
+            return per_arm
         assert self.cudagraph_manager is not None
         capture_encoder = (
             self.model_state.supports_mm_inputs

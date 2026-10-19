@@ -121,12 +121,13 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/__init__.py` | 34 |
 | `vllm/sm80/attention/__init__.py` | 2 |
 | `vllm/sm80/attention/triton_mla_sparse.py` | 386 |
+| `vllm/sm80/dev_ab.py` | 1,037 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
 | `vllm/sm80/distributed/communicator.py` | 356 |
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 1,192 |
+| `vllm/sm80/envs.py` | 1,199 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -141,7 +142,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/layers/moe/runner.py` | 177 |
 | `vllm/sm80/layers/moe/shared_experts.py` | 134 |
 | `vllm/sm80/model_registry.py` | 78 |
-| `vllm/sm80/platform.py` | 153 |
+| `vllm/sm80/platform.py` | 155 |
 | `vllm/sm80/plugin.py` | 324 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
@@ -157,7 +158,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **39 files** | **10,130** |
+| **40 files** | **11,176** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -385,7 +386,9 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/test_native_checkpoint_wrapper_meta.py` | 256 |
 | `tests/parser/engine/test_glm47_tool_choice_none.py` | 265 |
 | `tests/plugins_tests/conftest.py` | 17 |
-| `tests/sm80/seams.yaml` | 1,281 |
+| `tests/sm80/seams.yaml` | 1,344 |
+| `tests/sm80/test_dev_ab.py` | 533 |
+| `tests/sm80/test_dev_ab_dynamic.py` | 286 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
 | `tests/sm80/test_exl3_platform_verification.py` | 65 |
 | `tests/sm80/test_exl3_plugin.py` | 110 |
@@ -434,7 +437,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **180 files** | **89,937** |
+| **182 files** | **90,819** |
 
 #### `tools/`
 
@@ -513,7 +516,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/async_utils.py` | modified | 21 | 0 | 6 |
 | `vllm/v1/worker/gpu/block_table.py` | modified | 11 | 3 | 4 |
 | `vllm/v1/worker/gpu/cudagraph_utils.py` | modified | 131 | 9 | 12 |
-| `vllm/v1/worker/gpu/model_runner.py` | modified | 203 | 13 | 32 |
+| `vllm/v1/worker/gpu/model_runner.py` | modified | 207 | 13 | 33 |
 | `vllm/v1/worker/gpu/model_states/mamba_hybrid.py` | modified | 44 | 1 | 7 |
 | `vllm/v1/worker/gpu/model_states/recoverssm.py` | modified | 4 | 9 | 3 |
 | `vllm/v1/worker/gpu/pp_utils.py` | modified | 222 | 8 | 15 |
@@ -524,7 +527,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **71 files** | | **3,558** | **244** | **494** |
+| **71 files** | | **3,562** | **244** | **495** |
 
 ### Tests, docs and .github
 
@@ -558,9 +561,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 71 | 3,558 | 244 | 494 |
+| Product code | 71 | 3,562 | 244 | 495 |
 | Tests, docs and .github | 22 | 572 | 550 | 78 |
-| All | 93 | 4,130 | 794 | 572 |
+| All | 93 | 4,134 | 794 | 573 |
 
 ## 3. Fork environment variables
 
@@ -597,6 +600,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
+| `VLLM_DEV_AB_SWITCH` | `str` | `''` | `''` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
@@ -672,7 +676,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **102 variables** | | | |
+| **103 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -682,7 +686,8 @@ Functions, methods and classes in fork-added product files whose name occurs now
 |---|---:|---|---:|---|
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 890 | `forward_layer` | 19 | yes |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 260 | `engram_telemetry` | 4 | yes |
-| **2 definitions** | | | **23** | |
+| `vllm/sm80/dev_ab.py` | 1034 | `get_ab_arm` | 4 | yes |
+| **3 definitions** | | | **27** | |
 
 ## 5. Health numbers
 
@@ -690,12 +695,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 152 |
-| Fork-added product lines | 48,706 |
+| Fork-added product files | 153 |
+| Fork-added product lines | 49,752 |
 | Patched upstream files | 93 |
-| Patched upstream lines | +4,130 / -794 |
+| Patched upstream lines | +4,134 / -794 |
 | Patched upstream product files | 71 |
-| Patched upstream product lines | +3,558 / -244 |
-| Product lines added (new files and patches) | 52,264 |
-| Fork environment variables (flags) | 102 |
-| Unreferenced fork definitions | 2 (23 lines) |
+| Patched upstream product lines | +3,562 / -244 |
+| Product lines added (new files and patches) | 53,314 |
+| Fork environment variables (flags) | 103 |
+| Unreferenced fork definitions | 3 (27 lines) |

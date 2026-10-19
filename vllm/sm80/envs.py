@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
+    VLLM_DEV_AB_SWITCH: str = ""
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -988,6 +989,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN4_MTP_PER_STREAM_NORM": lambda: bool(
         int(os.getenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", "0"))
     ),
+    # Development server only: the name of one switch in
+    # vllm/sm80/dev_ab.py SWITCHES. Both of its arms are captured at boot and
+    # POST /collective_rpc set_ab_arm (VLLM_SERVER_DEV_MODE=1) changes the arm
+    # between requests. Costs graph memory and boot time; not for serving.
+    # Unset by default.
+    "VLLM_DEV_AB_SWITCH": lambda: os.getenv("VLLM_DEV_AB_SWITCH", ""),
 }
 
 
