@@ -303,8 +303,11 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
     requires = _requires(ms, tree, ns.capability, cache)
     cache.save()
 
+    # only the checkpoints this launch reads: another role of the model (one
+    # not downloaded, say) neither refuses nor marks this launch
     cps: dict[str, dict] = {}
-    for name, spec in ms.checkpoints.items():
+    for name in res.checkpoint_refs:
+        spec = ms.checkpoints[name]
         manifest, msha = checkpoint.load_manifest(sd.path(spec["manifest"]))
         st = checkpoint.status(manifest, msha, cp_paths[name], stamp_dir)
         st.update(repo=pins.get(spec["repo_key"]), revision=pins.get(spec["revision_key"]))
@@ -394,7 +397,7 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
         "_exe": res.exe,
         "_env": {k: v["value"] for k, v in res.child_env.items()},
         "_stamp_dir": stamp_dir,
-        "_cp_specs": {n: (sd.path(ms.checkpoints[n]["manifest"]), cp_paths[n]) for n in ms.checkpoints},
+        "_cp_specs": {n: (sd.path(ms.checkpoints[n]["manifest"]), cp_paths[n]) for n in res.checkpoint_refs},
         "_checkpoint_verify": ns.checkpoint_verify or rt["checkpoint_verify"],
         "_gen": gen,
         "_ev": ev,
@@ -444,7 +447,7 @@ def preflight_checkpoints(doc: dict, policy: str, stop: list | None = None) -> N
         if problems:
             raise Refusal(f"checkpoint {name} at {directory} is not complete: " + "; ".join(problems[:10]))
         sfile = checkpoint.stamp_path(doc["_stamp_dir"], directory)
-        state, stale, bad = checkpoint.identity(manifest, msha, directory, checkpoint.read_stamp(sfile))
+        state, stale, bad = checkpoint.identity(manifest, msha, directory, sfile)
         if stale and mode == "boot":
             try:
                 state, bad, _ = checkpoint.verify(manifest, msha, directory, sfile, stop=stop)
@@ -471,17 +474,16 @@ def preflight_checkpoints(doc: dict, policy: str, stop: list | None = None) -> N
 
 
 def verify_checkpoints(ns, environ, stop: list) -> int:
-    """--verify-checkpoints: stamp exactly the directories a launch would serve.
-    ``stop`` is the command's StopFlag, installed before anything is read."""
-    _defaults, rt, home, sd, ms, stamp_dir = _context(ns, environ)
-    paths = checkpoint_paths(ns, ms, rt, sd.pins(), home)
+    """--verify-checkpoints: stamp exactly the directories a launch would serve
+    (the checkpoints its resolution reads). ``stop`` is the command's
+    StopFlag, installed before anything is read."""
+    doc = build(ns, environ)
     worst = 0
     report = {}
-    for name, spec in ms.checkpoints.items():
+    for name, (mpath, directory) in doc["_cp_specs"].items():
         if stop[0]:
             raise Refusal("stopped (SIGTERM/SIGINT); no stamp written")
-        manifest, msha = checkpoint.load_manifest(sd.path(spec["manifest"]))
-        directory = paths[name]
+        manifest, msha = checkpoint.load_manifest(mpath)
         if not os.path.isdir(directory):
             report[name] = {"state": checkpoint.NOT_PRESENT, "path": directory}
             worst = max(worst, EXIT_CHECKPOINT_ABSENT)
@@ -493,7 +495,8 @@ def verify_checkpoints(ns, environ, stop: list) -> int:
             continue
         try:
             state, bad, hashed = checkpoint.verify(manifest, msha, directory,
-                                                   checkpoint.stamp_path(stamp_dir, directory), stop=stop)
+                                                   checkpoint.stamp_path(doc["_stamp_dir"], directory),
+                                                   stop=stop)
         except checkpoint.Interrupted:
             raise Refusal("interrupted; no stamp written") from None
         report[name] = {"state": state, "path": directory, "hashed": hashed}

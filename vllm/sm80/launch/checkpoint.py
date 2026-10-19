@@ -11,9 +11,13 @@ checkpoint), each with its size and sha256.
 Completeness (availability): every manifest file present, non-empty and of
 the manifest's size, and no ``.incomplete`` blob. Identity: every file's
 sha256 equals the manifest's. Hashing is done once per file and recorded in
-a stamp (schema checkpoint-stamp/1: path, inode, size, mtime_ns, sha256 per
-file, plus the manifest's sha256); later checks only stat files against
-the stamp and never open a checkpoint file.
+a stamp (schema checkpoint-stamp/1: path, inode, size, mtime_ns, sha256 and
+realpath per file, plus the manifest's sha256); later checks only stat files
+against the stamp and never open a checkpoint file. A file the directory's
+own stamp does not cover is taken from any stamp in the same stamp directory
+that holds the same file (realpath, inode, size and mtime_ns) with the
+manifest's sha256, so a directory of links to stamped files, or a new
+manifest naming stamped files, hashes only the files no stamp holds.
 
 Command line (CPU only; never needs a GPU)::
 
@@ -119,26 +123,84 @@ def _stat_key(path: str) -> dict:
     return {"inode": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
 
-def identity(manifest: dict, manifest_sha: str, directory: str,
-             stamp: dict | None) -> tuple[str, list[str], list[str]]:
-    """Stat-only check against a stamp: (state, stale files, mismatched files)."""
-    files = sorted(manifest["files"])
+def _own_entries(stamp: dict | None, manifest_sha: str, directory: str) -> dict:
+    """The directory's own stamp entries, if the stamp is for this directory
+    and manifest."""
     if stamp is None or stamp.get("manifest_sha256") != manifest_sha \
             or stamp.get("path") != os.path.realpath(directory):
-        return UNVERIFIED, files, []
+        return {}
+    files = stamp.get("files")
+    return dict(files) if isinstance(files, dict) else {}
+
+
+def _same_file(ent, key: dict, real: str) -> bool:
+    return isinstance(ent, dict) and all(ent.get(k) == v for k, v in key.items()) \
+        and ent.get("realpath", real) == real
+
+
+def stamped_files(stamp_file: str) -> dict[str, list[dict]]:
+    """Every file entry of every stamp in the directory of ``stamp_file``, by
+    the file's realpath. An entry without a realpath (written before stamps
+    recorded it) is keyed by its stamp's directory joined with its name.
+    Reads stamps only, never a checkpoint file."""
+    out: dict[str, list[dict]] = {}
+    folder = os.path.dirname(stamp_file)
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return out
+    for name in names:
+        stamp = read_stamp(os.path.join(folder, name)) if name.endswith(STAMP_SUFFIX) else None
+        files = stamp.get("files") if stamp else None
+        if not isinstance(files, dict):
+            continue
+        base = stamp.get("path")
+        for rel, ent in files.items():
+            if not isinstance(ent, dict):
+                continue
+            real = ent.get("realpath")
+            if not isinstance(real, str) and isinstance(base, str):
+                real = os.path.realpath(os.path.join(base, rel))
+            if isinstance(real, str):
+                out.setdefault(real, []).append(ent)
+    return out
+
+
+def _reusable(pool: dict, real: str, key: dict, sha: str) -> dict | None:
+    """A stamped entry of the same file whose sha256 is ``sha``, as an entry
+    for this stamp; None if no stamp holds one."""
+    for ent in pool.get(real, ()):
+        if _same_file(ent, key, real) and ent.get("sha256") == sha:
+            return dict(key, sha256=sha, realpath=real)
+    return None
+
+
+def identity(manifest: dict, manifest_sha: str, directory: str,
+             stamp_file: str) -> tuple[str, list[str], list[str]]:
+    """Stat-only check against the directory's stamp, and for a file it does
+    not cover against every stamp beside it: (state, stale files, mismatched
+    files)."""
+    entries = _own_entries(read_stamp(stamp_file), manifest_sha, directory)
+    pool = None
     stale, bad = [], []
-    entries = stamp.get("files", {})
-    for rel in files:
-        ent = entries.get(rel)
+    for rel in sorted(manifest["files"]):
+        p = os.path.join(directory, rel)
         try:
-            key = _stat_key(os.path.join(directory, rel))
+            key = _stat_key(p)
         except OSError:
             stale.append(rel)
             continue
-        if not isinstance(ent, dict) or any(ent.get(k) != v for k, v in key.items()):
+        real = os.path.realpath(p)
+        want = manifest["files"][rel]["sha256"]
+        ent = entries.get(rel)
+        if _same_file(ent, key, real):
+            if ent.get("sha256") != want:
+                bad.append(rel)
+            continue
+        if pool is None:
+            pool = stamped_files(stamp_file)
+        if _reusable(pool, real, key, want) is None:
             stale.append(rel)
-        elif ent.get("sha256") != manifest["files"][rel]["sha256"]:
-            bad.append(rel)
     if bad:
         return MISMATCH, stale, bad
     if stale:
@@ -148,16 +210,15 @@ def identity(manifest: dict, manifest_sha: str, directory: str,
 
 def verify(manifest: dict, manifest_sha: str, directory: str, stamp_file: str, *,
            stop: list | None = None) -> tuple[str, list[str], int]:
-    """Hash every file the stamp does not cover, then publish the stamp.
+    """Hash every file no stamp covers (the directory's own stamp, or for a
+    file it does not cover any stamp beside it holding the same file with
+    the manifest's sha256), then publish the stamp.
 
     Returns (state, mismatched files, files hashed). A stop request
     between or during files, or before the stamp is published, raises
     Interrupted and writes no stamp."""
-    old = read_stamp(stamp_file)
-    if old is not None and (old.get("manifest_sha256") != manifest_sha
-                            or old.get("path") != os.path.realpath(directory)):
-        old = None
-    entries = dict(old.get("files", {})) if old else {}
+    entries = _own_entries(read_stamp(stamp_file), manifest_sha, directory)
+    pool = None
     bad = []
     hashed = 0
     for rel in sorted(manifest["files"]):
@@ -165,15 +226,21 @@ def verify(manifest: dict, manifest_sha: str, directory: str, stamp_file: str, *
             raise Interrupted()
         p = os.path.join(directory, rel)
         key = _stat_key(p)
+        real = os.path.realpath(p)
+        want = manifest["files"][rel]["sha256"]
         ent = entries.get(rel)
-        if not isinstance(ent, dict) or any(ent.get(k) != v for k, v in key.items()):
+        if not _same_file(ent, key, real):
+            if pool is None:
+                pool = stamped_files(stamp_file)
+            ent = _reusable(pool, real, key, want)
+        if ent is None:
             digest = sha256_file(p)
             hashed += 1
             if stop and stop[0]:
                 raise Interrupted()
             ent = dict(key, sha256=digest)
-            entries[rel] = ent
-        if ent["sha256"] != manifest["files"][rel]["sha256"]:
+        entries[rel] = ent = dict(ent, realpath=real)
+        if ent["sha256"] != want:
             bad.append(rel)
     entries = {k: v for k, v in entries.items() if k in manifest["files"]}
     stamp = {"schema": STAMP_SCHEMA, "path": os.path.realpath(directory),
@@ -222,8 +289,7 @@ def status(manifest: dict, manifest_sha: str, directory: str, stamp_dir: str) ->
     if problems:
         out.update(state=INCOMPLETE, identity=UNVERIFIED, files=problems)
         return out
-    stamp = read_stamp(stamp_path(stamp_dir, directory))
-    state, stale, bad = identity(manifest, manifest_sha, directory, stamp)
+    state, stale, bad = identity(manifest, manifest_sha, directory, stamp_path(stamp_dir, directory))
     out.update(state="complete", identity=state)
     if bad:
         out["files"] = bad

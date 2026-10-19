@@ -8,6 +8,7 @@ import builtins
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from contextlib import redirect_stdout
@@ -15,6 +16,7 @@ from contextlib import redirect_stdout
 import pytest
 
 import checkpoint as ck
+import main
 from helpers import CHECKPOINT_FILES, LAUNCH, World, make_checkpoint, promote, write
 from model import load_model_settings
 from settings_dir import SettingsDir
@@ -215,3 +217,149 @@ def test_new_pin_with_verified_weights_fails_receipt(w, tmp_path):
     assert d["checkpoint"]["target"]["identity"] == "verified"
     # TARGET_REVISION is a receipt pin, so criterion 2 fires beside 4a
     assert set(d["validated"]["reasons"]) == {"pin ≠ receipt", "checkpoint ≠ receipt"}
+
+
+# -- a launch checks only the checkpoints it reads ------------------------------
+
+def add_role(w, name: str, dirname: str) -> None:
+    """A second checkpoint role of the model (same manifest as the target)."""
+    with open(os.path.join(w.settings, "model.toml"), "a") as f:
+        f.write(f'\n[checkpoint.{name}]\nrepo_key = "TARGET_REPO"\nrevision_key = "TARGET_REVISION"\n'
+                f'dir = "{dirname}"\nindex = "model.safetensors.index.json"\n'
+                f'manifest = "checkpoints/synth-dense-1b.manifest.json"\n')
+
+
+def test_unread_role_with_missing_directory_is_not_checked(w):
+    # a model whose settings carry a second served role (a variant serves it)
+    # that is not downloaded: the target launch neither refuses nor is marked
+    add_role(w, "hybrid", "synth-hybrid")
+    write(os.path.join(w.settings, "variants", "hybrid.toml"),
+          'schema = "launch-variant/1"\n[args]\nmodel = "${checkpoint.hybrid.path}"\n')
+    assert verify_cli(w, "--checkpoint", "target")[0] == 0
+    d = w.resolve()
+    assert d["served_checkpoint"] == "target" and sorted(d["checkpoint"]) == ["target"]
+    assert d["checkpoint"]["target"]["identity"] == "verified"
+    assert not {"checkpoint not present", "checkpoint not verified"} & set(d["validated"]["reasons"])
+    doc = main.build(main.parse_args(w.base_args()), w.env())
+    assert list(doc["_cp_specs"]) == ["target"]
+    main.preflight_checkpoints(doc, "strict")
+    p = w.run()
+    assert p.returncode == 0, p.stderr
+    # the launch that serves the missing role is the one refused
+    d = w.resolve("--variant", "hybrid")
+    assert d["served_checkpoint"] == "hybrid" and sorted(d["checkpoint"]) == ["hybrid"]
+    assert d["checkpoint"]["hybrid"]["state"] == "not present"
+    p = w.run("--variant", "hybrid")
+    assert p.returncode == 3 and "checkpoint hybrid" in p.stderr and "not complete" in p.stderr
+
+
+def test_role_named_in_a_nested_argument_is_checked(w, tmp_path):
+    # a checkpoint the server reads beside the served one (a table directory
+    # named inside a dict argument) is checked with it
+    add_role(w, "tables", "synth-tables")
+    write(os.path.join(w.settings, "variants", "tables.toml"),
+          'schema = "launch-variant/1"\n[args.hf-overrides]\n'
+          'table_dir = "${checkpoint.tables.path}"\n')
+    assert verify_cli(w, "--checkpoint", "target")[0] == 0
+    d = w.resolve("--variant", "tables")
+    assert d["served_checkpoint"] == "target" and sorted(d["checkpoint"]) == ["tables", "target"]
+    assert d["checkpoint"]["tables"]["state"] == "not present"
+    assert "checkpoint not present" in d["validated"]["reasons"]
+    p = w.run("--variant", "tables")
+    assert p.returncode == 3 and "checkpoint tables" in p.stderr
+    shutil.copytree(w.cp, os.path.join(w.models, "synth-tables"))
+    out = io.StringIO()
+    with redirect_stdout(out):
+        code = main.main(w.base_args("--variant", "tables", "--verify-checkpoints"), w.env())
+    assert code == 0 and sorted(json.loads(out.getvalue())) == ["tables", "target"]
+    assert w.run("--variant", "tables").returncode == 0
+
+
+# -- stamps are reused across directories ----------------------------------------
+
+def overlay(w, tmp_path, fresh=("config.json",)) -> str:
+    """A directory of links to the target's files; ``fresh`` files are copies."""
+    out = str(tmp_path / "overlay")
+    os.makedirs(out)
+    for rel in sorted(os.listdir(w.cp)):
+        if rel in fresh:
+            shutil.copy(os.path.join(w.cp, rel), os.path.join(out, rel))
+        else:
+            os.symlink(os.path.join(w.cp, rel), os.path.join(out, rel))
+    return out
+
+
+def manifest(w):
+    return ck.load_manifest(os.path.join(w.settings, "checkpoints", "synth-dense-1b.manifest.json"))
+
+
+def test_overlay_of_links_to_stamped_files_hashes_only_new_files(w, tmp_path):
+    assert verify_cli(w)[0] == 0
+    ov = overlay(w, tmp_path)
+    with OpenCounter(w.cp) as c:
+        code, rep = verify_cli(w, "--checkpoint", "target", "--path", ov)
+    assert code == 0 and rep["target"]["state"] == "verified" and rep["target"]["hashed"] == 1
+    assert c.hits == []
+    stamp = ck.read_stamp(ck.stamp_path(w.stamps, ov))
+    real = {rel: e["realpath"] for rel, e in stamp["files"].items()}
+    assert real["tokenizer.json"] == os.path.realpath(os.path.join(w.cp, "tokenizer.json"))
+    assert real["config.json"] == os.path.realpath(os.path.join(ov, "config.json"))
+    assert w.resolve("--checkpoint-path", f"target={ov}")["checkpoint"]["target"]["identity"] == "verified"
+
+
+def test_overlay_of_links_only_is_verified_without_its_own_stamp(w, tmp_path):
+    assert verify_cli(w)[0] == 0
+    ov = overlay(w, tmp_path, fresh=())
+    with OpenCounter(w.cp) as c:
+        d = w.resolve("--checkpoint-path", f"target={ov}")
+        doc = main.build(main.parse_args(w.base_args("--checkpoint-path", f"target={ov}")), w.env())
+        main.preflight_checkpoints(doc, "strict")
+    assert c.hits == []
+    assert d["checkpoint"]["target"]["identity"] == "verified"
+    assert not os.path.exists(ck.stamp_path(w.stamps, ov))
+
+
+def test_stamp_entries_without_realpath_are_reused(w, tmp_path):
+    assert verify_cli(w)[0] == 0
+    sfile = ck.stamp_path(w.stamps, w.cp)
+    stamp = ck.read_stamp(sfile)
+    assert all("realpath" in e for e in stamp["files"].values())
+    for e in stamp["files"].values():
+        del e["realpath"]
+    write(sfile, json.dumps(stamp))
+    ov = overlay(w, tmp_path)
+    code, rep = verify_cli(w, "--checkpoint", "target", "--path", ov)
+    assert code == 0 and rep["target"]["hashed"] == 1
+
+
+@pytest.mark.parametrize("change", ["touched", "other_sha256", "other_file"])
+def test_stamp_entry_of_another_file_or_hash_is_not_reused(w, tmp_path, change):
+    assert verify_cli(w)[0] == 0
+    shard = "model-00001-of-00002.safetensors"
+    ov = overlay(w, tmp_path, fresh=("config.json", shard) if change == "other_file" else ("config.json",))
+    if change == "touched":
+        os.utime(os.path.join(w.cp, shard), ns=(1, 1))
+    elif change == "other_sha256":
+        sfile = ck.stamp_path(w.stamps, w.cp)
+        stamp = ck.read_stamp(sfile)
+        stamp["files"][shard]["sha256"] = "0" * 64
+        write(sfile, json.dumps(stamp))
+    m, sha = manifest(w)
+    with OpenCounter(w.cp) as c:
+        state, bad, hashed = ck.verify(m, sha, ov, ck.stamp_path(w.stamps, ov))
+    assert state == ck.VERIFIED and bad == [] and hashed == 2
+    assert c.hits == ([] if change == "other_file" else [os.path.realpath(os.path.join(w.cp, shard))])
+
+
+def test_reused_entry_with_a_new_manifest(w):
+    # a new manifest for the same directory (another file list) hashes nothing
+    # the old stamp holds with the same sha256
+    assert verify_cli(w)[0] == 0
+    path = os.path.join(w.settings, "checkpoints", "synth-dense-1b.manifest.json")
+    data = json.load(open(path))
+    data["files"].pop("chat_template.jinja")
+    write(path, json.dumps(data, indent=1, sort_keys=True) + "\n")
+    m, sha = manifest(w)
+    with OpenCounter(w.cp) as c:
+        state, bad, hashed = ck.verify(m, sha, w.cp, ck.stamp_path(w.stamps, w.cp))
+    assert state == ck.VERIFIED and hashed == 0 and c.hits == []

@@ -67,6 +67,7 @@ LAUNCHER_ARGS = frozenset(GEOMETRY_ARGS_NAMES + ("model", "config"))
 LOCATION_ARGS = ("host", "port")
 _SUBST = re.compile(r"\$\{([^}]*)\}")
 _CHECKPOINT_REF = re.compile(r"^\$\{checkpoint\.([A-Za-z0-9_-]+)\.path\}$")
+_CHECKPOINT_USE = re.compile(r"\$\{checkpoint\.([A-Za-z0-9_-]+)\.path\}")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHORT_OPTION = re.compile(r"^-[A-Za-z]")
 _TOP_KEYS = ("tp", "pp", "cards", "card_ids")
@@ -232,6 +233,17 @@ def substitute(value: Any, subst: dict[str, str], where: str) -> Any:
     return value
 
 
+def checkpoint_uses(value: Any) -> set[str]:
+    """Names of the checkpoints a value refers to (``${checkpoint.X.path}``)."""
+    if isinstance(value, str):
+        return set(_CHECKPOINT_USE.findall(value))
+    if isinstance(value, dict):
+        return set().union(*(checkpoint_uses(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(checkpoint_uses(v) for v in value))
+    return set()
+
+
 def render_arg(name: str, value: Any) -> list[str]:
     if value is None or value is False:
         return []
@@ -334,6 +346,8 @@ class Resolved:
     functional_sha256: str
     exe: str
     secret_names: set[str]
+    # the served checkpoint, then every other one the arguments or the
+    # environment name (sorted): the checkpoints this launch reads
     checkpoint_refs: list[str]
 
 
@@ -650,6 +664,9 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set:
         child.setdefault(name, {"value": value, "class": cls})
         if cls == "secret":
             secret_names.add(name)
+    used = set().union(*(checkpoint_uses(e.value) for k, e in final.entries.items()
+                         if k.split(".", 1)[0] in ("args", "env", "loc")))
+    refs += sorted(used - set(refs))
     functional_sha256 = canonical_sha256({"argv": argv_functional, "env": env_functional})
     return Resolved(
         final=final, variants=variants, argv=argv, argv_functional=argv_functional,
