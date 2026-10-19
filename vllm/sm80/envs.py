@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_TOOL_CHOICE_NONE_MASK: bool = False
     VLLM_DFLASH_BOUNDARY_CACHE: bool = False
+    VLLM_DSPARK_PER_K_WIDTH: bool = False
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
@@ -501,6 +502,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DFLASH_BOUNDARY_CACHE": lambda: bool(
         int(os.getenv("VLLM_DFLASH_BOUNDARY_CACHE", "0"))
+    ),
+    # DSpark drafts the scheduled K rather than drafting the maximum and
+    # truncating. Each positive width has persistent anchors and CUDA graphs.
+    "VLLM_DSPARK_PER_K_WIDTH": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_PER_K_WIDTH", "0"))
     ),
     # Diagnostics (step-cost calibration): a file holding a depth; while it
     # holds one inside the adaptive_k load width, every step verifies that
