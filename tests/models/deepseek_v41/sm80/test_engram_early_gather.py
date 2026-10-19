@@ -10,6 +10,7 @@ import torch
 
 from vllm.models.deepseek_v41.common.engram import Engram
 from vllm.models.deepseek_v41.nvidia import sm80_engram_prefetch as P
+from vllm.models.deepseek_v41.nvidia.sm80_engram_projection import project_kv, project_rows
 
 
 @pytest.fixture
@@ -75,7 +76,7 @@ def test_gathers_project_once_before_layer_and_join_own_event(monkeypatch, strea
         return hashes.float() * 3
 
     monkeypatch.setattr(Engram, "prepare_embeddings", prepare)
-    monkeypatch.setattr(Engram, "_project_kv", project)
+    monkeypatch.setattr(P, "project_rows", project)
     a, b = layer(), layer()
     P.EarlyEngram.adopt(a)
     P.EarlyEngram.adopt(b)
@@ -88,8 +89,8 @@ def test_gathers_project_once_before_layer_and_join_own_event(monkeypatch, strea
         assert streams.current[0] is streams.main
         assert [s for s, op, _ in streams.log if op == "gather_project_gather"] == ["aux", "aux"]
         assert not any(op == "wait_event" for _, op, _ in streams.log)
-        assert torch.equal(a._project_kv(hashes), hashes.float() * 3)
-        assert torch.equal(b._project_kv(hashes + 1), (hashes.float() + 1) * 3)
+        assert torch.equal(project_kv(a, hashes), hashes.float() * 3)
+        assert torch.equal(project_kv(b, hashes + 1), (hashes.float() + 1) * 3)
         assert [(s, obj) for s, op, obj in streams.log if op == "wait_event"] == [
             ("main", a._projection_done), ("main", b._projection_done)]
         assert [(s, obj) for s, op, obj in streams.log if op == "wait_stream"] == [
@@ -100,20 +101,20 @@ def test_gathers_project_once_before_layer_and_join_own_event(monkeypatch, strea
 
 def test_projection_lifetime_and_row_count(monkeypatch, streams):
     monkeypatch.setattr(Engram, "prepare_embeddings", lambda e, h: None)
-    monkeypatch.setattr(Engram, "_project_kv", lambda e, h: h.clone())
+    monkeypatch.setattr(P, "project_rows", lambda e, h: h.clone())
     e = layer()
     P.EarlyEngram.adopt(e)
     h = torch.zeros(6, 2)
     with pytest.raises(RuntimeError, match="missing"):
-        e._project_kv(h)
+        project_kv(e, h)
     e.prepare_embeddings(h)
     with pytest.raises(RuntimeError, match="not consumed"):
         e.prepare_embeddings(h)
     with pytest.raises(RuntimeError, match="missing"):
-        e._project_kv(h[:4])
-    assert torch.equal(e._project_kv(h), h)
+        project_kv(e, h[:4])
+    assert torch.equal(project_kv(e, h), h)
     with pytest.raises(RuntimeError, match="missing"):
-        e._project_kv(h)
+        project_kv(e, h)
 
 
 @pytest.mark.parametrize("attribute,value", [("use_sequence_parallel", True), ("_batch", object())])
@@ -176,3 +177,20 @@ def test_refuse_piecewise_stream_forks(mode_name):
         compilation_config=SimpleNamespace(cudagraph_mode=getattr(CUDAGraphMode, mode_name))))
     with pytest.raises(ValueError, match="piecewise"):
         P.adopt_early_engram(model)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_ordinary_projection_keeps_original_input_and_dtype(batched):
+    hashes = torch.arange(6).reshape(3, 2)
+    embedded = torch.arange(24, dtype=torch.bfloat16).reshape(3, 2, 4)
+    seen = []
+    def wkv(rows):
+        seen.append(rows)
+        return rows[:, :2]
+    e = SimpleNamespace(_batch=None, embed=lambda h: embedded, wkv=wkv)
+    if batched:
+        e._batch = SimpleNamespace(wkv_input=lambda owner, rows: embedded.flatten(-2))
+    want = embedded.flatten(-2)[:, :2]
+    assert torch.equal(project_kv(e, hashes), want)
+    assert seen[0].dtype == embedded.dtype and seen[0].data_ptr() == embedded.data_ptr()
+    assert torch.equal(project_rows(e, hashes), want)

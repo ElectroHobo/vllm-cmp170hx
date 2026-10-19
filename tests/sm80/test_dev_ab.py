@@ -18,11 +18,7 @@ MODEL_RUNNER = REPO / "vllm" / "v1" / "worker" / "gpu" / "model_runner.py"
 UPSTREAM_CAPTURE_MODEL_SHA256 = (
     "14f78e5a457fc366b63170a7b0e87868dda176c2e6dbe541ef30c750307c4158"
 )
-HOOK = (
-    "    per_arm = capture_model_per_arm(self, profile_only)\n"
-    "    if per_arm is not None:\n"
-    "        return per_arm\n"
-)
+HOOK = "@with_ab_capture\n"
 
 
 class _Trap:
@@ -63,7 +59,7 @@ class _Owner:
 
 
 class _Runner:
-    """capture_model as Model Runner V2 calls it: the hook first."""
+    """Capture through the same wrapper used by Model Runner V2."""
 
     def __init__(self, owners, late_owner=None):
         self.owners = owners
@@ -74,10 +70,8 @@ class _Runner:
         self.adaptive_verification = None
         self.req_states = SimpleNamespace(req_id_to_index={})
 
+    @dev_ab.with_ab_capture
     def capture_model(self, *, profile_only=False):
-        per_arm = dev_ab.capture_model_per_arm(self, profile_only)
-        if per_arm is not None:
-            return per_arm
         arm = dev_ab._STATE.arm
         self.calls.append((arm, profile_only))
         if arm and self.late_owner is not None:
@@ -119,10 +113,8 @@ def test_unset_touches_nothing(monkeypatch, state, value):
 def test_capture_model_is_upstream_plus_the_hook():
     source = _method_source(MODEL_RUNNER, "GPUModelRunner", "capture_model")
     assert source.count(HOOK) == 1
-    # The hook is the method's first statement, so None falls through to the
-    # upstream body unchanged.
-    first = source.split("\n")[2:5]
-    assert "\n".join(first) + "\n" == HOOK
+    # The wrapper owns switching; the original capture body is byte-identical.
+    assert source.split("\n")[1] == "@with_ab_capture"
     digest = hashlib.sha256(source.replace(HOOK, "").encode()).hexdigest()
     assert digest == UPSTREAM_CAPTURE_MODEL_SHA256
 
@@ -158,6 +150,7 @@ def test_configure_refuses_another_extension(monkeypatch, state):
 def test_allowlist():
     assert set(dev_ab.SWITCHES) == {
         "exl3_dense_splitk",
+        "exl3_moe_v2",
         "exl3_dense_prefill_tc",
         "dsv41_fused_mhc",
         "dsv41_fused_mhc_finish",
@@ -535,3 +528,18 @@ def test_router_fp32_switch_refuses_at_boot(monkeypatch, router_model):
     assert switch.unavailable(runner) is None
     monkeypatch.delitem(dev_ab.sys.modules, dev_ab._QWEN4_MODEL_MODULE)
     assert "no Qwen4Exp MoE router gates" in switch.unavailable(runner)
+
+@pytest.mark.parametrize("profile_only", [False, True])
+@pytest.mark.parametrize("selected", [None, 0, 23])
+def test_capture_decorator_preserves_unset_and_zero_byte_results(monkeypatch, profile_only, selected):
+    calls = []
+    runner = object()
+    def original(value, *, profile_only=False):
+        assert value is runner
+        calls.append(profile_only)
+        return 17
+    monkeypatch.setattr(dev_ab, "capture_model_per_arm", lambda value, profile: selected)
+    wrapped = dev_ab.with_ab_capture(original)
+    assert wrapped(runner, profile_only=profile_only) == (17 if selected is None else selected)
+    assert calls == ([profile_only] if selected is None else [])
+    assert wrapped.__wrapped__ is original

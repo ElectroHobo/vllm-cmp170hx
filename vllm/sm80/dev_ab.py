@@ -9,7 +9,7 @@
 - Model Runner V2 captures every CUDA graph once per arm, the boot arm first,
   and ends on the boot arm. Each graph store (descriptor -> graph) becomes an
   :class:`ArmGraphStore`, so replay is keyed by (descriptor, arm)
-  (:func:`capture_model_per_arm`, the first call in
+  (:func:`with_ab_capture`, wrapping
   ``GPUModelRunner.capture_model``). The memory-profiling capture takes both
   arms too, so the KV cache is sized with both arms' graphs reserved;
 - ``POST /collective_rpc`` (``VLLM_SERVER_DEV_MODE=1``) with method
@@ -46,6 +46,7 @@ K-table dispatch coverage and per-arm capture bytes. These are allocation deltas
 not standalone graph-pool measurements; shared pool reuse is charged once.
 """
 
+import functools
 import gc
 import importlib
 import os
@@ -468,6 +469,25 @@ def _moepf_apply(runner, on: bool) -> None:
         experts.prefill_v2_bits_x2 = bits if on else 0
 
 
+def _moe_v2_unavailable(runner) -> str | None:
+    experts = [e for e in _moepf_experts(runner) if hasattr(e, "moe_v2_rows")]
+    if not any(e.moe_v2_rows for e in experts):
+        return ("boot with VLLM_EXL3_MOE_V2=1: "
+                "eligible experts need their load-time workspace and warmup")
+    _STATE.saved["exl3_moe_v2"] = [(e, e.moe_v2_rows) for e in experts]
+    return None
+
+
+def _moe_v2_current(runner) -> bool:
+    return any(getattr(e, "moe_v2_rows", 0) for e in _moepf_experts(runner))
+
+
+def _moe_v2_apply(runner, on: bool) -> None:
+    _set_env("VLLM_EXL3_MOE_V2", on)
+    for experts, rows in _STATE.saved["exl3_moe_v2"]:
+        experts.moe_v2_rows = rows if on else 0
+
+
 def _splitk_unavailable(runner) -> str | None:
     from vllm.sm80.kernels.exl3 import ops
     if not ops._loaded:
@@ -599,6 +619,10 @@ SWITCHES: dict[str, Switch] = {
             _moepf_unavailable,
             lambda runner: any(e.prefill_v2_bits_x2 for e in _moepf_experts(runner)),
             _moepf_apply,
+        ),
+        Switch(
+            "exl3_moe_v2", "VLLM_EXL3_MOE_V2", True, False,
+            _moe_v2_unavailable, _moe_v2_current, _moe_v2_apply,
         ),
         Switch(
             "exl3_dense_splitk", "VLLM_EXL3_DENSE_SPLITK", True, False,
@@ -984,6 +1008,18 @@ def _capture_unsupported(runner) -> str | None:
         if getattr(spec, "method", None) != "dspark" or not hasattr(draft, "_cg_managers"):
             return "only the static DSpark per-batch K table is covered"
     return None
+
+
+def with_ab_capture(capture):
+    """Keep the ordinary capture body intact behind a default-neutral wrapper."""
+    @functools.wraps(capture)
+    def wrapped(runner, *, profile_only=False):
+        per_arm = capture_model_per_arm(runner, profile_only)
+        if per_arm is not None:
+            return per_arm
+        return capture(runner, profile_only=profile_only)
+
+    return wrapped
 
 
 def capture_model_per_arm(runner, profile_only: bool) -> int | None:

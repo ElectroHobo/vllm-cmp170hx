@@ -14,6 +14,7 @@ from itertools import islice
 import torch
 
 from vllm.models.deepseek_v41.common.engram import Engram
+from vllm.models.deepseek_v41.nvidia.sm80_engram_projection import project_rows
 from vllm.utils.torch_utils import aux_stream, current_stream
 
 
@@ -46,7 +47,7 @@ class EarlyEngram(Engram):
             # Keep lookup, both gathers and WKV on the registered stream,
             # including large lookups that the upstream helper runs inline.
             super().prepare_embeddings(hash_ids)
-            self._early_kv = super()._project_kv(hash_ids)
+            self._early_kv = project_rows(self, hash_ids)
             self._projection_done.record(stream)
 
     def _project_kv(self, hash_ids: torch.Tensor) -> torch.Tensor:

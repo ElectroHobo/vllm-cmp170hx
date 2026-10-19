@@ -401,3 +401,23 @@ def test_combined_optional_paths_keep_empty_default(monkeypatch, name):
 
     monkeypatch.delenv(name, raising=False)
     assert FORK_ENV_VARS[name]() == ""
+
+
+def test_moe_v2_requires_construction_and_restores_only_eligible_rows(monkeypatch, state):
+    eligible = NS(prefill_v2_bits_x2=6, moe_v2_rows=64, moe_v2_bits_x2=6, workspace_elements=1234)
+    closed = NS(prefill_v2_bits_x2=0, moe_v2_rows=0, moe_v2_bits_x2=0, workspace_elements=5678)
+    def layer(experts):
+        return NS(quant_method=NS(moe_kernel=NS(fused_experts=experts)))
+    runner = NS(model=NS(modules=lambda: [layer(eligible), layer(closed)]))
+    monkeypatch.setenv("VLLM_EXL3_MOE_V2", "1")
+    switch = ab.SWITCHES["exl3_moe_v2"]
+    assert switch.unavailable(runner) is None
+    for on in (False, True):
+        switch.apply(runner, on)
+        assert switch.current(runner) is on
+        assert eligible.moe_v2_rows == (64 if on else 0)
+        assert closed.moe_v2_rows == 0
+        assert eligible.moe_v2_bits_x2 == 6 and closed.moe_v2_bits_x2 == 0
+        assert eligible.workspace_elements == 1234 and closed.workspace_elements == 5678
+    eligible.moe_v2_rows = 0
+    assert "boot with" in switch.unavailable(runner)

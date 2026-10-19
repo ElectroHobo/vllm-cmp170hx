@@ -163,3 +163,75 @@ exceptions:
     Remove with the draft-width code when it moves into vllm/sm80 behind one
     call (a DFlash subclass or a width hook); DSpark and DFlash must still
     pass tests/v1/spec_decode/test_dspark_zero_draft.py.
+
+- file: vllm/models/deepseek_v41/common/engram.py
+  hunks: [41489bc78107]
+  reason: >-
+    The existing embedding-factory decorator selects storage before any lookup. The new projection hook runs after lookup and cannot replace that constructor-time selection. Both lifetimes belong to the upstream Engram class; no common factory registers both.
+  owner: sm_80 Engram storage
+  removal: >-
+    Remove this exact decorator exception when upstream provides one Engram implementation factory covering storage construction and projection; retain storage, ordinary-projection and early-gather tests.
+
+- file: vllm/v1/worker/gpu/model_runner.py
+  hunks: [ff7a814b29b9]
+  reason: >-
+    The existing pipeline draft-tail controller must be constructed and attached after speculative configuration and PP ranks exist, before model loading. A graph-capture decorator cannot supply this constructor lifetime.
+  owner: pipeline draft-tail lifecycle
+  removal: >-
+    Move controller construction behind an upstream runner-component factory when available, preserving PP draft-tail ownership and load ordering.
+
+- file: vllm/v1/worker/gpu/model_runner.py
+  hunks: [9b96f0854408]
+  reason: >-
+    The existing folded drafter projection configures the loaded target and PP handler before the drafter loads. It needs local target weights and cannot run at graph capture or output publication.
+  owner: pipeline folded draft projection
+  removal: >-
+    Remove when an upstream target-loaded callback owns projection configuration; retain folded-versus-unfolded arithmetic and PP handoff tests.
+
+- file: vllm/v1/worker/gpu/model_runner.py
+  hunks: [183d60859f35]
+  reason: >-
+    The existing folded-projection marker runs only after the speculator loads, unlike the preceding target-weight configuration. Its timing prevents applying the input projection twice.
+  owner: pipeline folded draft projection
+  removal: >-
+    Remove when an upstream speculator-loaded callback owns the marker and draft-tail loading without changing the load order.
+
+- file: vllm/v1/worker/gpu/model_runner.py
+  hunks: [a35c6ff88a1c]
+  reason: >-
+    The existing optional memory inventory reads the completed target/drafter load and its measured allocator delta. Constructor, capture and request callbacks do not expose that same completed-load boundary.
+  owner: sm_80 memory attribution
+  removal: >-
+    Move the inventory behind an upstream completed-model-load observer that supplies the same measured allocation interval.
+
+- file: vllm/v1/worker/gpu/model_runner.py
+  hunks: [276b0ee249b6]
+  reason: >-
+    The existing optional KV-allocation observer brackets actual temporary profiling or serving KV construction. It must remain around this allocation scope, not around the later graph-capture method.
+  owner: sm_80 memory attribution
+  removal: >-
+    Remove when upstream exposes one KV-allocation context observer retaining the profiling-versus-serving distinction.
+
+- file: vllm/v1/worker/gpu/model_runner.py
+  hunks: [20c6cc21da36]
+  reason: >-
+    The existing optional profiling stage recorder is constructed at the memory-profile boundary and used by its nested stages. It cannot be initialized at model construction without changing its measured interval.
+  owner: sm_80 memory attribution
+  removal: >-
+    Move the recorder to an upstream memory-profiler observer with the same stage boundaries and allocation accounting.
+
+- file: vllm/v1/worker/gpu/model_runner.py
+  hunks: [ba753e35fcca]
+  reason: >-
+    The existing failed-input delivery consumes per-step model failure tokens with the actual request query offsets when constructing asynchronous output. Capture-time registration cannot supply those per-request values.
+  owner: sm_80 failed-input delivery
+  removal: >-
+    Remove when upstream exposes per-output failed-token metadata through the runner output constructor without adding another per-step lookup.
+
+- file: vllm/v1/worker/gpu/async_utils.py
+  hunks: [b20fe5341bf9]
+  reason: >-
+    Output-type registration wraps the existing copy event once after both output classes exist. The older failed-request-id hook runs per output after synchronization and cannot install producer-stream copies before that same event. Registration does not add a synchronization or a reply.
+  owner: sm_80 distributed output checks
+  removal: >-
+    Remove when upstream output classes provide copy-stream and pre-publication error hooks on the same existing event; retain nonreply-rank dispatch and default-neutral copy-event regressions.

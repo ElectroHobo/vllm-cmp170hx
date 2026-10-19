@@ -74,6 +74,7 @@ from vllm.models.deepseek_v41.common.ops.query_quant import (
     mxfp8_scale_offset,
 )
 from vllm.models.deepseek_v41.nvidia.sm80_engram import sm80_engram_embedding
+from vllm.models.deepseek_v41.nvidia.sm80_engram_projection import project_kv
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
@@ -1676,12 +1677,6 @@ class Engram(nn.Module):
         rows = tensor_model_parallel_all_gather(rows, dim=1)
         return rows[:, : self.embed_tokens.n_hash_cols]
 
-    def _project_kv(self, hash_ids: torch.Tensor) -> torch.Tensor:
-        """Project the gathered rows independently of the residual stream."""
-        if self._batch is not None:
-            return self.wkv(self._batch.wkv_input(self, hash_ids.shape[0]))
-        return self.wkv(self.embed(hash_ids).flatten(-2))
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1691,7 +1686,7 @@ class Engram(nn.Module):
         """hidden_states: [T, hc_mult, dim]; hash_ids: [T, n_hash_cols] (all
         tokens, pre sequence-parallel shard); token_mask: [T], False shuts
         the gate so those positions pass through untouched."""
-        kv = self._project_kv(hash_ids)
+        kv = project_kv(self, hash_ids)
         num_kv_tokens = hash_ids.shape[0]
         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
         if self.use_sequence_parallel:

@@ -229,7 +229,13 @@ def _well_formed(row):
 def test_every_family_runs_on_cpu(tmp_path, cases):
     rc, head, rows = _run(tmp_path, cases)
     assert rc == 0
-    assert set(head) == {"torch", "triton", "cuda", "gpu", "sm_count"}
+    assert set(head) == {"torch", "triton", "cuda", "gpu", "sm_count", "reference_math"}
+    assert head["reference_math"] == {
+        "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "allow_bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        "allow_fp16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+    }
     assert set(rows) == {c["id"] for c in cases}
     for cid, row in rows.items():
         _well_formed(row)

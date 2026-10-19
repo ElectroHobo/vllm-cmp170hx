@@ -368,7 +368,7 @@ def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
         return 16
 
     def prefill(x, trellis, suh, svh, bits_x2, *rest):
-        calls.append(("prefill", tuple(x.shape), bits_x2))
+        calls.append(("prefill", tuple(x.shape), bits_x2, rest[3].dtype))
 
     library = SimpleNamespace(
         set_prefill_schedule=lambda mode: calls.append(("schedule", mode)),
@@ -394,7 +394,8 @@ def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
     assert calls == [
         ("schedule", 0),
         ("workspace", (rows, padded_in, padded_out)),
-        *(("prefill", (rows, padded_in), bits_x2) for bits_x2 in (10, 12, 14)),
+        *(("prefill", (rows, padded_in), bits_x2, dtype)
+          for bits_x2 in (10, 12, 14) for dtype in (torch.bfloat16, torch.float32)),
     ]
     assert fakes[-1] == "_exl3_C::linear_out_prefill"
 

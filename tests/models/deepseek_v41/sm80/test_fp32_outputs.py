@@ -135,7 +135,8 @@ def test_plugin_defaults_the_head_dtype_to_fp32(monkeypatch):
     from vllm.model_executor.models import config as models_config
     from vllm.sm80 import plugin
 
-    upstream = models_config.MODELS_CONFIG_MAP[ARCH]
+    registered = models_config.MODELS_CONFIG_MAP[ARCH]
+    upstream = getattr(registered, "replaced_hook", registered)
     monkeypatch.setitem(models_config.MODELS_CONFIG_MAP, ARCH, upstream)
     plugin.register_hf_config_defaults()
     hook = models_config.MODELS_CONFIG_MAP[ARCH]
