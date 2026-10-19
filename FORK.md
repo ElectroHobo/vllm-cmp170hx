@@ -134,7 +134,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 1,260 |
+| `vllm/sm80/envs.py` | 1,266 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -156,6 +156,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
 | `vllm/sm80/spec_decode/aux_fc_fold.py` | 173 |
 | `vllm/sm80/spec_decode/dflash2_model.py` | 425 |
+| `vllm/sm80/spec_decode/dspark_width.py` | 90 |
 | `vllm/sm80/spec_decode/lilicorr_model.py` | 31 |
 | `vllm/sm80/spec_decode/warmup.py` | 184 |
 | `vllm/sm80/spec_decode/zero_draft.py` | 29 |
@@ -166,7 +167,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **42 files** | **11,945** |
+| **43 files** | **12,041** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -248,8 +249,8 @@ Files added elsewhere, grouped by top-level directory.
 | `docs/THIRD_PARTY.md` | 85 |
 | `docs/UPSTREAM_README.md` | 111 |
 | `docs/features/quantization/exl3.md` | 90 |
-| `docs/features/speculative_decoding/adaptive_k.md` | 150 |
-| **4 files** | **436** |
+| `docs/features/speculative_decoding/adaptive_k.md` | 168 |
+| **4 files** | **454** |
 
 #### `plugins/`
 
@@ -443,6 +444,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/core/test_scheduler_failed_inputs.py` | 108 |
 | `tests/v1/kv_connector/conftest.py` | 17 |
 | `tests/v1/spec_decode/test_adaptive_k.py` | 223 |
+| `tests/v1/spec_decode/test_dspark_width.py` | 265 |
 | `tests/v1/spec_decode/test_dspark_zero_draft.py` | 391 |
 | `tests/v1/spec_decode/test_glm5_dflash_accept_depth.py` | 378 |
 | `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 453 |
@@ -457,7 +459,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **193 files** | **93,825** |
+| **194 files** | **94,090** |
 
 #### `tools/`
 
@@ -543,13 +545,14 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/model_states/recoverssm.py` | modified | 4 | 9 | 3 |
 | `vllm/v1/worker/gpu/pp_utils.py` | modified | 222 | 8 | 15 |
 | `vllm/v1/worker/gpu/sample/gumbel.py` | modified | 9 | 1 | 2 |
+| `vllm/v1/worker/gpu/spec_decode/__init__.py` | modified | 4 | 3 | 3 |
 | `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` | modified | 103 | 18 | 7 |
 | `vllm/v1/worker/gpu/spec_decode/dflash/utils.py` | modified | 13 | 3 | 4 |
 | `vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py` | modified | 282 | 0 | 7 |
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **71 files** | | **3,562** | **244** | **495** |
+| **72 files** | | **3,566** | **247** | **498** |
 
 ### Tests, docs and .github
 
@@ -583,9 +586,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 71 | 3,562 | 244 | 495 |
+| Product code | 72 | 3,566 | 247 | 498 |
 | Tests, docs and .github | 22 | 572 | 550 | 78 |
-| All | 93 | 4,134 | 794 | 573 |
+| All | 94 | 4,138 | 797 | 576 |
 
 ## 3. Fork environment variables
 
@@ -626,6 +629,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEV_AB_SWITCH` | `str` | `''` | `''` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
+| `VLLM_DSPARK_PER_K_WIDTH` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
 | `VLLM_ENGRAM_TELEMETRY_STEPS` | `int` | `0` | `'0'` |
@@ -710,7 +714,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **115 variables** | | | |
+| **116 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -729,12 +733,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 161 |
-| Fork-added product lines | 52,314 |
-| Patched upstream files | 93 |
-| Patched upstream lines | +4,134 / -794 |
-| Patched upstream product files | 71 |
-| Patched upstream product lines | +3,562 / -244 |
-| Product lines added (new files and patches) | 55,876 |
-| Fork environment variables (flags) | 115 |
+| Fork-added product files | 162 |
+| Fork-added product lines | 52,410 |
+| Patched upstream files | 94 |
+| Patched upstream lines | +4,138 / -797 |
+| Patched upstream product files | 72 |
+| Patched upstream product lines | +3,566 / -247 |
+| Product lines added (new files and patches) | 55,976 |
+| Fork environment variables (flags) | 116 |
 | Unreferenced fork definitions | 3 (27 lines) |
