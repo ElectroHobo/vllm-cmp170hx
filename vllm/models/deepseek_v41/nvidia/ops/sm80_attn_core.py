@@ -393,14 +393,17 @@ def store_kv(
     weights: Sm80AttnWeights,
     caches: Sm80AttnCaches,
     batch: Sm80AttnBatch,
-    kv: torch.Tensor,
+    kv: torch.Tensor | None,
     kv_score: torch.Tensor | None,
+    window: bool = True,
 ) -> None:
     """Every KV write of one layer: window row, compressed row, index key.
 
-    ``kv`` is ``kv_norm(wkv(x))`` (BF16, pre-RoPE)."""
-    rows = window_kv(kv, batch.positions, weights.freqs)
-    store_rows(caches.swa, batch.swa_slots, rows)
+    ``kv`` is ``kv_norm(wkv(x))`` (BF16, pre-RoPE). Without ``window`` the
+    window rows are already written (the fused prologue) and ``kv`` is unused."""
+    if window:
+        rows = window_kv(kv, batch.positions, weights.freqs)
+        store_rows(caches.swa, batch.swa_slots, rows)
     if not cfg.is_kv_source:
         return
     assert kv_score is not None and caches.comp is not None
@@ -786,6 +789,7 @@ def prepare_layer(
     kv_score: torch.Tensor | None,
     index_weights: torch.Tensor | None,
     chunk_bytes: int = DEFAULT_SCORE_CHUNK_BYTES,
+    fused: bool = False,
 ) -> torch.Tensor:
     """Everything before attention: norms, ``wq_b`` and the query RoPE, this
     step's KV writes, and at index sources the top-k (and candidate) buffers.
@@ -793,14 +797,28 @@ def prepare_layer(
 
     ``qr_kv`` [>= T, q_lora + head_dim] BF16; ``kv_score`` [>= T, ratio *
     head_dim] fp32 at kv sources; ``index_weights`` [>= T, index_n_heads]
-    BF16 (``weights_proj`` output) at index sources."""
+    BF16 (``weights_proj`` output) at index sources.
+
+    ``fused``: the norms and the window row run as one launch
+    (``sm80_attn_fused.prologue``) and the returned query is ``wq_b``'s output
+    BEFORE RoPE, which :func:`attend_layer` with ``fused`` rotates."""
     T = batch.num_tokens
     pos = batch.positions
     d = cfg.head_dim
-    qr, kv = qr_kv[:T].split([qr_kv.shape[1] - d, d], dim=-1)
-    qr = rms_norm(qr, weights.q_norm, cfg.eps)
-    kv = rms_norm(kv, weights.kv_norm, cfg.eps)
-    q = rope(weights.wq_b(qr).view(T, cfg.n_local_heads, d), pos, weights.freqs)
+    if fused:
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_fused
+
+        qr = sm80_attn_fused.prologue(
+            qr_kv, weights.q_norm, weights.kv_norm, pos, weights.freqs,
+            caches.swa, batch.swa_slots, cfg.eps,
+        )
+        kv = None
+        q = weights.wq_b(qr).view(T, cfg.n_local_heads, d)
+    else:
+        qr, kv = qr_kv[:T].split([qr_kv.shape[1] - d, d], dim=-1)
+        qr = rms_norm(qr, weights.q_norm, cfg.eps)
+        kv = rms_norm(kv, weights.kv_norm, cfg.eps)
+        q = rope(weights.wq_b(qr).view(T, cfg.n_local_heads, d), pos, weights.freqs)
     store_kv(
         cfg,
         weights,
@@ -808,6 +826,7 @@ def prepare_layer(
         batch,
         kv,
         None if kv_score is None else kv_score[:T],
+        window=not fused,
     )
     if cfg.compress_ratio and cfg.is_index_source:
         assert index_weights is not None
@@ -823,12 +842,36 @@ def attend_layer(
     batch: Sm80AttnBatch,
     q: torch.Tensor,
     out: torch.Tensor,
+    fused: bool = False,
 ) -> None:
     """Sparse attention of the post-RoPE ``q`` over the window slots and the
     selected compressed positions (``caches.topk``), then the output RoPE and
     qdq. Writes ``out[:T]`` (the ``wo_a`` input, [n_local_heads, head_dim]
-    BF16 rows) and zeros the padding rows ``out[T:]``."""
+    BF16 rows) and zeros the padding rows ``out[T:]``.
+
+    ``fused``: ``q`` is the pre-RoPE query of :func:`prepare_layer` with
+    ``fused``; the query RoPE, attention and output run as
+    ``sm80_attn_fused.attend``."""
     T = batch.num_tokens
+    if fused:
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_fused
+
+        sm80_attn_fused.attend(
+            q,
+            batch.positions,
+            weights.freqs,
+            caches.swa,
+            batch.swa_indices,
+            caches.comp,
+            batch.comp_block_table,
+            caches.topk[:T] if cfg.compress_ratio else None,
+            batch.token_to_req,
+            weights.attn_sink,
+            cfg.softmax_scale,
+            cfg.n_local_groups,
+            out,
+        )
+        return
     o = sparse_attention(
         q[:T],
         caches.swa,

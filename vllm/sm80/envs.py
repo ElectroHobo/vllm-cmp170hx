@@ -99,6 +99,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -837,6 +839,19 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Default OFF. Read in vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
     "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the attention core of decode, speculative verify
+    # and draft steps (the norms and window row of prepare_layer, the query
+    # RoPE, sparse attention, output RoPE and qdq of attend_layer) as two
+    # fused calls per layer (ops/sm80_attn_fused.py), same rounding points.
+    # Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: the most rows (tokens of the
+    # padded step) a layer call may have to take the fused path.
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "48")
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.

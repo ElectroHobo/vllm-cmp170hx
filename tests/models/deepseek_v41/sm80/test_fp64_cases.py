@@ -123,8 +123,43 @@ def _mhc(g, pre_only=False):
     return {k: v for k, v in a.items() if v is not None}
 
 
+def _rope_freqs():
+    return core.rope_freqs(64, 0, 10000.0, 1.0, 32, 1)
+
+
+def _attn_prologue(g, n=11):
+    """A fused-prologue call: a token whose slot is -1 writes nothing."""
+    slots = torch.randperm(5 * 64, generator=g)[:n] + 64
+    slots[3] = -1
+    return dict(
+        qr_kv=(torch.randn(n, 1792, generator=g) * 3).to(BF16),
+        q_norm=(1 + 0.1 * torch.randn(1280, generator=g)).to(BF16),
+        kv_norm=(1 + 0.1 * torch.randn(512, generator=g)).to(BF16),
+        positions=torch.randint(0, 9000, (n,), generator=g),
+        freqs=_rope_freqs(),
+        swa_cache=(torch.randn(6, 64, 512, generator=g) * 0.5).to(BF16),
+        swa_slots=slots,
+        eps=1e-20,
+    )
+
+
+def _attn_attend(g, compressed=True):
+    q, swa, swa_idx, comp, table, local, req, sink = _attn_case(g)
+    n = q.shape[0]
+    t = dict(q=q, positions=torch.randint(0, 9000, (n,), generator=g),
+             freqs=_rope_freqs(), swa_cache=swa, swa_indices=swa_idx, comp_cache=comp,
+             comp_block_table=table, comp_local=local, req=req.int(), attn_sink=sink,
+             scale=512**-0.5, n_groups=2, out=torch.zeros(n, 16, 512, dtype=BF16))
+    if not compressed:
+        t.update(comp_cache=None, comp_block_table=None, comp_local=None)
+    return t
+
+
 # mHC case ids: <family>:<output> (the output the case judges)
 MHC = ("mhc_delayed:comb", "mhc_delayed:layer_input.rp", "mhc_pre_delayed:pre")
+# Fused attention core case ids (the prologue's cases name their output)
+FUSED_ATTN = ("attn_prologue:qr", "attn_prologue:window", "attn_attend")
+MULTI = MHC + FUSED_ATTN[:2]
 
 
 @pytest.fixture(scope="module")
@@ -153,11 +188,19 @@ def cases(tmp_path_factory):
         "mhc_delayed:comb": [_source(d, "mhc", "mhc_delayed", _mhc(g))],
         "mhc_delayed:layer_input.rp": [_source(d, "mhc_li", "mhc_delayed", _mhc(g))],
         "mhc_pre_delayed:pre": [_source(d, "mhc_pre", "mhc_pre_delayed", _mhc(g, True))],
+        "attn_prologue:qr": [_source(d, "pro", "attn_prologue", _attn_prologue(g))],
+        "attn_prologue:window": [
+            _source(d, "pro_w", "attn_prologue", _attn_prologue(g))
+        ],
+        "attn_attend": [
+            _source(d, "att0", "attn_attend", _attn_attend(g)),
+            _source(d, "att1", "attn_attend", _attn_attend(g, compressed=False)),
+        ],
     }
     return [
         {"id": k, "family": k.split(":")[0], "phase": "decode", "concurrency": 1,
          "calls": len(v), "captured_sources": v,
-         **({"output": k.split(":")[1]} if k in MHC else {})}
+         **({"output": k.split(":")[1]} if k in MULTI else {})}
         for k, v in sources.items()
     ]
 
@@ -208,6 +251,8 @@ def test_every_family_runs_on_cpu(tmp_path, cases):
             assert e["cand_max"] > 0, cid  # their BF16 rounding is measured
     assert rows["compress"]["family"] == "compress"
     for cid in MHC:
+        assert rows[cid]["family"] == cid, cid
+    for cid in FUSED_ATTN:
         assert rows[cid]["family"] == cid, cid
 
 
@@ -569,3 +614,10 @@ def test_cuda_paths_on_the_synthetic_cases(tmp_path, cases):
             assert e["cand_mean"] == e["ref_mean"] and e["cand_max"] == e["ref_max"], cid
         if cid in EXACT[:3]:
             assert e["cand_max"] == 0.0, cid
+        if cid in FUSED_ATTN:
+            # V2: the fused core against the served path, both against FP64
+            if e["ref_max"] == 0.0:
+                assert e["cand_max"] == 0.0, cid
+            else:
+                assert e["cand_mean"] <= 1.10 * e["ref_mean"], (cid, e)
+                assert e["cand_max"] <= 1.25 * e["ref_max"], (cid, e)

@@ -100,6 +100,21 @@ unless named in full.
   element moves the coefficients by more than their FP32 arithmetic does).
   Row invariance holds within a kernel variant (up to 8 rows and from 9
   rows, the two kernel A forms reduce in different orders).
+- ``attn_prologue``: ``sm80_attn_fused:prologue`` (qr_kv, q_norm, kv_norm,
+  positions, freqs, swa_cache, swa_slots, eps) -> the fused prologue
+  (``sm80_attn_fused``; the reference path on CPU) / ``sm80_attn_core``'s
+  ``rms_norm`` pair, ``window_kv`` and ``store_rows`` / FP64. Two outputs,
+  judged one per case (as the mHC families): ``qr`` (the query RMSNorm,
+  against FP64 unrounded) or ``window`` (the cache rows of the slots >= 0:
+  RMSNorm and RoPE in FP64, each rounded to BF16 as the reference does, then
+  the exact FP8 qdq).
+- ``attn_attend``: ``sm80_attn_fused:attend`` (q, positions, freqs,
+  swa_cache, swa_indices, comp_cache, comp_block_table, comp_local, req,
+  attn_sink, scale, n_groups, out) -> the fused attend (the reference path
+  on CPU) / ``sm80_attn_core``'s ``rope``, ``sparse_attention`` and
+  ``output_qdq`` / FP64: ``out[:T]`` with the query RoPE (rounded to BF16),
+  the sink attention (rounded to BF16) and the inverse RoPE (rounded to
+  BF16) in FP64, then the exact per-group FP8 qdq.
 """
 
 import argparse
@@ -728,8 +743,178 @@ def mhc_pre_delayed(a: dict, device: torch.device, src: Source) -> Call:
     return _mhc(a, device, src.output)
 
 
+# ---------------------------------------------------------------- fused attention core
+
+ATTN_PROLOGUE_OUTPUTS = ("qr", "window")
+
+
+def _rms_fp64(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    x = x.double()
+    return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * w.double()
+
+
+def _rope_fp64(x, positions, freqs, inverse=False):
+    """FP64 RoPE of the last ``2 * len(freqs)`` dims of ``x`` ([T, ..., D])
+    at the layer's FP32 angles (``fp32(position) * fp32 frequency``)."""
+    rd = 2 * freqs.numel()
+    angles = (positions.to(torch.float32)[:, None] * freqs.to(torch.float32)).double()
+    cis = torch.polar(torch.ones_like(angles), angles)
+    if inverse:
+        cis = cis.conj()
+    cis = cis.view((positions.shape[0],) + (1,) * (x.dim() - 2) + (rd // 2,))
+    out = x.double().clone()
+    tail = torch.view_as_complex(out[..., -rd:].contiguous().unflatten(-1, (-1, 2)))
+    out[..., -rd:] = torch.view_as_real(tail * cis).flatten(-2)
+    return out
+
+
+def _fused_attn(device: torch.device):
+    """The fused module where it runs (CUDA); None on CPU, where the
+    reference path stands in for the candidate."""
+    if device.type != "cuda":
+        return None
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_fused
+
+    return sm80_attn_fused
+
+
+def attn_prologue(a: dict, device: torch.device, src: Source) -> Call:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
+    from vllm.models.deepseek_v41.nvidia.ops.sm80_act_quant import act_quant_qdq_fp8
+
+    output = src.output
+    if output not in ATTN_PROLOGUE_OUTPUTS:
+        raise ValueError(
+            f"attn_prologue output {output!r} is not one of {ATTN_PROLOGUE_OUTPUTS}"
+        )
+    names = ("qr_kv", "q_norm", "kv_norm", "positions", "freqs", "swa_cache", "swa_slots")
+    t = {k: _to(a[k], device) for k in names}
+    eps = float(a["eps"])
+    fused = _fused_attn(device)
+    cache0, slots, pos = t["swa_cache"], t["swa_slots"], t["positions"]
+    d = cache0.shape[-1]
+    entries = cache0.shape[1]
+
+    def ref(rows):
+        qr, kv = t["qr_kv"][rows].split([t["qr_kv"].shape[1] - d, d], dim=-1)
+        cache = cache0.clone()
+        qr = core.rms_norm(qr, t["q_norm"], eps)
+        kv = core.rms_norm(kv, t["kv_norm"], eps)
+        core.store_rows(cache, slots[rows], core.window_kv(kv, pos[rows], t["freqs"]))
+        return qr, cache
+
+    def cand(rows):
+        if fused is None:
+            return ref(rows)
+        cache = cache0.clone()
+        qr = fused.prologue(
+            t["qr_kv"][rows], t["q_norm"], t["kv_norm"], pos[rows], t["freqs"],
+            cache, slots[rows], eps,
+        )
+        return qr, cache
+
+    keep = slots >= 0
+    written = slots[keep]
+
+    def judged(qr, cache):
+        if output == "qr":
+            return qr
+        return cache[written // entries, written % entries]
+
+    whole = cand(slice(None))
+    T = pos.shape[0]
+    qr_part, kv_part = t["qr_kv"][:T].split([t["qr_kv"].shape[1] - d, d], dim=-1)
+    if output == "qr":
+        exact = _rms_fp64(qr_part, t["q_norm"], eps)
+    else:
+        kvn = _rms_fp64(kv_part, t["kv_norm"], eps).to(BF16)
+        rope = _rope_fp64(kvn, pos, t["freqs"]).to(BF16)
+        exact = act_quant_qdq_fp8(rope, 32).double()[keep]
+
+    def alone(i):
+        qr, cache = cand(slice(i, i + 1))
+        if output == "qr":
+            return bits_equal(qr, whole[0][i : i + 1])
+        s = int(slots[i])
+        if s < 0:
+            return bits_equal(cache, cache0)
+        return bits_equal(cache[s // entries, s % entries], whole[1][s // entries, s % entries])
+
+    return Call(
+        judged(*whole), judged(*ref(slice(None))), exact, all(alone(i) for i in picks(T))
+    )
+
+
+def attn_attend(a: dict, device: torch.device, _src: Source) -> Call:
+    from tests.models.deepseek_v41.sm80.test_sm80_kernels_gpu import (
+        _fp64_attention,
+        _gather_rows,
+    )
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
+    from vllm.models.deepseek_v41.nvidia.ops.sm80_act_quant import act_quant_qdq_fp8
+
+    names = ("q", "positions", "freqs", "swa_cache", "swa_indices", "comp_cache",
+             "comp_block_table", "comp_local", "req", "attn_sink", "out")
+    t = {k: _to(a.get(k), device) for k in names}
+    scale, groups = float(a["scale"]), int(a["n_groups"])
+    q, pos, local = t["q"], t["positions"], t["comp_local"]
+    fused = _fused_attn(device)
+    T = pos.shape[0]
+
+    def ref(rows):
+        o = core.sparse_attention(
+            core.rope(q[rows], pos[rows], t["freqs"]), t["swa_cache"],
+            t["swa_indices"][rows], t["comp_cache"], t["comp_block_table"],
+            None if local is None else local[rows], t["req"][rows], t["attn_sink"], scale,
+        )
+        return core.output_qdq(o, pos[rows], t["freqs"], groups)
+
+    def cand(rows):
+        if fused is None:
+            return ref(rows)
+        n = pos[rows].shape[0]
+        out = t["out"][:n].clone()
+        fused.attend(
+            q[rows], pos[rows], t["freqs"], t["swa_cache"], t["swa_indices"][rows],
+            t["comp_cache"], t["comp_block_table"],
+            None if local is None else local[rows], t["req"][rows], t["attn_sink"],
+            scale, groups, out,
+        )
+        return out
+
+    whole = cand(slice(None))
+    n_rows = t["swa_indices"].shape[1] + (0 if local is None else local.shape[1])
+    h, d = q.shape[1], q.shape[2]
+    step = max(1, CHUNK_BYTES // max(1, n_rows * (d + h) * 8))
+    exacts = []
+    for start in range(0, T, step):
+        rows = slice(start, min(T, start + step))
+        gathered, valid = _gather_rows(
+            SimpleNamespace(compress_ratio=int(local is not None)),
+            SimpleNamespace(
+                swa=t["swa_cache"], comp=t["comp_cache"],
+                topk=None if local is None else local[rows],
+            ),
+            SimpleNamespace(
+                num_tokens=rows.stop - rows.start,
+                swa_indices=t["swa_indices"][rows],
+                token_to_req=t["req"][rows],
+                comp_block_table=t["comp_block_table"],
+            ),
+        )
+        qr = _rope_fp64(q[rows], pos[rows], t["freqs"]).to(BF16)
+        o = _fp64_attention(qr, gathered, valid, t["attn_sink"], scale).to(BF16)
+        o = _rope_fp64(o, pos[rows], t["freqs"], inverse=True).to(BF16)
+        n = o.shape[0]
+        exacts.append(
+            act_quant_qdq_fp8(o.view(n, groups, (h // groups) * d), 32).view(n, h, d)
+        )
+    alone = all(bits_equal(whole[i : i + 1], cand(slice(i, i + 1))) for i in picks(T))
+    return Call(whole[:T], ref(slice(None)), torch.cat(exacts).double(), alone)
+
+
 # Families with several outputs: the case names the one it judges.
-MULTI_OUTPUT = {"mhc_delayed", "mhc_pre_delayed"}
+MULTI_OUTPUT = {"mhc_delayed", "mhc_pre_delayed", "attn_prologue"}
 
 
 FAMILIES = {
@@ -746,6 +931,8 @@ FAMILIES = {
     },
     "mhc_delayed": mhc_delayed,
     "mhc_pre_delayed": mhc_pre_delayed,
+    "attn_prologue": attn_prologue,
+    "attn_attend": attn_attend,
 }
 
 
@@ -757,6 +944,7 @@ _MOE_ARGS = ["x", "topk_ids", "topk_weights", "packed_meta", "expert_map",
 _MHC = "vllm.models.deepseek_v41.nvidia.ops.sm80_mhc"
 _MHC_ARGS = ["fn", "hc_scale", "hc_base", "rms_eps", "hc_pre_eps", "hc_sinkhorn_eps",
              "hc_post_mult_value", "sinkhorn_repeat", "pre_mix", "norm_weight", "norm_eps"]
+_FUSED = "vllm.models.deepseek_v41.nvidia.ops.sm80_attn_fused"
 POINTS = {
     "sparse_attention": (f"{_CORE}:sparse_attention",
                          ["q", "swa_cache", "swa_indices", "comp_cache",
@@ -780,6 +968,13 @@ POINTS = {
     "mhc_delayed": (f"{_MHC}:mhc_fused_post_pre_delayed",
                     ["x", "residual", "post_layer_mix", "comb_res_mix", *_MHC_ARGS]),
     "mhc_pre_delayed": (f"{_MHC}:mhc_pre_delayed", ["residual", *_MHC_ARGS]),
+    "attn_prologue": (f"{_FUSED}:prologue",
+                      ["qr_kv", "q_norm", "kv_norm", "positions", "freqs", "swa_cache",
+                       "swa_slots", "eps"]),
+    "attn_attend": (f"{_FUSED}:attend",
+                    ["q", "positions", "freqs", "swa_cache", "swa_indices", "comp_cache",
+                     "comp_block_table", "comp_local", "req", "attn_sink", "scale",
+                     "n_groups", "out"]),
 }
 
 
