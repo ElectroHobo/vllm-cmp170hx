@@ -160,6 +160,7 @@ def test_apply_passes_the_layer_bits_to_moe_out_v2(monkeypatch):
     experts.workspace_elements = 0
     experts.max_rows = 2048
     experts.moe_v2_rows = 64
+    experts.moe_out_rows = experts.max_rows
     experts.moe_v2_bits_x2 = 4
     experts.prefill_decode_len = 0
     experts.swiglu_limit = SWIGLU_LIMIT

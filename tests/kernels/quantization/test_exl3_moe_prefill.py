@@ -280,6 +280,7 @@ def _experts(
     experts.workspace_elements = workspace
     experts.max_rows = max_rows
     experts.moe_v2_rows = moe_v2_rows
+    experts.moe_out_rows = max_rows
     experts.moe_v2_bits_x2 = 10
     experts.prefill_decode_len = prefill_decode_len
     experts.swiglu_limit = 0.0

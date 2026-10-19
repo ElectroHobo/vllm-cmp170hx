@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EXL3 packed linear and whole-expert inference with BF16 activations."""
 
+import math
 from functools import cache, partial
 from pathlib import Path
 from typing import Any, Literal
@@ -243,6 +244,43 @@ class Exl3Config(QuantizationConfig):
         return None
 
 
+# Every view of an expert buffer starts at a multiple of this many bytes, the
+# alignment the caching allocator gives each block, so the kernels see the
+# same alignment as with one allocation per tensor.
+EXPERT_VIEW_ALIGN_BYTES = 512
+
+
+def expert_buffer_views(
+    matrices: list[PackedMatrix],
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """(trellis, suh, svh) views of whole packed matrices, in ``matrices``
+    order, into one new buffer per tensor kind (int16 trellis, FP16 suh, FP16
+    svh) on the default device. Each view is a contiguous tensor of the shape
+    Exl3PackedWeight allocates for the whole matrix, at an offset that is a
+    multiple of EXPERT_VIEW_ALIGN_BYTES (VLLM_EXL3_EXPERTS_CONTIGUOUS)."""
+    kinds = (
+        (torch.int16, lambda m: (m.padded_in // 16, m.padded_out // 16, 8 * m.bits_x2)),
+        (torch.float16, lambda m: (m.padded_in,)),
+        (torch.float16, lambda m: (m.padded_out,)),
+    )
+    columns = []
+    for dtype, shape_of in kinds:
+        step = EXPERT_VIEW_ALIGN_BYTES // dtype.itemsize
+        shapes = [shape_of(matrix) for matrix in matrices]
+        offsets, total = [], 0
+        for shape in shapes:
+            offsets.append(total)
+            total += -(-math.prod(shape) // step) * step
+        buffer = torch.empty(total, dtype=dtype)
+        columns.append(
+            [
+                buffer[offset : offset + math.prod(shape)].view(shape)
+                for offset, shape in zip(offsets, shapes)
+            ]
+        )
+    return list(zip(*columns))
+
+
 class Exl3PackedWeight(nn.Module):
     def __init__(
         self,
@@ -251,7 +289,11 @@ class Exl3PackedWeight(nn.Module):
         logical_out: int,
         input_slice: slice,
         output_slices: list[slice],
+        views: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ):
+        """``views``: (trellis, suh, svh) tensors to load into instead of new
+        allocations (expert_buffer_views); their shapes and dtypes must be the
+        ones allocated here."""
         super().__init__()
         for part, limit in [(input_slice, matrix.padded_in)] + [
             (part, matrix.padded_out) for part in output_slices
@@ -275,21 +317,27 @@ class Exl3PackedWeight(nn.Module):
             or not 0 < logical_out <= self.padded_out
         ):
             raise ValueError("EXL3 logical dimensions exceed assigned packed blocks")
-        self.trellis = nn.Parameter(
-            torch.empty(
-                self.padded_in // 16,
-                self.padded_out // 16,
-                8 * matrix.bits_x2,
-                dtype=torch.int16,
-            ),
-            requires_grad=False,
+        shapes = (
+            (self.padded_in // 16, self.padded_out // 16, 8 * matrix.bits_x2),
+            (self.padded_in,),
+            (self.padded_out,),
         )
-        self.suh = nn.Parameter(
-            torch.empty(self.padded_in, dtype=torch.float16), requires_grad=False
-        )
-        self.svh = nn.Parameter(
-            torch.empty(self.padded_out, dtype=torch.float16), requires_grad=False
-        )
+        dtypes = (torch.int16, torch.float16, torch.float16)
+        if views is None:
+            views = tuple(
+                torch.empty(shape, dtype=dtype) for shape, dtype in zip(shapes, dtypes)
+            )
+        elif any(
+            tuple(view.shape) != shape
+            or view.dtype != dtype
+            or not view.is_contiguous()
+            for view, shape, dtype in zip(views, shapes, dtypes)
+        ):
+            raise ValueError("EXL3 packed weight views do not match the matrix")
+        trellis, suh, svh = views
+        self.trellis = nn.Parameter(trellis, requires_grad=False)
+        self.suh = nn.Parameter(suh, requires_grad=False)
+        self.svh = nn.Parameter(svh, requires_grad=False)
         self.loaded = False
 
     def load(self, files, ledger):
@@ -662,9 +710,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.intermediate_size = intermediate_size_per_partition
         self.local_experts = num_experts
         self.hidden_size = hidden_size
-        weights = [[] for _ in range(num_experts)]
         self.global_expert_ids = [-1] * num_experts
         self.nonlocal_keys = []
+        # (local expert, matrix, logical in, logical out) in allocation order.
+        local_matrices = []
         for expert in range(layer.global_num_experts):
             local = layer._map_global_expert_id_to_local_expert_id(expert)
             for role in ("gate_proj", "up_proj", "down_proj"):
@@ -682,15 +731,27 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     self.nonlocal_keys.extend(matrix.keys)
                 else:
                     self.global_expert_ids[local] = expert
-                    weights[local].append(
-                        Exl3PackedWeight(
-                            matrix,
-                            k,
-                            n,
-                            slice(0, matrix.padded_in),
-                            [slice(0, matrix.padded_out)],
-                        )
-                    )
+                    local_matrices.append((local, matrix, k, n))
+        views = [None] * len(local_matrices)
+        if envs.VLLM_EXL3_EXPERTS_CONTIGUOUS and local_matrices:
+            views = expert_buffer_views([m for _, m, _, _ in local_matrices])
+            logger.info_once(
+                "EXL3 routed experts in one buffer per MoE layer and tensor kind "
+                "(VLLM_EXL3_EXPERTS_CONTIGUOUS): trellis, suh and svh of every "
+                "local expert matrix are views."
+            )
+        weights = [[] for _ in range(num_experts)]
+        for (local, matrix, k, n), view in zip(local_matrices, views):
+            weights[local].append(
+                Exl3PackedWeight(
+                    matrix,
+                    k,
+                    n,
+                    slice(0, matrix.padded_in),
+                    [slice(0, matrix.padded_out)],
+                    views=view,
+                )
+            )
         if any(len(expert) != 3 for expert in weights):
             raise ValueError("EXL3 expert assignment is incomplete or duplicated")
         layer.exl3_experts = nn.ModuleList(nn.ModuleList(w) for w in weights)
@@ -751,8 +812,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             allow_new_interface=True,
         )
         max_rows = dispatched_rows(prepare, self.moe)
+        # Its workspace holds one moe_out launch, which may be a row chunk.
+        moe_out_rows = moe_out_launch_rows(max_rows)
         workspace = exl3_ops.moe_workspace_size(
-            max_rows,
+            moe_out_rows,
             self.hidden_size,
             self.intermediate_size,
             layer.top_k,
@@ -768,6 +831,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             prefill_decode_len, workspace = self._moe_prefill(
                 layer, metadata, max_rows, workspace
             )
+        if moe_out_rows < max_rows:
+            logger.info_once(
+                "EXL3 moe_out runs MoE calls of more than %d rows in chunks of "
+                "at most %d (VLLM_EXL3_MOE_CHUNK_ROWS); its workspace holds %d "
+                "rows instead of %d.",
+                moe_out_rows,
+                moe_out_rows,
+                moe_out_rows,
+                max_rows,
+            )
         experts = Exl3Experts(
             self.moe,
             self.moe_quant_config,
@@ -775,6 +848,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_expert_map,
             workspace,
             max_rows,
+            moe_out_rows=moe_out_rows,
             moe_v2_rows=moe_v2_rows,
             moe_v2_bits_x2=moe_v2_bits_x2,
             prefill_decode_len=prefill_decode_len,
@@ -944,6 +1018,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         expert_map,
         workspace,
         max_rows,
+        moe_out_rows=None,
         moe_v2_rows=0,
         moe_v2_bits_x2=0,
         prefill_decode_len=0,
@@ -954,6 +1029,9 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.expert_map = expert_map
         self.workspace_elements = workspace
         self.max_rows = max_rows
+        # moe_out takes at most this many rows per launch (its workspace size;
+        # VLLM_EXL3_MOE_CHUNK_ROWS); larger calls run in chunks.
+        self.moe_out_rows = max_rows if moe_out_rows is None else moe_out_rows
         # Calls of 1..moe_v2_rows rows take moe_out_v2 (VLLM_EXL3_MOE_V2) with
         # the layer's routed-matrix bits_x2.
         self.moe_v2_rows = moe_v2_rows
@@ -1056,18 +1134,31 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             operator = moe_out
         if self.prefill_decode_len:
             operator = self._prefill_operator(rows, operator)
-        operator(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            w1,
-            w2,
-            self.expert_map if expert_map is None else expert_map,
-            self.intermediate_size,
-            output,
-            workspace2.view(torch.float32),
-            swiglu_limit=self.swiglu_limit,
-        )
+        # Row-indexed arguments; moe_out takes at most moe_out_rows of them per
+        # launch. It computes every row from its own input and routes alone, so
+        # row chunks give the bits of the whole call.
+        rows_args = (hidden_states, topk_ids, topk_weights, output)
+        if operator is moe_out and rows > self.moe_out_rows:
+            step = self.moe_out_rows
+            chunks = [
+                tuple(t[start : start + step] for t in rows_args)
+                for start in range(0, rows, step)
+            ]
+        else:
+            chunks = [rows_args]
+        for x, ids, weights, out in chunks:
+            operator(
+                x,
+                ids,
+                weights,
+                w1,
+                w2,
+                self.expert_map if expert_map is None else expert_map,
+                self.intermediate_size,
+                out,
+                workspace2.view(torch.float32),
+                swiglu_limit=self.swiglu_limit,
+            )
 
     def _prefill_operator(self, rows: int, operator):
         """moe_out_prefill for a call of MOE_PREFILL_MIN_ROWS..MOE_PREFILL_MAX_ROWS
@@ -1117,6 +1208,18 @@ def _unaligned_trellis_reason(pointers) -> str | None:
             if trellis % 16:
                 return f"local expert {local} {role} trellis is not 16-byte aligned"
     return None
+
+
+def moe_out_launch_rows(max_rows: int) -> int:
+    """Most rows one moe_out launch takes for calls of up to ``max_rows``
+    rows: VLLM_EXL3_MOE_CHUNK_ROWS when it is set and smaller (larger calls
+    then run in row chunks), else ``max_rows``."""
+    chunk_rows = envs.VLLM_EXL3_MOE_CHUNK_ROWS
+    if chunk_rows < 0:
+        raise ValueError(
+            f"VLLM_EXL3_MOE_CHUNK_ROWS must be 0 or positive, not {chunk_rows}"
+        )
+    return min(max_rows, chunk_rows) if chunk_rows else max_rows
 
 
 def dispatched_rows(prepare, moe) -> int:

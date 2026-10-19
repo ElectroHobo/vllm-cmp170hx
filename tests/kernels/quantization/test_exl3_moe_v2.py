@@ -177,6 +177,7 @@ def _experts(moe_v2_rows, max_rows=4096, workspace=0, expert_map="layer map"):
     experts.workspace_elements = workspace
     experts.max_rows = max_rows
     experts.moe_v2_rows = moe_v2_rows
+    experts.moe_out_rows = max_rows
     experts.moe_v2_bits_x2 = BITS_X2
     experts.prefill_decode_len = 0
     experts.swiglu_limit = 0.0
