@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sm80.kernels.exl3.layout import Exl3Layout, exl3_layout
 from vllm.sm80.kernels.exl3.override import apply_override
+from vllm.sm80.kernels.exl3.placement import apply_placement
 from vllm.sm80.kernels.exl3.utils import (
     Exl3Manifest,
     PackedMatrix,
@@ -707,6 +708,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if params_dtype != torch.bfloat16 or layer.apply_router_weight_on_input:
             raise ValueError("EXL3 MoE requires BF16 and routing weights after down")
         assert self.config.manifest is not None
+        apply_placement(layer, self.config, self.prefix)
         self.intermediate_size = intermediate_size_per_partition
         self.local_experts = num_experts
         self.hidden_size = hidden_size

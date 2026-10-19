@@ -113,6 +113,8 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
+    VLLM_EXL3_EXPERT_PLACEMENT: str = ""
+    VLLM_EXL3_EXPERT_PLACEMENT_SHA256: str = ""
     VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
@@ -946,6 +948,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_EXPERTS_CONTIGUOUS": lambda: bool(
         int(os.getenv("VLLM_EXL3_EXPERTS_CONTIGUOUS", "0"))
     ),
+    # SHA-pinned boot-time whole-expert EP permutation; empty is disabled.
+    "VLLM_EXL3_EXPERT_PLACEMENT": lambda: os.getenv(
+        "VLLM_EXL3_EXPERT_PLACEMENT", ""
+    ),
+    "VLLM_EXL3_EXPERT_PLACEMENT_SHA256": lambda: os.getenv(
+        "VLLM_EXL3_EXPERT_PLACEMENT_SHA256", ""
+    ),
+
     # EXL3 routed experts: moe_out runs MoE calls of more than this many rows
     # in row chunks of at most this many, so its workspace is sized for one
     # chunk (vllm/sm80/kernels/exl3/quant.py). moe_out computes every row from
