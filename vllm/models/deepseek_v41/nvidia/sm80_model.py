@@ -344,6 +344,14 @@ class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
         # the upstream unquantized-head path, in the head dtype too.
         Exl3HeadLogitsProcessor.adopt(self.logits_processor)
 
+    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocabulary shard of ``compute_logits`` (no all-gather,
+        padding columns kept), for the per-rank greedy argmax
+        (``vllm/sm80/spec_decode/shard_argmax.py``)."""
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
+
     def load_weights(self, weights) -> set[str]:
         """Upstream ``load_weights``, without dropping the confidence head
         when one call does not carry it: the EXL3 loader passes one tensor

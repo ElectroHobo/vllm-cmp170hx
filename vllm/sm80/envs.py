@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
+    VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -893,6 +894,22 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Default OFF. Read in vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
     "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80, the DSpark drafter's greedy Markov sampling:
+    # each TP rank takes the argmax of its own vocabulary shard of the draft
+    # logits (base logits + Markov bias), and the ranks exchange one
+    # (value, index) pair per 4096-column chunk through a 16-byte all-reduce
+    # slot, instead of all-gathering the full-vocabulary base logits once per
+    # draft step. Precision: none changes. The logits are the same values the
+    # gathered path builds (the same head and the same addition on this
+    # rank's columns), and the pick is torch.argmax's over the gathered row,
+    # ties and NaN included: the first index of the largest value, the first
+    # NaN when any is NaN, -0.0 equal to +0.0. Greedy drafts only (no
+    # probabilistic drafting, draft top-k or acceptance estimator). Default
+    # OFF: unset, the full-vocabulary all-gather and torch.argmax run. Read in
+    # vllm/sm80/spec_decode/shard_argmax.py.
+    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", "0"))
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.

@@ -1293,3 +1293,31 @@ seams:
   why: with no FULL samples it must return 0, so profile_cudagraph_memory returns the measured drop of a capture that took every FULL graph
   sha256: 5707fc144c9fce97ff7875a6ecc30297db36546c3efa191a094c708ae3f03339
   signature: '(mem_samples: list[int], total_graphs: int) -> int'
+
+- id: dsv41-dspark-sample-sequential
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential
+  why: vllm/sm80/spec_decode/shard_argmax.py replaces its dense greedy path (base logits of every draft position once, then per step the anchor or last draft through markov_embed and markov_bias added to the base logits, the draft written to draft_tokens, the confidence head over the stacked Markov embeddings) and must draft the same tokens
+  sha256: 3781858bbd960f6c82e81332f716a8ca97e58dcdc260a6431fb2e9077f3c0160
+  signature: '(self, num_reqs: int, head_hidden: torch.Tensor) -> None'
+
+- id: dsv41-dspark-sample-logits
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_logits
+  why: with draft_logits None and no acceptance estimator a greedy draft is logits.argmax(dim=-1) mapped by map_draft_to_target; shard_argmax.py reproduces exactly that argmax (first index of the maximum, first NaN) and refuses the other cases
+  sha256: 28e1320d397e53507e39c01d7d54583147386a0a5a328e6d2452ab6957d1a92c
+  signature: '(self, logits: torch.Tensor, idx_map: torch.Tensor, sample_pos: torch.Tensor, step: int) -> torch.Tensor'
+
+- id: dsv41-logits-processor-forward
+  kind: method
+  target: vllm.model_executor.layers.logits_processor:LogitsProcessor.forward
+  why: with skip_gather the shard logits get the same soft cap and scale as the gathered ones, so shard_argmax.py compares the values the gathered row holds
+  sha256: 8d59778d071858e84cbd263207ebc0b2ef96e54cee5e8a37912ce1b02b02ba57
+  signature: '(self, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None = None, skip_gather: bool = False) -> torch.Tensor | None'
+
+- id: dsv41-logits-processor-get-logits
+  kind: method
+  target: vllm.model_executor.layers.logits_processor:LogitsProcessor._get_logits
+  why: the gathered row is the ranks' head outputs concatenated in rank order (all-gather on the last dim) and cut at org_vocab_size; shard_argmax.py numbers a rank's columns from rank * local width and stops at org_vocab_size
+  sha256: 50f037e79ede7e763cdc90b3bf38d87faa466101ca2088f23576aabb4cbedda6
+  signature: '(self, hidden_states: torch.Tensor, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, embedding_bias: torch.Tensor | None, skip_gather: bool = False) -> torch.Tensor | None'
