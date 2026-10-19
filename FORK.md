@@ -219,7 +219,7 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/moe_prefill.cu` | 1,045 |
 | `csrc/exl3/moe_prefill.h` | 28 |
 | `csrc/exl3/moe_prefill_v2.cu` | 1,171 |
-| `csrc/exl3/moe_prefill_v2.h` | 28 |
+| `csrc/exl3/moe_prefill_v2.h` | 30 |
 | `csrc/exl3/moe_v2.cu` | 1,290 |
 | `csrc/exl3/moe_v2.h` | 25 |
 | `csrc/exl3/ops.h` | 48 |
@@ -228,7 +228,7 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/ple_read.cpp` | 373 |
 | `csrc/exl3/reference.cu` | 450 |
 | `csrc/exl3/row_read.h` | 204 |
-| **30 files** | **9,812** |
+| **30 files** | **9,814** |
 
 #### `docs/`
 
@@ -280,7 +280,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_chunk_rows.py` | 273 |
 | `tests/kernels/quantization/test_exl3_moe_prefill.py` | 536 |
 | `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
-| `tests/kernels/quantization/test_exl3_moe_prefill_v2.py` | 723 |
+| `tests/kernels/quantization/test_exl3_moe_prefill_v2.py` | 726 |
 | `tests/kernels/quantization/test_exl3_moe_swiglu_clamp.py` | 83 |
 | `tests/kernels/quantization/test_exl3_moe_v2.py` | 616 |
 | `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 592 |
@@ -431,7 +431,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **178 files** | **89,224** |
+| **178 files** | **89,227** |
 
 #### `tools/`
 
@@ -686,11 +686,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 151 |
-| Fork-added product lines | 48,026 |
+| Fork-added product lines | 48,028 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,130 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,558 / -244 |
-| Product lines added (new files and patches) | 51,584 |
+| Product lines added (new files and patches) | 51,586 |
 | Fork environment variables (flags) | 100 |
 | Unreferenced fork definitions | 2 (23 lines) |
