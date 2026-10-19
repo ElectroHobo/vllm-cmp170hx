@@ -135,17 +135,32 @@ def test_switch_and_schedule_default_off(monkeypatch):
     assert set(tc.SCHEDULES) == {"planned", "whole"}
 
 
-def _config(tp=2, pp=1, method="mtp", parallel_drafting=False):
+def _config(
+    tp=2,
+    pp=1,
+    method="mtp",
+    parallel_drafting=False,
+    k=3,
+    max_num_seqs=16,
+    schedule=None,
+):
     speculative = (
         None
         if method is None
-        else SimpleNamespace(method=method, parallel_drafting=parallel_drafting)
+        else SimpleNamespace(
+            method=method,
+            parallel_drafting=parallel_drafting,
+            num_speculative_tokens=k,
+            num_speculative_tokens_per_batch_size=schedule,
+            adaptive_k=None,
+        )
     )
     return SimpleNamespace(
-        num_speculative_tokens=0 if method is None else 3,
+        num_speculative_tokens=0 if method is None else k,
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp, pipeline_parallel_size=pp
         ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         speculative_config=speculative,
     )
 
@@ -159,13 +174,33 @@ def test_gate_opens_only_on_the_validated_configuration():
     assert "None" in tc.closed_reason(None, None, config)
     assert "70 multiprocessors" in tc.closed_reason((8, 0), 70, config)
     assert "no vLLM config" in tc.closed_reason((8, 0), 74, None)
+    assert tc.closed_reason((8, 0), 74, _config(tp=4)) is None
     # Other layouts give other matrices and row chunks.
-    assert "(1, 1), not (2, 1)" in tc.closed_reason((8, 0), 74, _config(tp=1))
-    assert "(2, 2), not (2, 1)" in tc.closed_reason((8, 0), 74, _config(pp=2))
-    # Drafters whose decode steps schedule more than 1 + k tokens per request.
-    assert "'dflash'" in tc.closed_reason((8, 0), 74, _config(method="dflash"))
+    layouts = "not one of (2, 1), (4, 1)"
+    assert f"(1, 1), {layouts}" in tc.closed_reason((8, 0), 74, _config(tp=1))
+    assert f"(2, 2), {layouts}" in tc.closed_reason((8, 0), 74, _config(pp=2))
+    # Drafters whose decode steps schedule more than 1 + k tokens per request
+    # and can carry more than 64 rows: 16 requests x (1 + 3 + 3).
+    reason = tc.closed_reason((8, 0), 74, _config(method="dflash"))
+    assert "'dflash'" in reason and "carry 112 rows" in reason
     reason = tc.closed_reason((8, 0), 74, _config(parallel_drafting=True))
     assert "parallel drafting True" in reason
+    # A parallel drafter whose decode steps never carry more than 64 rows: the
+    # row floor keeps them on today's kernels, so the gate opens. The
+    # batch-size schedule drafts k = 5 for 1-3 requests and none for 4-8:
+    # 3 x (1 + 5 + 5) = 33 rows.
+    dspark = dict(
+        tp=4,
+        method="dspark",
+        parallel_drafting=True,
+        k=5,
+        max_num_seqs=8,
+        schedule=[[1, 3, 5], [4, 8, 0]],
+    )
+    assert tc.closed_reason((8, 0), 74, _config(**dspark)) is None
+    # Without the schedule every batch size drafts 5: 8 x 11 = 88 rows.
+    reason = tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None)))
+    assert "'dspark'" in reason and "carry 88 rows" in reason
 
 
 def test_only_validated_matrices_are_taken():
@@ -249,16 +284,16 @@ def test_resolution_logs_through_vllm_logger(monkeypatch, caplog):
         tc.__name__,
         "EXL3 dense prefill tensor-core path active (VLLM_EXL3_DENSE_PREFILL_TC): "
         "in prefill steps (a request with more than 4 tokens scheduled), dense "
-        "launches of more than 64 rows and at least 16 output tiles of the 9 "
-        "validated TP2 matrices (bits_x2 10/12/14, codebook 2) take "
+        "launches of more than 64 rows and at least 16 output tiles of the 28 "
+        "validated matrices (bits_x2 10/12/14, codebook 2) take "
         "linear_out_prefill, schedule planned; split-K launches, other matrices, "
         "decode steps and graph captures keep today's kernels.",
     ) in lines
     closed = sorted({m for _, _, m in lines if "gate is closed" in m})
     assert closed == [
         "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: (tensor, "
-        "pipeline) parallel size (1, 1), not (2, 1); every dense EXL3 launch "
-        "keeps today's kernels.",
+        "pipeline) parallel size (1, 1), not one of (2, 1), (4, 1); every dense "
+        "EXL3 launch keeps today's kernels.",
         "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: 70 "
         "multiprocessors, not 74; every dense EXL3 launch keeps today's kernels.",
         "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: device "

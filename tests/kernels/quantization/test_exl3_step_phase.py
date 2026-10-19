@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 import vllm.forward_context as forward_context
-from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len, prefill_step
+from vllm.sm80.kernels.exl3.step_phase import (
+    max_decode_query_len,
+    max_decode_step_rows,
+    prefill_step,
+)
 
 # One sampled token plus three draft tokens under verification.
 DECODE_QUERY_LEN = 4
@@ -28,6 +32,36 @@ def _attention(max_query_len):
 def test_max_decode_query_len_counts_the_verified_draft():
     assert max_decode_query_len(SimpleNamespace(num_speculative_tokens=3)) == 4
     assert max_decode_query_len(SimpleNamespace(num_speculative_tokens=0)) == 1
+
+
+def _rows_config(max_num_seqs, k=None, schedule=None, adaptive_k=None):
+    speculative = (
+        None
+        if k is None
+        else SimpleNamespace(
+            num_speculative_tokens=k,
+            num_speculative_tokens_per_batch_size=schedule,
+            adaptive_k=adaptive_k,
+        )
+    )
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        speculative_config=speculative,
+    )
+
+
+def test_max_decode_step_rows_bounds_verify_and_draft_slots():
+    # No speculation: one token per request.
+    assert max_decode_step_rows(_rows_config(8)) == 8
+    # Each request: the sampled token, k verified drafts and k draft slots.
+    assert max_decode_step_rows(_rows_config(8, k=5)) == 88
+    assert max_decode_step_rows(_rows_config(16, k=3)) == 112
+    # A batch-size schedule: k = 5 for 1-3 requests, none for 4-8.
+    schedule = [[1, 3, 5], [4, 8, 0]]
+    assert max_decode_step_rows(_rows_config(8, k=5, schedule=schedule)) == 33
+    # Adaptive k may pick any depth up to num_speculative_tokens.
+    config = _rows_config(8, k=5, schedule=schedule, adaptive_k={"by_load": [5]})
+    assert max_decode_step_rows(config) == 88
 
 
 @pytest.mark.parametrize(
