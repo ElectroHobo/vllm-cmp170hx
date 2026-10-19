@@ -123,8 +123,43 @@ def _mhc(g, pre_only=False):
     return {k: v for k, v in a.items() if v is not None}
 
 
+def _rope_freqs():
+    return core.rope_freqs(64, 0, 10000.0, 1.0, 32, 1)
+
+
+def _attn_prologue(g, n=11):
+    """A fused-prologue call: a token whose slot is -1 writes nothing."""
+    slots = torch.randperm(5 * 64, generator=g)[:n] + 64
+    slots[3] = -1
+    return dict(
+        qr_kv=(torch.randn(n, 1792, generator=g) * 3).to(BF16),
+        q_norm=(1 + 0.1 * torch.randn(1280, generator=g)).to(BF16),
+        kv_norm=(1 + 0.1 * torch.randn(512, generator=g)).to(BF16),
+        positions=torch.randint(0, 9000, (n,), generator=g),
+        freqs=_rope_freqs(),
+        swa_cache=(torch.randn(6, 64, 512, generator=g) * 0.5).to(BF16),
+        swa_slots=slots,
+        eps=1e-20,
+    )
+
+
+def _attn_attend(g, compressed=True):
+    q, swa, swa_idx, comp, table, local, req, sink = _attn_case(g)
+    n = q.shape[0]
+    t = dict(q=q, positions=torch.randint(0, 9000, (n,), generator=g),
+             freqs=_rope_freqs(), swa_cache=swa, swa_indices=swa_idx, comp_cache=comp,
+             comp_block_table=table, comp_local=local, req=req.int(), attn_sink=sink,
+             scale=512**-0.5, n_groups=2, out=torch.zeros(n, 16, 512, dtype=BF16))
+    if not compressed:
+        t.update(comp_cache=None, comp_block_table=None, comp_local=None)
+    return t
+
+
 # mHC case ids: <family>:<output> (the output the case judges)
 MHC = ("mhc_delayed:comb", "mhc_delayed:layer_input.rp", "mhc_pre_delayed:pre")
+# Fused attention core case ids (the prologue's cases name their output)
+FUSED_ATTN = ("attn_prologue:qr", "attn_prologue:window", "attn_attend")
+MULTI = MHC + FUSED_ATTN[:2]
 
 
 @pytest.fixture(scope="module")
@@ -153,11 +188,19 @@ def cases(tmp_path_factory):
         "mhc_delayed:comb": [_source(d, "mhc", "mhc_delayed", _mhc(g))],
         "mhc_delayed:layer_input.rp": [_source(d, "mhc_li", "mhc_delayed", _mhc(g))],
         "mhc_pre_delayed:pre": [_source(d, "mhc_pre", "mhc_pre_delayed", _mhc(g, True))],
+        "attn_prologue:qr": [_source(d, "pro", "attn_prologue", _attn_prologue(g))],
+        "attn_prologue:window": [
+            _source(d, "pro_w", "attn_prologue", _attn_prologue(g))
+        ],
+        "attn_attend": [
+            _source(d, "att0", "attn_attend", _attn_attend(g)),
+            _source(d, "att1", "attn_attend", _attn_attend(g, compressed=False)),
+        ],
     }
     return [
         {"id": k, "family": k.split(":")[0], "phase": "decode", "concurrency": 1,
          "calls": len(v), "captured_sources": v,
-         **({"output": k.split(":")[1]} if k in MHC else {})}
+         **({"output": k.split(":")[1]} if k in MULTI else {})}
         for k, v in sources.items()
     ]
 
@@ -208,6 +251,8 @@ def test_every_family_runs_on_cpu(tmp_path, cases):
             assert e["cand_max"] > 0, cid  # their BF16 rounding is measured
     assert rows["compress"]["family"] == "compress"
     for cid in MHC:
+        assert rows[cid]["family"] == cid, cid
+    for cid in FUSED_ATTN:
         assert rows[cid]["family"] == cid, cid
 
 
@@ -467,7 +512,8 @@ def mixed_checkpoint(tmp_path_factory):
 def _cpu_operators(monkeypatch):
     """CPU stand-ins for the EXL3 MoE operators (CUDA only): the routed
     experts of the weights the driver loaded, in FP64 rounded to BF16. They
-    record the bits_x2 each moe_out_v2 call received."""
+    record the bits_x2 each moe_out_v2 and moe_out_prefill_v2 call
+    received."""
     from vllm.sm80.kernels.exl3 import ops
 
     loaded, seen = {}, []
@@ -481,7 +527,7 @@ def _cpu_operators(monkeypatch):
     def operator(name):
         def run(x, ids, tw, ptrs, meta, emap, inter, out, workspace,
                 swiglu_limit=0.0, *, bits_x2=None):
-            assert (bits_x2 is not None) == (name == "moe_out_v2"), name
+            assert (bits_x2 is not None) == name.endswith("_v2"), name
             if bits_x2 is not None:
                 assert {int(b) for b in meta[..., 2].flatten()} == {bits_x2}
                 seen.append(bits_x2)
@@ -490,19 +536,20 @@ def _cpu_operators(monkeypatch):
         return run
 
     monkeypatch.setattr(F, "expert_set", remember)
-    for name in ("moe_out", "moe_out_v2", "moe_out_prefill"):
+    for name in ("moe_out", "moe_out_v2", "moe_out_prefill", "moe_out_prefill_v2"):
         monkeypatch.setattr(ops, name, operator(name))
     for size in ("moe_workspace_size", "moe_workspace_size_v2",
-                 "moe_workspace_size_prefill"):
+                 "moe_workspace_size_prefill", "moe_workspace_size_prefill_v2"):
         monkeypatch.setattr(ops, size, lambda *args: 1)
     return seen
 
 
 def test_moe_families_run_at_both_bit_widths(tmp_path, mixed_checkpoint, monkeypatch):
-    """exl3_moe_out_v2 cases of a bits_x2 6 and a bits_x2 4 layer, and an
-    exl3_moe_out case, run through fp64_cases.run end to end (operators
-    replaced by CPU stand-ins): one line each, moe_out_v2 given each layer's
-    width; a recorded width that is not the layer's refuses its case."""
+    """exl3_moe_out_v2 and exl3_moe_out_prefill_v2 cases of a bits_x2 6 and a
+    bits_x2 4 layer, and an exl3_moe_out case, run through fp64_cases.run end
+    to end (operators replaced by CPU stand-ins): one line each, the v2
+    operators given each layer's width; a recorded width that is not the
+    layer's refuses its case."""
     from tests.kernels.quantization import exl3_real_cases as real
 
     seen = _cpu_operators(monkeypatch)
@@ -535,21 +582,31 @@ def test_moe_families_run_at_both_bit_widths(tmp_path, mixed_checkpoint, monkeyp
     cases = [
         source("v2_bits6", "exl3_moe_out_v2", 0, bits=6),
         source("v2_bits4", "exl3_moe_out_v2", 1, bits=4),
+        source("pv2_bits6", "exl3_moe_out_prefill_v2", 0, bits=6),
+        source("pv2_bits4", "exl3_moe_out_prefill_v2", 1, bits=4),
         source("v1_bits6", "exl3_moe_out", 0),
     ]
+    family = {
+        "v2": "exl3_moe_out_v2",
+        "pv2": "exl3_moe_out_prefill_v2",
+        "v1": "exl3_moe_out",
+    }
     rc, _, rows = _run(tmp_path, cases, target=mixed_checkpoint)
-    assert rc == 0 and set(rows) == {"v2_bits6", "v2_bits4", "v1_bits6"}
+    assert rc == 0 and set(rows) == {c["id"] for c in cases}
     for cid, row in rows.items():
         _well_formed(row)
-        assert row["family"] == ("exl3_moe_out_v2" if cid.startswith("v2") else "exl3_moe_out")
+        assert row["family"] == family[cid.split("_")[0]]
         assert row["bitwise"] and row["row_invariance"], cid
         assert row["fp64"]["cand_max"] == row["fp64"]["ref_max"] > 0, cid
-    # Whole call, moe_out reference, then three rows alone, per v2 case.
-    assert sorted(set(seen)) == [4, 6] and seen.count(6) == seen.count(4) == 4
+    # Per v2 case the whole call, then three rows alone; per prefill v2 case
+    # (3 rows, fewer than it takes alone) the whole call only.
+    assert sorted(set(seen)) == [4, 6] and seen.count(6) == seen.count(4) == 5
 
-    wrong = source("v2_wrong_bits", "exl3_moe_out_v2", 1, bits=6)
-    rc, _, rows = _run(tmp_path, [wrong], target=mixed_checkpoint)
-    assert rc == 1 and rows == {}
+    for name, fam in (("v2_wrong_bits", "exl3_moe_out_v2"),
+                      ("pv2_wrong_bits", "exl3_moe_out_prefill_v2")):
+        wrong = source(name, fam, 1, bits=6)
+        rc, _, rows = _run(tmp_path, [wrong], target=mixed_checkpoint)
+        assert rc == 1 and rows == {}, name
 
 
 # ---------------------------------------------------------------- GPU
@@ -569,3 +626,10 @@ def test_cuda_paths_on_the_synthetic_cases(tmp_path, cases):
             assert e["cand_mean"] == e["ref_mean"] and e["cand_max"] == e["ref_max"], cid
         if cid in EXACT[:3]:
             assert e["cand_max"] == 0.0, cid
+        if cid in FUSED_ATTN:
+            # V2: the fused core against the served path, both against FP64
+            if e["ref_max"] == 0.0:
+                assert e["cand_max"] == 0.0, cid
+            else:
+                assert e["cand_mean"] <= 1.10 * e["ref_mean"], (cid, e)
+                assert e["cand_max"] <= 1.25 * e["ref_max"], (cid, e)

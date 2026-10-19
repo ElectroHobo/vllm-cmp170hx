@@ -99,6 +99,9 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
+    VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -116,6 +119,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
+    VLLM_DEV_AB_SWITCH: str = ""
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -391,8 +395,7 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # pure function of the shape. Read when those modules are imported; other
     # devices keep normal autotuning. Off by default.
     "VLLM_FLA_PIN_AUTOTUNE": lambda: bool(
-        int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))
-    ),
+        int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))    ),
     # With pinning off, the vendored flash-linear-attention autotuners on sm_80
     # build each config before timing it and skip (never launch) one whose
     # build needs more than the context's default 1,024 B of local memory per
@@ -838,6 +841,31 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", "0"))
     ),
+    # DeepSeek-V4.1 on sm_80: the attention core of decode, speculative verify
+    # and draft steps (the norms and window row of prepare_layer, the query
+    # RoPE, sparse attention, output RoPE and qdq of attend_layer) as two
+    # fused calls per layer (ops/sm80_attn_fused.py), same rounding points.
+    # Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: the most rows (tokens of the
+    # padded step) a layer call may have to take the fused path.
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "48")
+    ),
+    # DeepSeek-V4.1 on sm_80: the routed experts of the decoder layers run MoE
+    # calls of 65..2048 rows in prefill steps on the tensor cores
+    # (csrc/exl3/moe_prefill_v2.cu, ops.moe_out_prefill_v2) at tensor parallel
+    # size 4, with every routed matrix of a layer at bits_x2 6 or 4, codebook 2,
+    # and 16-byte-aligned trellis bases, when no decode step of a parallel
+    # drafter can carry 65 rows (vllm/sm80/kernels/exl3/quant.py). Other calls
+    # and every call of a decode step keep their kernels. Results differ from
+    # moe_out in the last bits. Default OFF: unset, prefill calls take moe_out.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MOE_PREFILL_TC", "0"))
+    ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
     "VLLM_EXL3_PLE_COLD": lambda: bool(int(os.getenv("VLLM_EXL3_PLE_COLD", "0"))),
@@ -961,6 +989,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN4_MTP_PER_STREAM_NORM": lambda: bool(
         int(os.getenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", "0"))
     ),
+    # Development server only: the name of one switch in
+    # vllm/sm80/dev_ab.py SWITCHES. Both of its arms are captured at boot and
+    # POST /collective_rpc set_ab_arm (VLLM_SERVER_DEV_MODE=1) changes the arm
+    # between requests. Costs graph memory and boot time; not for serving.
+    # Unset by default.
+    "VLLM_DEV_AB_SWITCH": lambda: os.getenv("VLLM_DEV_AB_SWITCH", ""),
 }
 
 

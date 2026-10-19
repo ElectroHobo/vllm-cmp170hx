@@ -60,6 +60,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.sm80.kernels.exl3.quant import set_output_dtype
+from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len, prefill_step
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -333,6 +334,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             raise ValueError(
                 f"{index_n_heads} index heads do not split over TP {tp_size}"
             )
+        self._sm80_fused_attn = self._sm80_fused_attn_gate(vllm_config)
         self._sm80_rope_params = _rope_params(
             config, self.compress_ratio, self.rope_head_dim
         )
@@ -364,6 +366,55 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             )
 
     # -- pieces -------------------------------------------------------------
+
+    def _sm80_fused_attn_gate(self, vllm_config: VllmConfig) -> bool:
+        """Whether this layer may take the fused attention core
+        (``VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE``): the switch is on and the
+        layer has the configuration the fused kernels were validated for.
+        Which calls take it is :meth:`_sm80_fused_attn_call`."""
+        if not envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE:
+            return False
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_fused
+
+        reason = sm80_attn_fused.supports(
+            self.n_local_heads,
+            self.head_dim,
+            self.rope_head_dim,
+            self.n_local_groups,
+            self.window_size,
+            self.sm80_cfg.index_topk,
+            self.compress_ratio,
+            self.kv_cache_torch_dtype,
+            current_platform.get_device_capability(),
+        )
+        if reason is not None:
+            logger.warning_once(
+                "DeepSeek-V4.1 sm_80: VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE=1 but the "
+                "attention core stays unfused: %s", reason, scope="global",
+            )
+            return False
+        self._sm80_fused_max_rows = envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS
+        self._sm80_max_decode_query_len = max_decode_query_len(vllm_config)
+        # The speculative drafter's layers are numbered after the target's.
+        n_target = vllm_config.model_config.hf_text_config.num_hidden_layers
+        self._sm80_is_draft_layer = self.layer_id >= n_target
+        logger.info_once(
+            "DeepSeek-V4.1 sm_80: the attention core of decode, verify and draft "
+            "steps of up to %d rows runs fused (VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE=1)",
+            self._sm80_fused_max_rows, scope="global",
+        )
+        return True
+
+    def _sm80_fused_attn_call(self, rows: int) -> bool:
+        """A call of ``rows`` (padded) rows takes the fused core when the layer
+        may and the rows are within the bound, at a drafter layer (its calls
+        are draft blocks) or in a step the scheduler did not make a prefill
+        step (decode or speculative verify)."""
+        if not self._sm80_fused_attn or rows > self._sm80_fused_max_rows:
+            return False
+        return self._sm80_is_draft_layer or not prefill_step(
+            self._sm80_max_decode_query_len
+        )
 
     def _sm80_weights(self, device: torch.device) -> core.Sm80AttnWeights:
         freqs = self._sm80_freqs.to(device)
@@ -497,6 +548,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         batch = core.pad_batch(
             self._sm80_batch(attn_metadata, positions), qr_kv.shape[0]
         )
+        fused = self._sm80_fused_attn_call(qr_kv.shape[0])
         q = core.prepare_layer(
             self.sm80_cfg,
             self._sm80_weights(out.device),
@@ -506,8 +558,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             kv_score,
             index_weights,
             self._sm80_chunk_bytes,
+            fused=fused,
         )
-        self._sm80_attend(batch, q, out)
+        self._sm80_attend(batch, q, out, fused=fused)
 
     def forward_mqa(
         self,
@@ -527,10 +580,12 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         batch = core.pad_batch(self._sm80_batch(attn_metadata, positions), q.shape[0])
         self._sm80_attend(batch, q, output)
 
-    def _sm80_attend(self, batch, q: torch.Tensor, out: torch.Tensor) -> None:
+    def _sm80_attend(
+        self, batch, q: torch.Tensor, out: torch.Tensor, fused: bool = False
+    ) -> None:
         core.attend_layer(
             self.sm80_cfg, self._sm80_weights(out.device), self._sm80_caches(),
-            batch, q, out,
+            batch, q, out, fused=fused,
         )
 
     def forward_kv(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> None:

@@ -572,6 +572,19 @@ def set_output_dtype(layer: nn.Module, dtype: torch.dtype) -> None:
     method.out_dtype = _linear_out_dtype(dtype)
 
 
+def set_moe_prefill_v2(layer: nn.Module) -> str | None:
+    """Have the EXL3 routed experts of ``layer`` (the module holding the MoE
+    quant method) take moe_out_prefill_v2 for prefill calls when its gate
+    opens at load (Exl3MoEMethod._moe_prefill_v2). Returns why it cannot, or
+    None."""
+    method = getattr(layer, "quant_method", None)
+    if not isinstance(method, Exl3MoEMethod):
+        kind = type(method).__name__
+        return f"{type(layer).__name__} has no EXL3 MoE method ({kind})"
+    method.prefill_v2 = True
+    return None
+
+
 class Exl3HeadLogitsProcessor(LogitsProcessor):
     """LogitsProcessor that also serves a head_dtype different from the
     model dtype with an EXL3 LM head: the head stores its logits in the head
@@ -694,6 +707,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         if not self.swiglu_limit >= 0.0:
             raise ValueError(f"Invalid EXL3 SwiGLU limit: {moe.swiglu_limit}")
+        # Set by set_moe_prefill_v2 before the weights load: this layer's
+        # prefill calls may take moe_out_prefill_v2 (its gate decides at load).
+        self.prefill_v2 = False
 
     def create_weights(
         self,
@@ -831,6 +847,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             prefill_decode_len, workspace = self._moe_prefill(
                 layer, metadata, max_rows, workspace
             )
+        prefill_v2_bits_x2 = prefill_v2_decode_len = 0
+        if self.prefill_v2:
+            prefill_v2_bits_x2, prefill_v2_decode_len, workspace = (
+                self._moe_prefill_v2(layer, metadata, max_rows, workspace)
+            )
         if moe_out_rows < max_rows:
             logger.info_once(
                 "EXL3 moe_out runs MoE calls of more than %d rows in chunks of "
@@ -852,6 +873,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             moe_v2_rows=moe_v2_rows,
             moe_v2_bits_x2=moe_v2_bits_x2,
             prefill_decode_len=prefill_decode_len,
+            prefill_v2_bits_x2=prefill_v2_bits_x2,
+            prefill_v2_decode_len=prefill_v2_decode_len,
             swiglu_limit=self.swiglu_limit,
         )
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
@@ -990,6 +1013,81 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         return decode_len, workspace
 
+    def _moe_prefill_v2(self, layer, metadata, max_rows: int, workspace: int):
+        """The bits_x2 of this layer's routed matrices, the most tokens one
+        request has in a decode step, above which a step is a prefill step
+        whose calls of MOE_PREFILL_MIN_ROWS..MOE_PREFILL_V2_MAX_ROWS rows take
+        moe_out_prefill_v2, and a workspace size that fits every operator
+        (bits_x2 0: the gate is closed)."""
+        from vllm.config import get_current_vllm_config
+        from vllm.sm80.kernels.exl3 import ops as exl3_ops
+        from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len
+
+        device = layer.exl3_ptrs.device
+        reason = exl3_ops.moe_prefill_v2_closed_reason(
+            tuple(torch.cuda.get_device_capability(device)),
+            self.moe.in_dtype,
+            self.hidden_size,
+            self.intermediate_size,
+            layer.top_k,
+            self.local_experts,
+            layer.global_num_experts,
+            metadata,
+        )
+        if reason is None and max_rows < exl3_ops.MOE_PREFILL_MIN_ROWS:
+            reason = f"MoE calls have at most {max_rows} rows"
+        if reason is None:
+            # Host copy of the layer's pointer table: one device sync, at load.
+            reason = _unaligned_trellis_reason(layer.exl3_ptrs.tolist())
+        vllm_config = get_current_vllm_config()
+        if reason is None:
+            reason = _prefill_v2_layout_closed_reason(vllm_config)
+        if reason is not None:
+            logger.info_once(
+                "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC is set but the gate is closed: "
+                "%s; these MoE layers keep their kernels in prefill steps.",
+                reason,
+            )
+            return 0, 0, workspace
+        exl3_ops.require_moe_prefill_v2()
+        # One bit width for every routed matrix of the layer (the gate checked).
+        bits_x2 = metadata[0][0][2]
+        rows = min(max_rows, exl3_ops.MOE_PREFILL_V2_MAX_ROWS)
+        workspace = max(
+            workspace,
+            exl3_ops.moe_workspace_size_prefill_v2(
+                rows,
+                self.hidden_size,
+                self.intermediate_size,
+                layer.top_k,
+                self.local_experts,
+            ),
+        )
+        exl3_ops.warmup_moe_prefill_v2(
+            layer.exl3_ptrs,
+            layer.exl3_meta,
+            layer.exl3_expert_map,
+            self.global_expert_ids,
+            self.hidden_size,
+            self.intermediate_size,
+            layer.top_k,
+            bits_x2,
+            self.swiglu_limit,
+        )
+        decode_len = max_decode_query_len(vllm_config)
+        logger.info_once(
+            "EXL3 MoE prefill v2 tensor-core path active "
+            "(VLLM_DEEPSEEK_V41_MOE_PREFILL_TC): routed experts (bits_x2 6 or 4) "
+            "for MoE calls of %d..%d rows in prefill steps (a request scheduled "
+            "more than %d tokens); decode steps, graph captures, calls of at "
+            "most %d rows and larger calls keep their kernels.",
+            exl3_ops.MOE_PREFILL_MIN_ROWS,
+            rows,
+            decode_len,
+            exl3_ops.MOE_PREFILL_MIN_ROWS - 1,
+        )
+        return bits_x2, decode_len, workspace
+
     def apply(
         self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
     ):
@@ -1022,6 +1120,8 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         moe_v2_rows=0,
         moe_v2_bits_x2=0,
         prefill_decode_len=0,
+        prefill_v2_bits_x2=0,
+        prefill_v2_decode_len=0,
         swiglu_limit=0.0,
     ):
         super().__init__(moe, quant)
@@ -1040,6 +1140,12 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         # than 64 rows in a step that schedules some request more than this
         # many tokens take moe_out_prefill.
         self.prefill_decode_len = prefill_decode_len
+        # Nonzero (VLLM_DEEPSEEK_V41_MOE_PREFILL_TC with its gate open): calls
+        # of MOE_PREFILL_MIN_ROWS..MOE_PREFILL_V2_MAX_ROWS rows in a step that
+        # schedules some request more than prefill_v2_decode_len tokens take
+        # moe_out_prefill_v2 with the layer's routed-matrix bits_x2.
+        self.prefill_v2_bits_x2 = prefill_v2_bits_x2
+        self.prefill_v2_decode_len = prefill_v2_decode_len
         # SwiGLU clamp the native operators apply (0: none).
         self.swiglu_limit = swiglu_limit
 
@@ -1134,6 +1240,8 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             operator = moe_out
         if self.prefill_decode_len:
             operator = self._prefill_operator(rows, operator)
+        if self.prefill_v2_bits_x2:
+            operator = self._prefill_v2_operator(rows, operator)
         # Row-indexed arguments; moe_out takes at most moe_out_rows of them per
         # launch. It computes every row from its own input and routes alone, so
         # row chunks give the bits of the whole call.
@@ -1177,6 +1285,24 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             return moe_out_prefill
         return operator
 
+    def _prefill_v2_operator(self, rows: int, operator):
+        """moe_out_prefill_v2 for a call of
+        MOE_PREFILL_MIN_ROWS..MOE_PREFILL_V2_MAX_ROWS rows in a prefill step
+        (the phase the scheduler gave the step, never the row count);
+        otherwise ``operator``."""
+        from vllm.sm80.kernels.exl3.ops import (
+            MOE_PREFILL_MIN_ROWS,
+            MOE_PREFILL_V2_MAX_ROWS,
+            moe_out_prefill_v2,
+        )
+        from vllm.sm80.kernels.exl3.step_phase import prefill_step
+
+        if MOE_PREFILL_MIN_ROWS <= rows <= MOE_PREFILL_V2_MAX_ROWS and prefill_step(
+            self.prefill_v2_decode_len
+        ):
+            return partial(moe_out_prefill_v2, bits_x2=self.prefill_v2_bits_x2)
+        return operator
+
 
 def _prefill_layout_closed_reason(vllm_config) -> str | None:
     """Why moe_out_prefill must not serve this engine, or None: it is
@@ -1193,6 +1319,38 @@ def _prefill_layout_closed_reason(vllm_config) -> str | None:
         or getattr(spec, "method", None) in ("dflash", "dspark")
     ):
         return f"speculative method {spec.method} drafts with parallel slots"
+    return None
+
+
+def _prefill_v2_layout_closed_reason(vllm_config) -> str | None:
+    """Why moe_out_prefill_v2 must not serve this engine, or None: it is
+    validated at tensor parallel size 4 without pipeline parallelism, and a
+    drafter whose decode steps the prefill-step rule (step_phase) cannot read
+    (parallel drafting slots, DFlash, DSpark) is admitted only when no forward
+    pass of a decode step can carry MOE_PREFILL_MIN_ROWS rows
+    (step_phase.max_decode_step_rows): calls of fewer rows never take the
+    operator, so such decode steps never reach it."""
+    from vllm.sm80.kernels.exl3.ops import MOE_PREFILL_MIN_ROWS
+    from vllm.sm80.kernels.exl3.step_phase import max_decode_step_rows
+
+    parallel = vllm_config.parallel_config
+    layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
+    if layout != (4, 1):
+        return f"(tensor, pipeline) parallel size {layout}, not (4, 1)"
+    spec = vllm_config.speculative_config
+    if (
+        spec is not None
+        and (
+            getattr(spec, "parallel_drafting", False)
+            or getattr(spec, "method", None) in ("dflash", "dspark")
+        )
+        and (rows := max_decode_step_rows(vllm_config)) >= MOE_PREFILL_MIN_ROWS
+    ):
+        return (
+            f"speculative method {spec.method} drafts with parallel slots and "
+            f"a decode step's forward pass can carry {rows} rows, at least "
+            f"the {MOE_PREFILL_MIN_ROWS} from which calls take the operator"
+        )
     return None
 
 

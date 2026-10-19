@@ -20,16 +20,24 @@ experts, and changes two things before the weights load:
   factor, all in FP32 torch ops (graph-safe, no host synchronisation).
 
 The experts and the SwiGLU clamp run in the EXL3 MoE kernels
-(vllm/sm80/kernels/exl3/quant.py, ``swiglu_limit``).
+(vllm/sm80/kernels/exl3/quant.py, ``swiglu_limit``). With
+``VLLM_DEEPSEEK_V41_MOE_PREFILL_TC`` the experts may take the tensor-core
+prefill operator ``moe_out_prefill_v2`` for prefill calls (its gate decides
+when the weights have loaded).
 """
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
 )
+from vllm.sm80.kernels.exl3.quant import set_moe_prefill_v2
+
+logger = init_logger(__name__)
 
 # Image-span tokens carry five consecutive sentinel ids from this one on
 # (common/mm_preprocess.py), the ids the upstream routers test for bias_vl.
@@ -139,3 +147,11 @@ def adopt_moe(ffn: nn.Module, config) -> None:
         raise TypeError(f"Unexpected DeepSeek-V4.1 router: {type(router).__name__}")
     router.__class__ = Sm80DeepseekV41Router
     router.gate_temp = float(getattr(config, "gate_temp", 1.0))
+    if envs.VLLM_DEEPSEEK_V41_MOE_PREFILL_TC:
+        reason = set_moe_prefill_v2(ffn.experts.routed_experts)
+        if reason is not None:
+            logger.info_once(
+                "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC is set but the gate is closed: "
+                "%s; these MoE layers keep their kernels in prefill steps.",
+                reason,
+            )

@@ -1256,7 +1256,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model
   why: the estimate split runner overrides it (keyword-only profile_only, returns the free-memory drop in bytes); the worker calls it once for the real capture after the KV cache is sized
-  sha256: 14f78e5a457fc366b63170a7b0e87868dda176c2e6dbe541ef30c750307c4158
+  sha256: c2a7f31dc64d0b1d10fc801eb0c1894add3ad9346649a90db0d7630dbfbfd239
   signature: '(self, *, profile_only: bool = False) -> int'
 
 - id: graphmem-runner-profile-cudagraph-memory
@@ -1279,3 +1279,66 @@ seams:
   why: with no FULL samples it must return 0, so profile_cudagraph_memory returns the measured drop of a capture that took every FULL graph
   sha256: 5707fc144c9fce97ff7875a6ecc30297db36546c3efa191a094c708ae3f03339
   signature: '(mem_samples: list[int], total_graphs: int) -> int'
+
+- id: dev-ab-breakable-call
+  kind: method
+  target: vllm.compilation.breakable_cudagraph:BreakableCUDAGraphWrapper.__call__
+  why: dev_ab replaces the wrapper's `entries` with an ArmGraphStore; dispatch must reach entries only through get and item assignment keyed by the batch descriptor
+  sha256: 5cf59cf33c3757a908c041fc48f3064fd72d6b0d8dba41395bab19502f8419f8
+  signature: '(self, *args: ''Any'', **kwargs: ''Any'') -> ''Any'''
+
+- id: dev-ab-breakable-clear
+  kind: method
+  target: vllm.compilation.breakable_cudagraph:BreakableCUDAGraphWrapper.clear_graphs
+  why: releasing graphs calls entries.clear(), which ArmGraphStore applies to every arm
+  sha256: 75ac17ef827e23b4c043e37521a25298d1e4c22060ea9a6f90bb5932cd5112e1
+  signature: (self) -> 'None'
+
+- id: dev-ab-cudagraph-call
+  kind: method
+  target: vllm.compilation.cuda_graph:CUDAGraphWrapper.__call__
+  why: dev_ab replaces concrete_cudagraph_entries with an ArmGraphStore; dispatch must reach it only through membership, item get and item assignment
+  sha256: 06cab1e7535cf39740d0e65ebcf2203fc5d57c00547b11ea917c52769c1aa2c2
+  signature: '(self, *args: Any, **kwargs: Any) -> typing.Any | None'
+
+- id: dev-ab-manager-capture
+  kind: method
+  target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture
+  why: FULL graphs are stored in self.graphs by descriptor (membership check and item assignment), so an ArmGraphStore keys them by arm; capture can run again for a second arm
+  sha256: 7ab498e2e81ba4c4b05bc7e77eb3a9598db97293d10f62fda2473c4cc4e9ca6d
+  signature: '(self, create_forward_fn: vllm.v1.worker.gpu.cudagraph_utils.CreateForwardFn, progress_bar_desc: str = ''Capturing CUDA graphs'') -> None'
+
+- id: dev-ab-manager-run-fullgraph
+  kind: method
+  target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.run_fullgraph
+  why: FULL replay looks the graph up in self.graphs by descriptor, the active arm's dict under dev_ab
+  sha256: d3dd8e8a40ce000e6a3025f7720fac20cb3ca2066a365dd3f8cc75dfae27015c
+  signature: '(self, desc: vllm.v1.worker.gpu.cudagraph_utils.BatchExecutionDescriptor)'
+
+- id: dev-ab-profile-capture
+  kind: function
+  target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
+  why: the graph-memory estimate comes from runner.capture_model(profile_only=True), so dev_ab's both-arm capture is what the KV cache is sized against
+  sha256: ffdd4cd7ba6c9cc949864294bdac6dc7f54f6f0e95b41fbfd53b85292eba43ef
+  signature: '(runner: ''GPUModelRunner'') -> int'
+
+- id: dev-ab-request-state
+  kind: method
+  target: vllm.v1.worker.gpu.states:RequestState.__init__
+  why: set_ab_arm refuses while req_id_to_index holds a request
+  sha256: 6b3d13b6bcc6328ab9fa63d77a92a1cf3b7730bb2b0021761bda5bc5fd81555f
+  signature: '(self, max_num_reqs: int, max_model_len: int, max_num_batched_tokens: int, num_speculative_steps: int, vocab_size: int, device: torch.device, num_prefill_lookahead: int = 1, use_dense_all_token_ids: bool = False)'
+
+- id: dev-ab-dynamic-candidates
+  kind: method
+  target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._init_candidates
+  why: the static K table selects compatible candidates by token count while preserving distinct request-count and uniform-query descriptors; dev_ab captures the existing union without respecializing it
+  sha256: 94c269cb0aad093f1b7875db56b8b962a47c53cf9250419d39254f12935ef6a0
+  signature: (self) -> None
+
+- id: dev-ab-dynamic-compatible
+  kind: function
+  target: vllm.v1.worker.gpu.cudagraph_utils:_is_compatible
+  why: the proof inventory resolves the actual target and draft descriptor with the same batch-query compatibility rule as dispatch
+  sha256: 67db5906f69666159eba6290ae57a5bc1230c975ca012f9acecc79d702f8ffa5
+  signature: '(desc: vllm.v1.worker.gpu.cudagraph_utils.BatchExecutionDescriptor, num_reqs: int, num_tokens: int, uniform_token_count: int | None, num_active_loras: int, max_query_len: int | None, num_ubatches: int) -> bool'
