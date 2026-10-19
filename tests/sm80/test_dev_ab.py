@@ -39,6 +39,7 @@ def state(monkeypatch):
     monkeypatch.setattr(dev_ab, "_synchronize", lambda: None)
     monkeypatch.setattr(dev_ab, "_capture_base", lambda r: r.capture_model(profile_only=True))
     monkeypatch.setattr(dev_ab, "_lock_workspace", lambda: None)
+    monkeypatch.setattr(dev_ab, "_all_ranks_same_state", lambda: True)
     return fresh
 
 

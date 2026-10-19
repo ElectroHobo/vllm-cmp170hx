@@ -99,6 +99,13 @@ def test_dynamic_captures_every_shape_and_preserves_policy(monkeypatch, state, f
     coverage = state.saved["dynamic_coverage"]
     assert [(r["batch"], r["k"]) for r in coverage] == [(b, 5 if b <= 3 else busy) for b in range(1, 9)]
     assert {r["draft_width"] for r in coverage} == ({5} if busy else {0, 5})
+    stores = {s["role"]: s for s in state.saved["graph_inventory"] if s["role"]}
+    assert set(stores) == {"target", "draft:5"}
+    for row in coverage:
+        for path in ("target", "draft") if row["k"] else ("target",):
+            store = stores[row[path + "_store"]]
+            assert row[path] in store["expected_full"]
+            assert all(row[path] in store["arms"][arm] for arm in ("off", "on"))
     for m in managers:
         expected = set(m._capture_descs.get(Mode.FULL, ()))
         for arm in (False, True):
@@ -284,3 +291,24 @@ def test_pipeline_adapter_preserves_construction_eligibility(state, boot):
         assert not closed._sm80_attn_pipeline_eligible
     absent = NS(model=NS(modules=lambda: [object()]), speculator=None)
     assert "no loaded" in switch.unavailable(absent)
+
+
+@pytest.mark.parametrize("which", [0, 1])
+def test_full_decode_rejects_eager_target_or_drafter(monkeypatch, state, fake_switch, which):
+    runner, managers, captured = dynamic_runner(monkeypatch)
+    managers[which].cudagraph_mode = Mode.NONE
+    # A plausible eager manager has no FULL capture plan or candidates.
+    managers[which]._capture_descs[Mode.FULL] = []
+    managers[which]._candidates.clear()
+    with pytest.raises(RuntimeError, match="FULL"):
+        ab.capture_model_per_arm(runner, False)
+    assert not captured and not state.captured
+
+
+def test_changed_manager_mode_cannot_silently_enable_eager(monkeypatch, state, fake_switch):
+    runner, managers, _ = dynamic_runner(monkeypatch)
+    ab.capture_model_per_arm(runner, False)
+    managers[1].cudagraph_mode = Mode.NONE
+    reply = ab._set_arm(NS(rank=0, model_runner=runner), "on", 1)
+    assert not reply["ok"] and "re-specialized" in reply["reason"]
+    assert state.arm is False and state.generation == 0

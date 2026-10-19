@@ -15,8 +15,9 @@
 - ``POST /collective_rpc`` (``VLLM_SERVER_DEV_MODE=1``) with method
   ``set_ab_arm`` and args ``["on" | "off", generation]`` switches every
   worker between engine steps. The ranks agree first (no request resident,
-  a newer generation, graphs captured for the arm) and then all switch, or
-  none does; each returns its state. The caller drains requests before the
+  a newer generation, graphs captured for the arm), then acknowledge a commit
+  or a rollback on every rank. Unrecoverable consistency faults terminate the
+  workers instead of escaping as ordinary RPC exceptions; each safe reply reports its state. The caller drains requests before the
   call and resets the prefix cache after it.
 
 Unset (the default), :func:`configure` and :func:`capture_model_per_arm`
@@ -51,7 +52,7 @@ import os
 import sys
 from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NoReturn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -729,6 +730,7 @@ class _ManagerPlan:
     original_descs: dict = field(init=False)
     original_candidates: dict = field(init=False)
     decode_query_len: int = field(init=False)
+    cudagraph_mode: Any = field(init=False)
 
     def __post_init__(self):
         self.original_descs = self.manager._capture_descs
@@ -736,6 +738,7 @@ class _ManagerPlan:
         self.descs = {k: tuple(v) for k, v in self.original_descs.items()}
         self.candidates = {k: tuple(v) for k, v in self.original_candidates.items()}
         self.decode_query_len = self.manager.decode_query_len
+        self.cudagraph_mode = self.manager.cudagraph_mode
 
     def unchanged(self) -> bool:
         m = self.manager
@@ -743,7 +746,8 @@ class _ManagerPlan:
                 and m._candidates is self.original_candidates
                 and {k: tuple(v) for k, v in m._capture_descs.items()} == self.descs
                 and {k: tuple(v) for k, v in m._candidates.items()} == self.candidates
-                and m.decode_query_len == self.decode_query_len)
+                and m.decode_query_len == self.decode_query_len
+                and m.cudagraph_mode == self.cudagraph_mode)
 
     def restore(self) -> None:
         if self.unchanged():
@@ -755,6 +759,7 @@ class _ManagerPlan:
         self.manager._capture_descs = self.original_descs
         self.manager._candidates = self.original_candidates
         self.manager.decode_query_len = self.decode_query_len
+        self.manager.cudagraph_mode = self.cudagraph_mode
 
     def check_graphs(self, arms) -> None:
         from vllm.config import CUDAGraphMode
@@ -811,12 +816,20 @@ def _dynamic_coverage(runner) -> list[dict]:
     from vllm.config import CUDAGraphMode
     from vllm.v1.worker.gpu.cudagraph_utils import _is_compatible
 
+    config = getattr(runner.vllm_config, "compilation_config", None)
+    mode = getattr(config, "cudagraph_mode", CUDAGraphMode.NONE)
+    full_decode = mode.decode_mode() == CUDAGraphMode.FULL
+
     def descriptor(manager, batch, query_len):
         if manager.cudagraph_mode == CUDAGraphMode.NONE:
+            if full_decode:
+                raise RuntimeError("dev A/B: FULL decode requires target and draft graphs, not eager fallback")
             return "eager"
         candidates = manager._candidates.get((batch * query_len, 0), ())
         for desc in candidates:
             if _is_compatible(desc, batch, batch * query_len, query_len, 0, None, 1):
+                if full_decode and desc.cg_mode != CUDAGraphMode.FULL:
+                    raise RuntimeError("dev A/B: FULL decode dispatched a non-FULL target or draft descriptor")
                 return repr(desc)
         raise RuntimeError(f"dev A/B: missing batch={batch}, query_len={query_len} capture")
 
@@ -829,15 +842,29 @@ def _dynamic_coverage(runner) -> list[dict]:
         draft_desc = (descriptor(manager, batch, manager.decode_query_len)
                       if k else "context-only")
         coverage.append({"batch": batch, "k": k, "target": target,
+                         "target_store": "target", "draft_store": f"draft:{width}" if k else None,
                          "draft_width": width if k else 0, "draft": draft_desc})
     return coverage
 
 
-def _graph_inventory() -> list[dict]:
-    return [{"owner": type(owner).__name__, "store": attr,
-             "arms": {_arm_name(a): sorted(map(repr, entries))
-                      for a, entries in getattr(owner, attr).by_arm.items()}}
-            for owner, attr in _graph_stores()]
+def _graph_inventory(runner) -> list[dict]:
+    from vllm.config import CUDAGraphMode
+
+    # A descriptor in another manager is not evidence for this dispatch path.
+    # Stable roles link each K-table row to its exact target/draft graph store.
+    roles = {id(getattr(runner, "cudagraph_manager", None)): "target"}
+    roles.update({id(m): f"draft:{width}"
+                  for width, m in getattr(_speculator(runner), "_cg_managers", {}).items()})
+    inventory = []
+    for owner, attr in _graph_stores():
+        entry = {"owner": type(owner).__name__, "store": attr,
+                 "role": roles.get(id(owner)) if attr == "graphs" else None,
+                 "arms": {_arm_name(a): sorted(map(repr, entries))
+                          for a, entries in getattr(owner, attr).by_arm.items()}}
+        if attr == "graphs":
+            entry["expected_full"] = sorted(map(repr, owner._capture_descs.get(CUDAGraphMode.FULL, ())))
+        inventory.append(entry)
+    return inventory
 
 
 def _capture_unsupported(runner) -> str | None:
@@ -906,7 +933,7 @@ def capture_model_per_arm(runner, profile_only: bool) -> int | None:
         _STATE.captured = arms
         _STATE.saved["capture_contract"] = (policy, plans)
         _STATE.saved["dynamic_coverage"] = coverage
-        _STATE.saved["graph_inventory"] = _graph_inventory()
+        _STATE.saved["graph_inventory"] = _graph_inventory(runner)
     phase = "profiling" if profile_only else "serving"
     _STATE.capture_bytes[phase] = sizes
     logger.info(
@@ -957,6 +984,38 @@ def _all_ranks_agree(ok: bool) -> bool:
     return bool(flag.item())
 
 
+def _fail_stop(reason: str) -> NoReturn:
+    # WorkerProc catches Exception and resumes serving. An unproven rollback or
+    # broken control collective must instead terminate the worker. Every rank
+    # reaches this path after a failed rollback vote; transport failures also
+    # terminate locally, letting the executor's worker-death handling stop peers.
+    try:
+        logger.critical("Dev A/B fail-stop: %s", reason)
+    finally:
+        os._exit(1)
+
+
+def _transaction_vote(ok: bool) -> bool:
+    try:
+        return _all_ranks_agree(ok)
+    except Exception as error:
+        _fail_stop(f"control collective failed: {error}")
+
+
+def _all_ranks_same_state() -> bool:
+    try:
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_world_group
+
+        group = get_world_group().cpu_group
+        state = (_STATE.arm, _STATE.generation, _STATE.replay)
+        states = [None] * dist.get_world_size(group)
+        dist.all_gather_object(states, state, group=group)
+        return all(other == state for other in states)
+    except Exception as error:
+        _fail_stop(f"state acknowledgement failed: {error}")
+
+
 def _report(worker, ok: bool, reason: str) -> dict[str, Any]:
     switch = _STATE.switch
     return {
@@ -996,6 +1055,8 @@ def _set_arm(worker, arm: str, generation: int, replay: bool = True) -> dict[str
             reason = f"{resident} requests resident; drain first"
         elif _graphs_on(runner) and (arm == "on") not in _STATE.captured:
             reason = "CUDA graphs were not captured for this arm"
+    previous = (_STATE.arm, _STATE.generation, _STATE.replay)
+    graph_flags = []
     if reason is None and "capture_contract" in _STATE.saved:
         policy, plans = _STATE.saved["capture_contract"]
         try:
@@ -1003,20 +1064,44 @@ def _set_arm(worker, arm: str, generation: int, replay: bool = True) -> dict[str
             _check_complete(_STATE.captured)
             for plan in plans:
                 plan.check_graphs(_STATE.captured)
-        except RuntimeError as error:
+            graph_flags = [(p.manager, p.manager._graphs_captured) for p in plans]
+        except Exception as error:
             reason = str(error)
-    # Every rank takes part, so none blocks; all switch or none does.
-    agreed = _all_ranks_agree(reason is None)
+    # Readiness is not a commit: adapters and device synchronizations can fail
+    # locally after this vote. No rank may return to serving until all commit,
+    # or all restore the prior arm, replay flags and generation.
+    agreed = _transaction_vote(reason is None)
     if reason is None and not agreed:
         reason = "another rank refused"
     if reason is not None:
         return _report(worker, False, reason)
-    _apply(runner, arm == "on")
-    if "capture_contract" in _STATE.saved:
-        for plan in _STATE.saved["capture_contract"][1]:
-            plan.manager._graphs_captured = replay
-    _STATE.replay = replay
-    _STATE.generation = generation
+    if not _all_ranks_same_state():
+        _fail_stop("rank states disagree before switching")
+    failure = None
+    try:
+        _apply(runner, arm == "on")
+        for manager, _ in graph_flags:
+            manager._graphs_captured = replay
+        _STATE.replay = replay
+        _STATE.generation = generation
+    except Exception as error:
+        failure = str(error)
+    committed = _transaction_vote(failure is None)
+    if committed:
+        committed = _all_ranks_same_state()
+    if not committed:
+        restored = False
+        try:
+            _apply(runner, previous[0])
+            for manager, value in graph_flags:
+                manager._graphs_captured = value
+            _STATE.arm, _STATE.generation, _STATE.replay = previous
+            restored = True
+        except Exception as error:
+            logger.error("Dev A/B rollback failed: %s", error)
+        if not _transaction_vote(restored) or not _all_ranks_same_state():
+            _fail_stop("cannot acknowledge a consistent rollback on every rank")
+        return _report(worker, False, "switch rolled back: " + (failure or "another rank failed to commit"))
     logger.info(
         "Dev A/B %s: arm %s (generation %d)", _STATE.switch.name, arm, generation
     )

@@ -121,7 +121,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/__init__.py` | 34 |
 | `vllm/sm80/attention/__init__.py` | 2 |
 | `vllm/sm80/attention/triton_mla_sparse.py` | 386 |
-| `vllm/sm80/dev_ab.py` | 1,037 |
+| `vllm/sm80/dev_ab.py` | 1,122 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
 | `vllm/sm80/distributed/communicator.py` | 356 |
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
@@ -158,7 +158,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **40 files** | **11,176** |
+| **40 files** | **11,261** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -387,8 +387,9 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/parser/engine/test_glm47_tool_choice_none.py` | 265 |
 | `tests/plugins_tests/conftest.py` | 17 |
 | `tests/sm80/seams.yaml` | 1,344 |
-| `tests/sm80/test_dev_ab.py` | 533 |
-| `tests/sm80/test_dev_ab_dynamic.py` | 286 |
+| `tests/sm80/test_dev_ab.py` | 534 |
+| `tests/sm80/test_dev_ab_atomic.py` | 137 |
+| `tests/sm80/test_dev_ab_dynamic.py` | 314 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
 | `tests/sm80/test_exl3_platform_verification.py` | 65 |
 | `tests/sm80/test_exl3_plugin.py` | 110 |
@@ -437,7 +438,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **182 files** | **90,819** |
+| **183 files** | **90,985** |
 
 #### `tools/`
 
@@ -686,7 +687,7 @@ Functions, methods and classes in fork-added product files whose name occurs now
 |---|---:|---|---:|---|
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 890 | `forward_layer` | 19 | yes |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 260 | `engram_telemetry` | 4 | yes |
-| `vllm/sm80/dev_ab.py` | 1034 | `get_ab_arm` | 4 | yes |
+| `vllm/sm80/dev_ab.py` | 1119 | `get_ab_arm` | 4 | yes |
 | **3 definitions** | | | **27** | |
 
 ## 5. Health numbers
@@ -696,11 +697,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 153 |
-| Fork-added product lines | 49,752 |
+| Fork-added product lines | 49,837 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,134 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,562 / -244 |
-| Product lines added (new files and patches) | 53,314 |
+| Product lines added (new files and patches) | 53,399 |
 | Fork environment variables (flags) | 103 |
 | Unreferenced fork definitions | 3 (27 lines) |
