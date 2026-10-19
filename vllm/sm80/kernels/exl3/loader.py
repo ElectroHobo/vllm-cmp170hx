@@ -200,6 +200,12 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     if missing:
         raise ValueError(f"Unloaded EXL3 runtime parameters: {sorted(missing)[:16]}")
     require_cuda_parameters(model)
+    from vllm.sm80 import capture
+
+    if capture.active and "hybrid" in capture.config().families:
+        from vllm.models.deepseek_v41.nvidia.hybrid_capture import register_model
+
+        register_model(model)
     counts = Counter(disposition for disposition, _ in ledger.entries.values())
     logger.info(
         "EXL3 packed format, BF16 activations; %s model; "

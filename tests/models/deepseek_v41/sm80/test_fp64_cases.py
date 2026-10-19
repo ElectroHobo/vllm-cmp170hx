@@ -597,6 +597,99 @@ def test_moe_families_run_at_both_bit_widths(tmp_path, mixed_checkpoint, monkeyp
     assert rc == 1 and rows == {}
 
 
+# ---------------------------------------------------------------- hybrid CPU contracts
+
+
+def test_hybrid_independent_fp8_decode():
+    from .hybrid_linear_cases import decode_fp8
+
+    bits = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(8, 32)
+    bits[(bits & 127) == 127] = 0
+    scale = torch.full((8, 1), 127, dtype=torch.uint8)
+    got = decode_fp8(bits.view(torch.float8_e4m3fn), scale)
+    want = bits.view(torch.float8_e4m3fn).double()
+    assert torch.equal(got, want)
+    assert torch.equal(got.signbit(), want.signbit())
+    scale[0] = 255
+    with pytest.raises(ValueError, match="nonfinite official UE8M0"):
+        decode_fp8(bits.view(torch.float8_e4m3fn), scale)
+
+
+def test_hybrid_capture_link_does_not_retain_dead_outputs():
+    import gc
+    import weakref
+    from vllm.models.deepseek_v41.nvidia import hybrid_capture as h
+
+    x = torch.ones(2, 32, dtype=BF16)
+    key = x.untyped_storage().data_ptr()
+    h._outputs[key] = ({"dtype": str(BF16), "storage_offset": 0,
+                        "call_id": 7, "output": "out", "prefix": "projection"}, weakref.ref(x))
+    assert h._link(x)["call_id"] == 7
+    del x
+    gc.collect()
+    assert h._outputs[key][1]() is None
+    h._outputs.clear()
+
+
+def test_hybrid_consumer_requires_real_link():
+    from .hybrid_consumer_cases import evaluate
+
+    obj = {"meta": {"call_id": 1, "op": "rms_norm", "outputs": ["out"]},
+           "tensors": {"x": torch.ones(2, 32, dtype=BF16),
+                       "weight": torch.ones(32, dtype=BF16), "eps": 1e-6,
+                       "out": torch.ones(2, 32, dtype=BF16)}}
+    with pytest.raises(ValueError, match="missing actual-consumer link"):
+        evaluate(obj, CPU, "unused")
+
+
+def test_hybrid_reference_disables_weak_reductions():
+    from .hybrid_linear_cases import reference_settings
+
+    settings = reference_settings()
+    assert settings["allow_tf32"] is False
+    assert settings["allow_bf16_reduced_precision_reduction"] is False
+    assert settings["allow_fp16_reduced_precision_reduction"] is False
+    assert settings["float32_matmul_precision"] == "highest"
+
+
+def test_hybrid_consumer_defers_tp_collectives():
+    from .hybrid_consumer_cases import evaluate
+
+    obj = {"meta": {"call_id": 1, "tp_boundary": True}, "tensors": {}}
+    with pytest.raises(ValueError, match="distributed consumer check"):
+        evaluate(obj, torch.device("cpu"), "unused")
+
+
+def test_hybrid_state_export_preserves_aliases_and_write_guards():
+    import importlib.util
+    from pathlib import Path
+    from .hybrid_consumer_cases import _owned_state
+
+    path = Path(__file__).resolve().parents[4] / "tools/sm80/export_hybrid_cases.py"
+    spec = importlib.util.spec_from_file_location("hybrid_case_export", path)
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    cache = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4)
+    after = cache.clone()
+    after[1, 1] = -1
+    blocks = torch.tensor([0, 1, 2, 1])
+    args = {"cache": cache[blocks], "out": after[blocks],
+            "snapshot_name": "cache", "snapshot_blocks": blocks,
+            "slots": torch.tensor([3]), "rows": after[1, 1:2]}
+    frozen = exporter.compact_state({"meta": {}, "tensors": args})
+    assert torch.equal(frozen["tensors"]["cache"], cache)
+    assert torch.equal(frozen["tensors"]["out"], after)
+    assert frozen["meta"]["observed_blocks"] == [0, 1, 2]
+    _owned_state("store_rows", frozen["tensors"], {"out": after})
+    wrong = after.clone()
+    wrong[2, 0] = -2
+    with pytest.raises(ValueError, match="outside owned slots"):
+        _owned_state("store_rows", frozen["tensors"], {"out": wrong})
+    args["out"][-1, 0] = -3
+    with pytest.raises(ValueError, match="aliased state blocks disagree"):
+        exporter.compact_state({"meta": {}, "tensors": args})
+
+
 # ---------------------------------------------------------------- GPU
 
 
