@@ -359,7 +359,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,171 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 378 |
-| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 772 |
+| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 909 |
 | `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 336 |
 | `tests/models/deepseek_v41/sm80/test_hybrid_checkpoint.py` | 438 |
 | `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 126 |
@@ -457,7 +457,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **193 files** | **93,688** |
+| **193 files** | **93,825** |
 
 #### `tools/`
 
