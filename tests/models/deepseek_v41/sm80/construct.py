@@ -103,7 +103,7 @@ def _model_config(directory: str, hf_config, runner_type: str) -> ModelConfig:
 def _quant_config(directory: str, hf_config):
     from vllm.sm80.kernels.exl3.quant import Exl3Config
 
-    quant = Exl3Config()
+    quant = Exl3Config.from_config(hf_config.quantization_config)
     quant.maybe_update_config(directory, hf_config=hf_config)
     return quant
 
