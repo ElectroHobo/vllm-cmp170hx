@@ -24,4 +24,4 @@ The full attention prepare-state capture is integrated separately through the at
 
 ## Removed or unchanged
 
-No production default changes, no compatibility aliases, no native source changes, and no routed-expert arithmetic changes. Existing capture APIs and the stock judge remain the single conventions.
+No production default changes, no compatibility aliases, no native source changes, and no routed-expert arithmetic changes. The retained FP32 router is captured as a downstream consumer, not relabelled as a changed FP8/BF16 projection; its promoted weight bytes are not compared to the source storage dtype as though a hybrid GEMM changed them. Existing capture APIs and the stock judge remain the single conventions.

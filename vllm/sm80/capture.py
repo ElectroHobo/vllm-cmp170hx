@@ -287,7 +287,8 @@ def begin(
     anything is copied). ``point_phase`` is an explicit model-owned phase,
     independent of the target scheduler phase (for example an eager draft
     called while the target is prefilling). It is never inferred from rows."""
-    point_phase = point_phase or _point_phase.get()
+    if point_phase is None:
+        point_phase = _point_phase.get()
     if point_phase not in (None, "prefill", "decode", "verify", "draft"):
         raise ValueError(f"unknown capture point phase {point_phase!r}")
     cfg = config()
