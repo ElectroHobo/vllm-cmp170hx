@@ -112,7 +112,7 @@ exceptions:
     Delete the notice line in the change that removes the last fork edit of
     this file, so that it no longer differs from upstream.
 - file: vllm/v1/core/sched/scheduler.py
-  hunks: [856437ee3c56, 2a416d3832a2]
+  hunks: [856437ee3c56, 2a416d3832a2, 22f90a26368e, 8ceddf09f07e, 7759e06de501]
   reason: >-
     Upstream bug fix taken ahead of upstream (vllm-project/vllm#54076, first
     part): the align-mode prefill split stops on the Mamba group's own block
@@ -120,12 +120,24 @@ exceptions:
     pulls below it (GLM-5.3-Flash at PP4). The split is a private scheduler
     method with no extension point. At zero context the replaced line merges
     with the fork's adjacent drop_eagle_block hunk into one hunk.
-  owner: GLM-5.3-Flash PP4 serving
+    The additional budget hunks prevent a long hybrid prompt from waiting for
+    decodes to finish when their recurring token and draft-slot charges leave
+    less than one state block. Both admission and running-chunk paths pass
+    the achievable prefill limit into the existing aligned splitter; other
+    prefills' temporary charges are restored. The accounting comment changes
+    because these counters now determine progress as well as statistics.
+    No extension point exposes both token budgets and prefill charges, and
+    this correctness fix must apply to every hybrid model without a flag.
+  owner: hybrid scheduler and GLM-5.3-Flash PP4 serving
   removal: >-
     When the upstream base carries #54076 or another fix that splits on the
     Mamba state block: delete the mamba_state_block_size block in __init__ and
     restore the single upstream block_size line in _mamba_block_aligned_split;
     tests/sm80/test_glm_pp4_mamba_split.py must still pass.
+    Remove the two achievable-prefill-limit calculations when upstream's
+    splitter guarantees progress under persistent decode occupancy while
+    preserving block boundaries and temporary-fragment deferral;
+    tests/v1/core/test_mamba_decode_progress.py must still pass.
 - file: vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
   hunks: [21689b6f8e90, 501bbcf1c181]
   reason: >-

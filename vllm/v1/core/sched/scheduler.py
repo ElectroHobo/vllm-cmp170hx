@@ -886,7 +886,7 @@ class Scheduler(SchedulerInterface):
         prefill_chunk_cap = token_budget
         if self.fair_prefill:
             prefill_token_budget, prefill_chunk_cap = self._fair_prefill_budget()
-        # Observability only; refunded when scheduled prefills are preempted.
+        # Prefill charges, refunded when scheduled prefills are preempted.
         num_prefill_tokens = 0
         num_prefill_reqs = 0
 
@@ -1032,6 +1032,21 @@ class Scheduler(SchedulerInterface):
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
+                if req_is_prefill:
+                    # Decodes can occupy this budget indefinitely. Restore
+                    # other prefills' charges, not decode charges, when finding
+                    # the widest attainable chunk; temporary prefill fragments
+                    # should still wait for a whole block on the next step.
+                    prefill_chunk_limit = min(
+                        prefill_chunk_limit
+                        if prefill_chunk_limit is not None
+                        else self.max_num_scheduled_tokens,
+                        long_prefill_token_threshold or self.max_num_scheduled_tokens,
+                        token_budget + num_prefill_tokens,
+                        input_budget
+                        + num_prefill_tokens
+                        + (num_prefill_reqs - 1) * draft_slots,
+                    )
                 # Positional: tests monkeypatch this with a `*args` stub.
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens, 0, 0, prefill_chunk_limit
@@ -1532,6 +1547,19 @@ class Scheduler(SchedulerInterface):
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
+                        if req_is_prefill:
+                            # As for running chunks, exclude decode occupancy
+                            # but restore earlier prefills' tokens and slots.
+                            prefill_chunk_limit = min(
+                                prefill_chunk_limit
+                                if prefill_chunk_limit is not None
+                                else self.max_num_scheduled_tokens,
+                                long_prefill_token_threshold
+                                or self.max_num_scheduled_tokens,
+                                token_budget + num_prefill_tokens,
+                                input_budget + num_prefill_tokens
+                                + (num_prefill_reqs - 1) * draft_slots,
+                            )
                         num_new_tokens = self._mamba_block_aligned_split(
                             request,
                             num_new_tokens,
