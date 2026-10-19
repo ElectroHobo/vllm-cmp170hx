@@ -33,6 +33,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.sm80 import capture
 from vllm.sm80.kernels.exl3.hybrid import (
     EXL3,
     UNQUANTIZED,
@@ -581,6 +582,7 @@ class Exl3LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer):
         from vllm.sm80.kernels.exl3 import ops as exl3_ops
+        from vllm.sm80.kernels.exl3 import capture_points
 
         self.row_chunks = []
         for weight in layer.exl3_weights:
@@ -590,6 +592,9 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise ValueError("EXL3 packed weights and scales must remain on CUDA")
             self.row_chunks.append(
                 exl3_ops.linear_row_chunk(weight.padded_in, weight.padded_out)
+            )
+            capture_points.register_linear(
+                weight, self.row_chunks[-1], self.out_dtype
             )
 
     def apply(self, layer, x, bias=None):
@@ -689,8 +694,7 @@ class Exl3HeadLogitsProcessor(LogitsProcessor):
         lm_head: nn.Module,
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        method = lm_head.quant_method
+    ) -> torch.Tensor:        method = lm_head.quant_method
         if not isinstance(method, Exl3LinearMethod):
             return super()._apply_head(lm_head, hidden_states, embedding_bias)
         head_dtype = self.head_dtype or hidden_states.dtype
@@ -896,6 +900,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.register_buffer(
             "exl3_meta", torch.tensor(metadata, dtype=torch.int64, device=device)
         )
+        from vllm.sm80.kernels.exl3 import capture_points
+
+        capture_points.register_moe(layer.exl3_ptrs, self.prefix)
         if layer.expert_map is None:
             layer.register_buffer(
                 "exl3_expert_map",
@@ -1259,6 +1266,21 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
                 out,
                 workspace2.view(torch.float32),
                 swiglu_limit=self.swiglu_limit,
+            )
+        if capture.active:
+            from vllm.sm80.kernels.exl3 import capture_points
+
+            capture_points.moe(
+                operator,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                w1,
+                w2,
+                self.expert_map if expert_map is None else expert_map,
+                self.intermediate_size,
+                self.swiglu_limit,
+                output,
             )
 
     def _prefill_operator(self, rows: int, operator):

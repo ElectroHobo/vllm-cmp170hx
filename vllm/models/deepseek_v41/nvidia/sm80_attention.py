@@ -27,6 +27,7 @@ width ``max_model_len // ratio``. The input projections and ``wo_a`` /
 ``wo_b`` are in the graph either way.
 """
 
+import dataclasses
 import functools
 import os
 from collections.abc import Callable
@@ -61,6 +62,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.sm80 import capture
 from vllm.sm80.kernels.exl3.quant import set_output_dtype
 from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len, prefill_step
 from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
@@ -631,13 +633,21 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         batch = core.pad_batch(
             self._sm80_batch(attn_metadata, positions), qr_kv.shape[0]
         )
+        weights = self._sm80_weights(out.device)
         caches = self._sm80_caches()
         pipeline = self._sm80_pipeline_call(qr_kv, kv_score, index_weights, batch, caches)
         workspace = self._sm80_pipeline_workspace(out.device) if pipeline else None
         fused = not pipeline and self._sm80_fused_attn_call(qr_kv.shape[0])
+        record = None
+        if capture.active:
+            record = capture.begin(
+                "attn", "dsv41_attn_layer", self.prefix, qr_kv.shape[0]
+            )
+        if record is not None:
+            weights = _capture_attention_inputs(record, batch, caches, weights, qr_kv)
         q = core.prepare_layer(
             self.sm80_cfg,
-            self._sm80_weights(out.device),
+            weights,
             caches,
             batch,
             qr_kv,
@@ -647,6 +657,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             fused=fused, pipeline=pipeline, workspace=workspace,
         )
         self._sm80_attend(batch, q, out, fused=fused, pipeline=pipeline, workspace=workspace)
+        if record is not None:
+            _capture_attention_outputs(record, self.sm80_cfg, batch, caches, out)
 
     def forward_mqa(
         self,
@@ -752,6 +764,67 @@ _PREEMPTING_BACKENDS = (
     "fi_pcie_ipc_ar_comm",
     "aiter_ar_comm",
 )
+
+
+def _window_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    """Rows of window slots ``slots`` (-1: row of slot 0, masked by the
+    slots themselves)."""
+    slots = slots.clamp_min(0).to(torch.int64)
+    return cache[slots // cache.shape[1], slots % cache.shape[1]]
+
+
+def _capture_attention_inputs(record, batch, caches, weights, qr_kv: torch.Tensor):
+    """Record the attention core's inputs before the layer writes its caches
+    (the window rows the step attends to, as they were), and return weights
+    whose ``wq_b`` records its input (the normalised query latent) and its
+    output (the query before RoPE)."""
+    record.put(
+        qr_kv=qr_kv,
+        positions=batch.positions,
+        token_to_req=batch.token_to_req,
+        query_start_loc=batch.query_start_loc,
+        swa_slots=batch.swa_slots,
+        swa_indices=batch.swa_indices,
+        swa_rows_before=_window_rows(caches.swa, batch.swa_indices),
+        q_norm=weights.q_norm,
+        kv_norm=weights.kv_norm,
+        attn_sink=weights.attn_sink,
+        freqs=weights.freqs,
+    )
+    wq_b = weights.wq_b
+
+    def recording_wq_b(qr: torch.Tensor) -> torch.Tensor:
+        q = wq_b(qr)
+        record.put(qr=qr, q=q)
+        return q
+
+    return dataclasses.replace(weights, wq_b=recording_wq_b)
+
+
+def _capture_attention_outputs(record, cfg, batch, caches, out: torch.Tensor) -> None:
+    """Record what attention read after the layer's cache writes (window
+    rows; at compressed layers the selected positions and their rows) and
+    the ``wo_a`` input it wrote."""
+    T = batch.num_tokens
+    values: dict[str, Any] = dict(
+        swa_rows=_window_rows(caches.swa, batch.swa_indices),
+        out=out,
+        num_tokens=T,
+        compress_ratio=int(cfg.compress_ratio),
+        n_groups=int(cfg.n_local_groups),
+        scale=float(cfg.softmax_scale),
+        eps=float(cfg.eps),
+    )
+    if cfg.compress_ratio:
+        local = caches.topk[:T]
+        req = batch.token_to_req.to(torch.int64)[:, None].expand_as(local)
+        values.update(
+            comp_local=local,
+            comp_rows=core.gather_compressed_rows(
+                caches.comp, batch.comp_block_table, req, local.clamp_min(0)
+            ),
+        )
+    record.put(**values).done()
 
 
 def _preempting_backends(comm: Any) -> list[str]:

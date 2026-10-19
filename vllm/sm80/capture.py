@@ -1,0 +1,410 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Diagnostic capture of served kernel calls (VLLM_SM80_CAPTURE_DIR).
+
+Off by default: with the directory unset ``active`` is False, nothing is
+patched and no capture point does any work. With it set, the capture points
+(the dense EXL3 linear, the EXL3 routed experts, model attention layers)
+hand selected calls to :func:`begin`; the returned :class:`Record` keeps
+copies of the call's arguments and outputs, and every kept call becomes one
+file
+
+    <dir>/r<rank>/<family>/<prefix>-M<rows>-<phase>-<owner>-s<step>-<n>.pt
+    {"schema": "lab-point-capture/1", "family": <point>,
+     "meta": {...}, "tensors": {argument or output: value}}
+
+(``torch.load(..., weights_only=True)``) and one line of
+``<dir>/r<rank>/index.jsonl`` (family, point, prefix, rows, phase, owner,
+step, bytes, saved, path, sha256). ``point`` names the operator the call
+went through (the family id of the FP64 case driver where it has one).
+
+Eager calls (prefill steps, decode steps outside a CUDA graph) are copied to
+the host right after the call. Calls inside a FULL CUDA graph are recorded
+inside the graph: while a graph is captured, a selected call's copies are
+captured with it (device copies into the graph's memory pool, in stream
+order, so on every replay they hold exactly what the graph's kernels read
+and wrote), and after a replay of that graph the copies are read back. The
+graph is the served one plus these copies; nothing it computes changes.
+Reading back waits for the stream: diagnostic boots only.
+
+Selection (vllm.sm80.envs):
+- VLLM_SM80_CAPTURE_FAMILIES: the families recorded (dense, moe, attn).
+- VLLM_SM80_CAPTURE_MATCH: a regex searched in the call's prefix (the
+  checkpoint prefix for dense matrices, the module prefix otherwise) for
+  every call outside prefill steps.
+- VLLM_SM80_CAPTURE_ROWS: the row counts whose graph captures get copies.
+- VLLM_SM80_CAPTURE_PER_KEY: files per (family, prefix, rows, phase, owner,
+  context), where the context is ``long`` when some request of the step had
+  computed at least LONG_CONTEXT tokens before it, else ``short``.
+- VLLM_SM80_CAPTURE_PREFILL_MATCH (default: _MATCH), _PREFILL_CALLS,
+  _PREFILL_MIN_ROWS: in prefill steps, the prefixes and the ordinals (per
+  family and prefix, from 1, over calls of at least _PREFILL_MIN_ROWS rows)
+  that are kept.
+- VLLM_SM80_CAPTURE_MAX_MB: bytes of tensors written per process; past it
+  the index says ``saved: false``.
+
+The phase is the scheduler's, from the step the model runner executes: a
+step that schedules some request more than 1 + num_speculative_tokens
+tokens is ``prefill``, one token per request ``decode``, otherwise
+``verify``; ``meta.query_lens`` holds every request's scheduled tokens. The
+owner is ``eager`` or the class of the CUDA graph manager that replayed the
+call (the target's or the drafter's), with the graph's descriptor in
+``meta.graph``. Profile runs, warm-ups and dummy steps are never recorded.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+
+from vllm import envs
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+SCHEMA = "lab-point-capture/1"
+FAMILIES = ("dense", "moe", "attn")
+# Context, in tokens, from which a step's records count as long-context ones.
+LONG_CONTEXT = 4096
+
+active = bool(envs.VLLM_SM80_CAPTURE_DIR)
+
+
+@dataclass
+class _Config:
+    root: str
+    families: frozenset
+    match: re.Pattern
+    prefill_match: re.Pattern
+    rows: frozenset
+    per_key: int
+    prefill_calls: frozenset
+    prefill_min_rows: int
+    max_bytes: int
+    rank: int
+    tp_rank: int
+
+
+def _ints(text: str) -> frozenset:
+    return frozenset(int(v) for v in text.split(",") if v.strip())
+
+
+def _ranks() -> tuple[int, int]:
+    rank = tp_rank = 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        tp_rank = get_tensor_model_parallel_rank()
+    except (AssertionError, RuntimeError):
+        tp_rank = rank
+    return rank, tp_rank
+
+
+_cfg: _Config | None = None
+
+
+def config() -> _Config:
+    """The settings, read once in the worker (after it joined its groups,
+    at weight loading); the first call installs the hooks."""
+    global _cfg
+    if _cfg is None:
+        families = frozenset(
+            f.strip() for f in envs.VLLM_SM80_CAPTURE_FAMILIES.split(",") if f.strip()
+        )
+        unknown = families - set(FAMILIES)
+        if unknown:
+            raise ValueError(f"VLLM_SM80_CAPTURE_FAMILIES: unknown {sorted(unknown)}")
+        rank, tp_rank = _ranks()
+        cfg = _Config(
+            root=os.path.join(envs.VLLM_SM80_CAPTURE_DIR, f"r{rank}"),
+            families=families,
+            match=re.compile(envs.VLLM_SM80_CAPTURE_MATCH),
+            prefill_match=re.compile(
+                envs.VLLM_SM80_CAPTURE_PREFILL_MATCH or envs.VLLM_SM80_CAPTURE_MATCH
+            ),
+            rows=_ints(envs.VLLM_SM80_CAPTURE_ROWS),
+            per_key=envs.VLLM_SM80_CAPTURE_PER_KEY,
+            prefill_calls=_ints(envs.VLLM_SM80_CAPTURE_PREFILL_CALLS),
+            prefill_min_rows=envs.VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS,
+            max_bytes=envs.VLLM_SM80_CAPTURE_MAX_MB << 20,
+            rank=rank,
+            tp_rank=tp_rank,
+        )
+        os.makedirs(cfg.root, exist_ok=True)
+        _install()
+        _cfg = cfg
+        logger.info(
+            "Kernel call capture active (VLLM_SM80_CAPTURE_DIR=%s): families %s, "
+            "graph rows %s, %d per key, prefill calls %s; diagnostic boots only.",
+            cfg.root, ",".join(sorted(families)), sorted(cfg.rows), cfg.per_key,
+            sorted(cfg.prefill_calls),
+        )
+    return _cfg
+
+
+# ------------------------------------------------------------------ step state
+
+# The step the model runner executes (set by its execute_model, kept until the
+# next one so the drafter's calls in sample_tokens get the same step).
+_step: dict[str, Any] = {
+    "real": False, "step": 0, "phase": None, "query_lens": [], "context_lens": [],
+}
+# Records made while a graph is being captured; the graph manager's storing
+# the graph moves them onto the graph object (they live and die with it, so a
+# graph torn down after the memory estimate takes its copies with it).
+_pending: list[Record] = []
+_counts: dict[tuple, int] = {}
+_prefill_calls: dict[tuple[str, str], int] = {}
+_bytes = [0]
+_weights: dict[int, dict] = {}
+
+
+def set_step(scheduler_output, decode_len: int, dummy: bool) -> None:
+    """Called by the model runner before every step it executes.
+    ``context_lens``: the tokens each request had computed before the step
+    (new requests first, then the running ones)."""
+    if dummy:
+        _step["real"] = False
+        return
+    lens = sorted(getattr(scheduler_output, "num_scheduled_tokens", {}).values())
+    context = [
+        getattr(r, "num_computed_tokens", None)
+        for r in getattr(scheduler_output, "scheduled_new_reqs", None) or []
+    ]
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    context += list(getattr(cached, "num_computed_tokens", None) or [])
+    top = lens[-1] if lens else 0
+    phase = "prefill" if top > decode_len else "decode" if top == 1 else "verify"
+    longest = max((c for c in context if c is not None), default=0)
+    _step.update(real=bool(lens), step=_step["step"] + 1, phase=phase,
+                 query_lens=lens, context_lens=context,
+                 context="long" if longest >= LONG_CONTEXT else "short")
+
+
+def _capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+# ------------------------------------------------------------------ records
+
+
+@dataclass
+class Record:
+    family: str
+    point: str
+    prefix: str
+    rows: int
+    meta: dict
+    tensors: dict = field(default_factory=dict)
+    in_graph: bool = False
+
+    def put(self, **values: Any) -> Record:
+        """Keep copies of ``values`` as they are now (tensors are copied on
+        their device, in stream order)."""
+        for name, value in values.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach().clone()
+            self.tensors[name] = value
+        return self
+
+    def done(self) -> None:
+        if self.in_graph:
+            _pending.append(self)
+        else:
+            _write([self], "eager", None)
+
+
+def begin(
+    family: str, point: str, prefix: str, rows: int, **meta: Any
+) -> Record | None:
+    """A Record for this call when it is selected, else None (decided before
+    anything is copied)."""
+    cfg = config()
+    if family not in cfg.families:
+        return None
+    if _capturing():
+        if rows not in cfg.rows or not cfg.match.search(prefix):
+            return None
+        return Record(family, point, prefix, rows, meta, in_graph=True)
+    if not _step["real"]:
+        return None
+    if _step["phase"] == "prefill":
+        if rows < cfg.prefill_min_rows or not cfg.prefill_match.search(prefix):
+            return None
+        key = (family, prefix)
+        _prefill_calls[key] = _prefill_calls.get(key, 0) + 1
+        if _prefill_calls[key] not in cfg.prefill_calls:
+            return None
+        meta = dict(meta, prefill_call=_prefill_calls[key])
+    elif not cfg.match.search(prefix) or _full(family, prefix, rows, "eager"):
+        return None
+    return Record(family, point, prefix, rows, meta)
+
+
+def _key(family: str, prefix: str, rows: int, owner: str) -> tuple:
+    return (family, prefix, rows, _step["phase"], owner, _step.get("context"))
+
+
+def _full(family: str, prefix: str, rows: int, owner: str) -> bool:
+    if _step["phase"] == "prefill":
+        return False
+    return _counts.get(_key(family, prefix, rows, owner), 0) >= config().per_key
+
+
+def _host(value: Any) -> Any:
+    return value.cpu() if isinstance(value, torch.Tensor) else value
+
+
+def _write(records: list[Record], owner: str, graph: dict | None) -> None:
+    cfg = config()
+    sm_count = (
+        torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        if torch.cuda.is_available()
+        else 0
+    )
+    lines = []
+    for rec in records:
+        if _full(rec.family, rec.prefix, rec.rows, owner):
+            continue
+        key = _key(rec.family, rec.prefix, rec.rows, owner)
+        n = _counts.get(key, 0)
+        tensors = {k: _host(v) for k, v in rec.tensors.items()}
+        size = sum(
+            t.numel() * t.element_size()
+            for t in tensors.values()
+            if isinstance(t, torch.Tensor)
+        )
+        line = {
+            "family": rec.family, "point": rec.point, "prefix": rec.prefix,
+            "rows": rec.rows, "phase": _step["phase"], "owner": owner,
+            "step": _step["step"], "context": _step.get("context"), "bytes": size,
+            "saved": False,
+        }
+        if _bytes[0] + size <= cfg.max_bytes:
+            meta = dict(
+                rec.meta, module_prefix=rec.prefix, rank=cfg.rank,
+                tp_rank=cfg.tp_rank, phase=_step["phase"], owner=owner,
+                step=_step["step"], query_lens=list(_step["query_lens"]),
+                context_lens=list(_step["context_lens"]),
+                rows=rec.rows, graph=graph, sm_count=sm_count,
+            )
+            name = re.sub(r"[^A-Za-z0-9_.]", "_", rec.prefix)
+            folder = os.path.join(cfg.root, rec.family)
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(
+                folder,
+                f"{name}-M{rec.rows}-{_step['phase']}-{owner}-s{_step['step']}-{n}.pt",
+            )
+            payload = {"schema": SCHEMA, "family": rec.point, "meta": meta,
+                       "tensors": tensors}
+            torch.save(payload, path + ".tmp")
+            os.replace(path + ".tmp", path)
+            with open(path, "rb") as f:
+                line["sha256"] = hashlib.sha256(f.read()).hexdigest()
+            line.update(saved=True, path=path)
+            _bytes[0] += size
+            _counts[key] = n + 1
+        lines.append(json.dumps(line) + "\n")
+    if lines:
+        with open(os.path.join(cfg.root, "index.jsonl"), "a") as f:
+            f.writelines(lines)
+
+
+# ------------------------------------------------------------------ weights
+
+
+def register_weight(key: int, **meta: Any) -> None:
+    """Facts about a weight (keyed by its device address) that the records
+    of its calls carry."""
+    _weights[key] = meta
+
+
+def weight(key: int) -> dict | None:
+    return _weights.get(key)
+
+
+def sha256_of(*tensors: torch.Tensor) -> str:
+    h = hashlib.sha256()
+    for t in tensors:
+        h.update(t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()
+
+
+# ------------------------------------------------------------------ hooks
+
+
+class _BindingGraphs(dict):
+    """A graph manager's ``graphs``: storing a graph binds the records made
+    while it was captured to the graph."""
+
+    def __setitem__(self, desc, graph):
+        super().__setitem__(desc, graph)
+        graph._sm80_capture_records = list(_pending)
+        _pending.clear()
+
+
+def _bind(manager) -> None:
+    if not isinstance(manager.graphs, _BindingGraphs):
+        manager.graphs = _BindingGraphs(manager.graphs)
+    # Copies made by a capture that never stored its graph go with it.
+    _pending.clear()
+
+
+def _drain(manager, desc) -> None:
+    records = getattr(manager.graphs.get(desc), "_sm80_capture_records", None)
+    if not records or not _step["real"]:
+        return
+    owner = type(manager).__name__
+    if all(_full(r.family, r.prefix, r.rows, owner) for r in records):
+        return
+    torch.cuda.current_stream().synchronize()
+    graph = {
+        "num_tokens": desc.num_tokens,
+        "num_reqs": desc.num_reqs,
+        "uniform_token_count": desc.uniform_token_count,
+        "max_query_len": desc.max_query_len,
+        "mode": str(desc.cg_mode),
+    }
+    _write(records, owner, graph)
+
+
+def _install() -> None:
+    """Patch the model runner (the step's phase) and the CUDA graph managers
+    (records inside graphs)."""
+    from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len
+    from vllm.v1.worker.gpu import cudagraph_utils, model_runner
+
+    manager = cudagraph_utils.CudaGraphManager
+    capture, run = manager.capture, manager.run_fullgraph
+
+    def capture_binding(self, *args, **kwargs):
+        _bind(self)
+        return capture(self, *args, **kwargs)
+
+    def run_draining(self, desc):
+        result = run(self, desc)
+        _drain(self, desc)
+        return result
+
+    manager.capture = capture_binding
+    manager.run_fullgraph = run_draining
+
+    runner = model_runner.GPUModelRunner
+    execute = runner.execute_model
+
+    def execute_model(self, scheduler_output, *args, **kwargs):
+        dummy = kwargs.get("dummy_run", args[1] if len(args) > 1 else False)
+        set_step(scheduler_output, max_decode_query_len(self.vllm_config), bool(dummy))
+        return execute(self, scheduler_output, *args, **kwargs)
+
+    runner.execute_model = execute_model
