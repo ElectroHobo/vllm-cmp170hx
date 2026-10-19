@@ -83,6 +83,28 @@ A row read that still fails after its retries fails only the requests that use t
 
 The PLE file is opened with `posix_fadvise(POSIX_FADV_RANDOM)`, so the kernel does not read ahead around requested rows. Buffered reads still hit the page cache, so warm runs mostly read RAM. Set `VLLM_EXL3_PLE_COLD=1` to call `POSIX_FADV_DONTNEED` on the table at setup (no root needed; pages that another process has mapped stay resident). Page-cache residency of the table (via `mincore`) is logged at setup, after the cold drop and at process exit. `Exl3PLEEmbedding.page_cache_residency()` returns `(resident, total)` pages for sampling between runs.
 
+## Fixed expert placement
+
+`VLLM_EXL3_EXPERT_PLACEMENT` defaults to the empty string (disabled). Set it
+to a JSON file and set `VLLM_EXL3_EXPERT_PLACEMENT_SHA256` to that file's
+SHA256 to install a fixed whole-expert permutation before loading. The schema is
+`{"version":1,"ep_size":2,"layers":{"model.layers.0.mlp.experts":[[0,2],[1,3]]}}`.
+Layer keys are **checkpoint** expert prefixes, not necessarily runtime module
+names. Each ordered rank list gives its local slots in order; every logical ID
+must occur exactly once, with the existing number of slots per rank. Unlisted
+layers keep their ordinary placement. Unknown checkpoint prefixes, missing or
+duplicate experts, wrong capacities and digest mismatches fail at startup.
+
+This is supported only with whole-expert EP, no data parallelism, dynamic EPLB,
+all-to-all dispatch or fused shared experts. It does not replicate experts or
+change the router's IDs, weights or top-k order. The loader and native kernels
+share the same expert map; no per-step map allocation or lookup is added.
+Packed tensors and each expert's arithmetic are unchanged. **Rank partials
+group different experts**, so final MoE bits need not match ordinary placement.
+Validate reduction error and downstream routing before enabling. Equal-sized
+expert permutations add no resident weight or workspace memory; heterogeneous
+experts require a separate per-rank byte ledger despite equal slot counts.
+
 ## Third-party material
 
 Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.
