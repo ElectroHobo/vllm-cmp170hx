@@ -71,6 +71,8 @@ import hashlib
 import json
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -87,6 +89,21 @@ FAMILIES = ("dense", "moe", "attn", "mhc", "hybrid")
 LONG_CONTEXT = 4096
 
 active = bool(envs.VLLM_SM80_CAPTURE_DIR)
+
+
+_point_phase = ContextVar("sm80_capture_point_phase", default=None)
+
+
+@contextmanager
+def phase_scope(phase: str):
+    """Scope actual model ownership without changing target scheduler metadata."""
+    if phase not in ("prefill", "decode", "verify", "draft"):
+        raise ValueError(f"unknown capture point phase {phase!r}")
+    token = _point_phase.set(phase)
+    try:
+        yield
+    finally:
+        _point_phase.reset(token)
 
 
 @dataclass
@@ -244,6 +261,7 @@ class Record:
     meta: dict
     tensors: dict = field(default_factory=dict)
     in_graph: bool = False
+    point_phase: str | None = None
 
     def put(self, **values: Any) -> Record:
         """Keep copies of ``values`` as they are now (tensors are copied on
@@ -262,22 +280,29 @@ class Record:
 
 
 def begin(
-    family: str, point: str, prefix: str, rows: int, **meta: Any
+    family: str, point: str, prefix: str, rows: int,
+    point_phase: str | None = None, **meta: Any
 ) -> Record | None:
     """A Record for this call when it is selected, else None (decided before
-    anything is copied)."""
+    anything is copied). ``point_phase`` is an explicit model-owned phase,
+    independent of the target scheduler phase (for example an eager draft
+    called while the target is prefilling). It is never inferred from rows."""
+    point_phase = point_phase or _point_phase.get()
+    if point_phase not in (None, "prefill", "decode", "verify", "draft"):
+        raise ValueError(f"unknown capture point phase {point_phase!r}")
     cfg = config()
     if family not in cfg.families:
         return None
     if _capturing():
         if rows not in cfg.rows or not cfg.match.search(prefix):
             return None
-        return Record(family, point, prefix, rows, meta, in_graph=True)
+        return Record(family, point, prefix, rows, meta, in_graph=True, point_phase=point_phase)
     if not _step["real"]:
         return None
-    seen = ("eager", family, _step["phase"], rows)
+    phase = point_phase or _step["phase"]
+    seen = ("eager", family, phase, rows)
     _seen[seen] = _seen.get(seen, 0) + 1
-    if _step["phase"] == "prefill":
+    if phase == "prefill":
         if rows < cfg.prefill_min_rows or not cfg.prefill_match.search(prefix):
             return None
         key = (family, prefix)
@@ -286,10 +311,10 @@ def begin(
             return None
         meta = dict(meta, prefill_call=_prefill_calls[key])
     elif not cfg.match.search(prefix) or _full(
-        family, prefix, rows, _step["phase"], "eager"
+        family, prefix, rows, phase, "eager"
     ):
         return None
-    return Record(family, point, prefix, rows, meta)
+    return Record(family, point, prefix, rows, meta, point_phase=point_phase)
 
 
 def _key(family: str, prefix: str, rows: int, phase: str, owner: str) -> tuple:
@@ -320,9 +345,10 @@ def _write(
     )
     lines = []
     for rec in records:
-        if _full(rec.family, rec.prefix, rec.rows, phase, owner):
+        record_phase = rec.point_phase or phase
+        if _full(rec.family, rec.prefix, rec.rows, record_phase, owner):
             continue
-        key = _key(rec.family, rec.prefix, rec.rows, phase, owner)
+        key = _key(rec.family, rec.prefix, rec.rows, record_phase, owner)
         n = _counts.get(key, 0)
         tensors = {k: _host(v) for k, v in rec.tensors.items()}
         size = sum(
@@ -332,7 +358,7 @@ def _write(
         )
         line = {
             "family": rec.family, "point": rec.point, "prefix": rec.prefix,
-            "rows": rec.rows, "phase": phase, "step_phase": _step["phase"],
+            "rows": rec.rows, "phase": record_phase, "step_phase": _step["phase"],
             "owner": owner,
             "step": _step["step"], "context": _step.get("context"), "bytes": size,
             "saved": False,
@@ -340,7 +366,7 @@ def _write(
         if _bytes[0] + size <= cfg.max_bytes:
             meta = dict(
                 rec.meta, module_prefix=rec.prefix, rank=cfg.rank,
-                tp_rank=cfg.tp_rank, phase=phase, step_phase=_step["phase"],
+                tp_rank=cfg.tp_rank, phase=record_phase, step_phase=_step["phase"],
                 owner=owner,
                 step=_step["step"], query_lens=list(_step["query_lens"]),
                 context_lens=list(_step["context_lens"]),
@@ -351,7 +377,7 @@ def _write(
             os.makedirs(folder, exist_ok=True)
             path = os.path.join(
                 folder,
-                f"{name}-M{rec.rows}-{phase}-{owner}-s{_step['step']}-{n}.pt",
+                f"{name}-M{rec.rows}-{record_phase}-{owner}-s{_step['step']}-{n}.pt",
             )
             payload = {"schema": SCHEMA, "family": rec.point, "meta": meta,
                        "tensors": tensors}
@@ -433,7 +459,7 @@ def _drain(manager, desc) -> None:
     records = getattr(manager.graphs.get(desc), "_sm80_capture_records", None)
     if not records:
         return
-    if all(_full(r.family, r.prefix, r.rows, phase, owner) for r in records):
+    if all(_full(r.family, r.prefix, r.rows, r.point_phase or phase, owner) for r in records):
         return
     torch.cuda.current_stream().synchronize()
     graph = {

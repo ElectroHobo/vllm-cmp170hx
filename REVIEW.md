@@ -70,7 +70,7 @@ Default-off diagnostic hooks record actual hybrid projection calls, before-pack 
 
 ## Files and interfaces
 
-- `vllm/models/deepseek_v41/nvidia/hybrid_capture.py`: capture-only wrappers and prepack fingerprints. Links are cleared at new steps/graph bindings and do not retain dead outputs. Large cache pools are never cloned wholesale; addressed blocks and real adjacent guard blocks are preserved and aliases validated during export.
+- `vllm/models/deepseek_v41/nvidia/hybrid_capture.py`: capture-only wrappers and prepack fingerprints. Links are cleared at new steps/graph bindings and do not retain dead outputs. Explicit `point_phase` and scoped draft-model ownership distinguish eager drafter calls from a target prefill without guessing from row count; quota keys, filenames and metadata use the same phase, while scheduler `step_phase` is preserved. Large cache pools are never cloned wholesale; addressed blocks and real adjacent guard blocks are preserved and aliases validated during export.
 - `vllm/sm80/capture.py`, `vllm/sm80/kernels/exl3/{loader,quant}.py`: existing owned capture/loader extension points. No additional upstream-owned hook.
 - `tests/models/deepseek_v41/sm80/{fp64_cases,hybrid_linear_cases,hybrid_consumer_cases}.py`: existing family protocol and FP64 driver, not a second result schema.
 - `tools/sm80/export_hybrid_cases.py`: existing `served_cases/1`; validates capture hashes, actual links, rank/role/phase/context coverage, immutable frozen bytes and state aliases. Missing cells refuse export. TP-dependent cells are enumerated separately, never counted as local passes.
