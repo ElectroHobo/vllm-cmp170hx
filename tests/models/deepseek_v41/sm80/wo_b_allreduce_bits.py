@@ -14,14 +14,19 @@ the wo_b output shape ``[rows, 5120]``, this compares
 * ``fp32``: ``all_reduce(partial.float()).bfloat16()`` (today's path);
 * ``exact``: the FP64 sum of the four gathered partials rounded to BF16;
 
-* ``switched``: ``wo_b_all_reduce(partial, switch)``, the layer's own call
-  with ``switch`` = VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE as the process
-  environment sets it (on: BF16 only where the custom all-reduce takes the
-  message); the JSON records the switch;
+* ``switched``: ``wo_b_all_reduce(partial, switch, pieces_switch)``, the
+  layer's own call with ``switch`` = VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE
+  (on: BF16 where the custom all-reduce takes the message whole) and
+  ``pieces_switch`` = VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE (on: BF16
+  through the custom all-reduce in pieces where the message is too large for
+  it whole) as the process environment sets them; the JSON records both and
+  the path each message took (``bf16``, ``bf16_pieces`` or ``fp32``);
 
 reports which backend each message takes, bitwise equality, mismatch counts
-and the largest BF16-ulp distance, and the median time of each all-reduce.
-``switched`` must equal ``fp32`` everywhere (verdict line ``SWITCHED``).
+and the largest BF16-ulp distance (also of ``switched`` and ``fp32`` against
+``exact``), and the median time of each all-reduce. ``switched`` must equal
+``fp32`` (verdict line ``SWITCHED``), or where it differs be no less accurate
+against ``exact`` in mismatch count and largest ulp distance.
 Rank 0 prints a table and writes JSON to ``--out``. The exit code is 0 when
 every case ran; the verdict line says whether ``bf16`` equals ``fp32``.
 
@@ -46,7 +51,9 @@ import statistics
 import torch
 import torch.distributed as dist
 
-ROWS = [1, 2, 4, 8, 16, 24, 25, 26, 32, 51, 52, 64, 128, 256, 512, 1024, 2048]
+# 819 rows of 5120 BF16 are the largest message below the 8 MiB custom
+# all-reduce buffer, 820 the smallest above it.
+ROWS = [1, 2, 4, 8, 16, 24, 25, 26, 32, 51, 52, 64, 128, 256, 512, 819, 820, 1024, 2048]
 HIDDEN = 5120
 
 
@@ -170,6 +177,7 @@ def main() -> None:
     )
     from vllm.distributed.parallel_state import get_tp_group
     from vllm.models.deepseek_v41.nvidia.sm80_attention import (
+        custom_all_reduce_pieces,
         custom_all_reduce_takes,
         wo_b_all_reduce,
     )
@@ -178,6 +186,7 @@ def main() -> None:
     import vllm.envs as envs
 
     switch = bool(envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE)
+    pieces_switch = bool(envs.VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE)
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -216,18 +225,30 @@ def main() -> None:
 
             bf16 = tensor_model_parallel_all_reduce(partial.clone())
             fp32 = tensor_model_parallel_all_reduce(partial.float()).to(torch.bfloat16)
-            switched = wo_b_all_reduce(partial.clone(), switch)
+            switched = wo_b_all_reduce(partial.clone(), switch, pieces_switch)
             gathered = [torch.empty_like(partial) for _ in range(world)]
             dist.all_gather(gathered, partial)
             exact = torch.stack(gathered).double().sum(0).to(torch.bfloat16)
+            if switch and custom_all_reduce_takes(partial):
+                path = "bf16"
+            elif pieces_switch and custom_all_reduce_pieces(partial) is not None:
+                path = "bf16_pieces"
+            else:
+                path = "fp32"
 
             case = {
                 "rows": rows,
                 "seed": seed,
                 "backend_bf16": _backend(comm, partial),
                 "backend_fp32": _backend(comm, partial.float()),
-                "switched_bf16": switch and custom_all_reduce_takes(partial),
+                "switched_bf16": path != "fp32",
+                "switched_path": path,
                 "switched_eq_fp32": bool(torch.equal(switched, fp32)),
+                "switched_ne_exact": int(
+                    (switched.view(torch.int16) != exact.view(torch.int16)).sum()
+                ),
+                "ulps_switched_exact": _ulps(switched, exact),
+                "ulps_fp32_exact": _ulps(fp32, exact),
                 "bf16_eq_fp32": bool(torch.equal(bf16, fp32)),
                 "bf16_ne_fp32": int((bf16.view(torch.int16) != fp32.view(torch.int16)).sum()),
                 "ulps_bf16_fp32": _ulps(bf16, fp32),
@@ -244,7 +265,7 @@ def main() -> None:
                     args.iters,
                 )
                 case["us_switched"] = _time(
-                    lambda: wo_b_all_reduce(partial, True), args.iters
+                    lambda: wo_b_all_reduce(partial, True, True), args.iters
                 )
             results.append(case)
 
@@ -257,6 +278,14 @@ def main() -> None:
     if rank == 0:
         equal = all(c["bf16_eq_fp32"] for c in results)
         switched_ok = all(c["switched_eq_fp32"] for c in results)
+        no_less_accurate = all(
+            c["switched_eq_fp32"]
+            or (
+                c["switched_ne_exact"] <= c["fp32_ne_exact"]
+                and c["ulps_switched_exact"] <= c["ulps_fp32_exact"]
+            )
+            for c in results
+        )
         for c in results:
             t = (
                 f" bf16 {c['us_bf16']:.1f} us fp32 {c['us_fp32']:.1f} us"
@@ -267,7 +296,7 @@ def main() -> None:
             print(
                 f"rows {c['rows']:5d} seed {c['seed']} "
                 f"{c['backend_bf16']:>16s}/{c['backend_fp32']:<16s} "
-                f"switched {'bf16' if c['switched_bf16'] else 'fp32'} "
+                f"switched {c['switched_path']:<11s} "
                 f"eq {c['switched_eq_fp32']!s:5s} "
                 f"bf16==fp32 {c['bf16_eq_fp32']!s:5s} ne {c['bf16_ne_fp32']:7d} "
                 f"ulps {c['ulps_bf16_fp32']:3d} | vs exact bf16 "
@@ -281,17 +310,24 @@ def main() -> None:
         print(f"VERDICT {verdict}; max ne over ranks {int(agree.max())}")
         n_bf16 = sum(c["switched_bf16"] for c in results)
         state = "EQUAL to" if switched_ok else "DIFFERS from"
+        accuracy = "" if switched_ok else (
+            "; no less accurate against FP64"
+            if no_less_accurate
+            else "; LESS ACCURATE against FP64"
+        )
         print(
             f"SWITCHED {state} the FP32 path "
-            f"(BF16 messages: {n_bf16}/{len(results)})"
+            f"(BF16 messages: {n_bf16}/{len(results)}){accuracy}"
         )
         with open(args.out, "w") as f:
             json.dump(
                 {
                     "verdict": verdict,
                     "switch": switch,
+                    "pieces_switch": pieces_switch,
                     "equal": equal,
                     "switched_equal": switched_ok,
+                    "switched_no_less_accurate": no_less_accurate,
                     "cases": results,
                 },
                 f,

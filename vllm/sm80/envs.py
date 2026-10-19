@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
+    VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
@@ -820,6 +821,24 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # FP32. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
     "VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: all-reduce a wo_b partial that is too large for
+    # the custom all-reduce to take whole (prefill and mixed steps; above 819
+    # rows of 5120 at the 8 MiB buffer) in BF16 through that same custom
+    # all-reduce, in pieces below its buffer size, when it takes every piece.
+    # Each element is summed in FP32 in a fixed order and rounded to BF16
+    # once, as on the FP32 path and in the reference's RowParallelLinear
+    # (y.float(), all_reduce, type_as). The FP32 sum of four BF16 partials is
+    # exact when their magnitudes lie within a factor 2^14 of each other, so
+    # such elements get the FP32 path's bits in any order; others can differ
+    # in the last BF16 bit where the inexact FP32 sum rounds differently in
+    # another order, as the FP32 path's own ring order already can. Half the
+    # bytes of the FP32 message. Eager steps only: never during CUDA graph
+    # capture or its warm-up. Default OFF: unset, such partials are
+    # all-reduced in FP32. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: run the decoder layers' delayed mHC (the fused
     # post + pre at every sublayer boundary and the pre-only entries) through

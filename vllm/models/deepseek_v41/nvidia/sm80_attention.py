@@ -362,6 +362,18 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 "all-reduce every wo_b partial in FP32)",
                 scope="global",
             )
+        self._wo_b_bf16_pieces = bool(
+            envs.VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE
+        )
+        if self._wo_b_bf16_pieces:
+            logger.info_once(
+                "DeepSeek-V4.1 sm_80: wo_b partials too large for the custom "
+                "all-reduce whole are all-reduced in BF16 through it in pieces "
+                "on eager steps, FP32 accumulation and one rounding per element "
+                "(VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE=1; set 0 to "
+                "all-reduce them in FP32)",
+                scope="global",
+            )
 
     # -- pieces -------------------------------------------------------------
 
@@ -583,7 +595,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         weight) on the already inverse-RoPE'd, FP8-qdq'd output, then
         ``wo_b``; with TP the ``wo_b`` partials are summed in fp32 and rounded
         once, as the reference's RowParallelLinear does (in BF16 by a kernel
-        that does exactly that, with VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE; see
+        that does exactly that, with VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE and,
+        for messages too large for it whole,
+        VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE; see
         :func:`wo_b_all_reduce`)."""
         T = attn_out.shape[0]
         o = attn_out.view(T, self.n_local_groups, -1)
@@ -598,7 +612,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         if self.gemm_rs is not None or not wo_b.reduce_results or wo_b.tp_size == 1:
             return self._wo_b_proj(z)
         partial = wo_b.quant_method.apply(wo_b, z, None)
-        return wo_b_all_reduce(partial, self._wo_b_bf16_allreduce)
+        return wo_b_all_reduce(
+            partial, self._wo_b_bf16_allreduce, self._wo_b_bf16_pieces
+        )
 
 
 # Backends the communicator tries before the custom all-reduce. When one is
@@ -644,12 +660,57 @@ def custom_all_reduce_takes(t: torch.Tensor) -> bool:
     return bool(ca.should_custom_ar(t))
 
 
-def wo_b_all_reduce(partial: torch.Tensor, bf16_when_custom: bool) -> torch.Tensor:
+def custom_all_reduce_pieces(t: torch.Tensor) -> list[torch.Tensor] | None:
+    """The pieces in which the TP group's custom all-reduce reduces ``t`` when
+    it does not take ``t`` whole: flat views of ``t`` in storage order, each
+    the largest whole number of 16-byte units below its buffer size (the last
+    one shorter), every one accepted by its own ``should_custom_ar``, with the
+    host-staged path not taking ``t`` and no backend dispatched before the
+    custom all-reduce enabled. None when it takes ``t`` whole (see
+    :func:`custom_all_reduce_takes`), declines a piece, ``t`` is not
+    contiguous, or a CUDA graph is being captured or warmed up: the pieces go
+    through the eager path's copy into the registered buffer."""
+    if t.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    comm = get_tp_group().device_communicator
+    host = getattr(comm, "hostshm_comm", None)
+    if host is not None and host.should_host_ar(t):
+        return None
+    ca = getattr(comm, "ca_comm", None)
+    if ca is None or ca.disabled or _preempting_backends(comm):
+        return None
+    if getattr(ca, "_IS_CAPTURING", False) or not t.is_contiguous():
+        return None
+    if ca.should_custom_ar(t):
+        return None
+    numel = (ca.max_size - 1) // 16 * (16 // t.element_size())
+    if numel <= 0:
+        return None
+    pieces = list(t.view(-1).split(numel))
+    if not all(ca.should_custom_ar(p) for p in pieces):
+        return None
+    return pieces
+
+
+def wo_b_all_reduce(
+    partial: torch.Tensor, bf16_when_custom: bool, bf16_in_pieces: bool
+) -> torch.Tensor:
     """Sum the ``wo_b`` partials of the TP ranks, rounding once to BF16: in
-    FP32, or with ``bf16_when_custom`` as BF16 when the custom all-reduce
-    (FP32 accumulation in a fixed order, one rounding) takes the message."""
+    FP32; with ``bf16_when_custom`` as BF16 when the custom all-reduce (FP32
+    accumulation in a fixed order, one rounding) takes the message; with
+    ``bf16_in_pieces`` as BF16 through that custom all-reduce piece by piece
+    when the message is too large for it whole but it takes the pieces
+    (:func:`custom_all_reduce_pieces`)."""
     if bf16_when_custom and custom_all_reduce_takes(partial):
         return tensor_model_parallel_all_reduce(partial)
+    if bf16_in_pieces:
+        pieces = custom_all_reduce_pieces(partial)
+        if pieces is not None:
+            ca = get_tp_group().device_communicator.ca_comm
+            out = torch.empty_like(partial)
+            for piece, dst in zip(pieces, out.view(-1).split(pieces[0].numel())):
+                ca.all_reduce(piece, out=dst)
+            return out
     return tensor_model_parallel_all_reduce(partial.float()).to(partial.dtype)
 
 def _in_full_graph() -> bool:
