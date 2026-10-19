@@ -13,7 +13,7 @@ exception: one hop, one rounding.
 
 What it does
 ------------
-The same bytes on the wire as the ring, one rounding:
+The same payload bytes and collectives as the ring, with one rounding:
 
   1. reduce-scatter as one grouped set of NCCL send/recv: the flat message is
      cut into N equal chunks (the last one zero-padded) and rank r receives
@@ -21,15 +21,19 @@ The same bytes on the wire as the ring, one rounding:
   2. rank r sums its N chunks in FP64 in rank order and rounds the sum once to
      the message dtype (round to odd into FP32, then round to nearest even:
      a correct rounding of the FP64 sum);
-  3. all-gather of the rounded chunks (NCCL), in the message dtype.
+  3. all-gather of the rounded chunks (NCCL), in the message dtype;
+     unsupported elements carry a NaN poison flag in that same payload.
 
 Exactness: the FP64 sum of N BF16 (FP16) values is exact while their nonzero
 magnitudes lie within a factor 2^(45 - ceil(log2 N)) (2^(42 - ceil(log2 N)))
-of each other. Outside that span a small summand can be lost (for example,
-BF16 [1, 2**-60, -1, 0] sums to zero in this order). The result is always the
-rank-ordered FP64 sum rounded once, deterministic and independent of message
-splitting, not independent of rank order or TP size. Messages of other dtypes
-are not taken.
+of each other. Each owner checks this bound per element, ignoring zero
+summands. Nonfinite inputs and spans outside the bound set the same sticky
+device error on every rank after the existing result all-gather. Serving
+raises ValueError at the existing output-copy completion event on every
+rank, before publishing tokens; no additional collective, host sync or
+device trap is used. CPU transports refuse directly after the data gather.
+A small summand could otherwise be lost (BF16 [1, 2**-60, -1, 0], for
+example). Messages of other dtypes are not taken.
 
 Used only outside CUDA graph capture (the call sites ask for it on eager
 prefill steps), with the TP group's PyNccl communicator. Model call sites opt
@@ -76,12 +80,15 @@ def round_once_all_reduce_with(
 ) -> torch.Tensor:
     """The round-once all-reduce of ``t`` over ``world`` ranks with the given
     transports (NCCL in serving, gloo in the CPU tests). Returns a new tensor
-    like ``t``; ``t`` is not modified."""
+    like ``t``; ``t`` is not modified. CUDA callers must consume the deferred
+    error via ``step_errors`` at their existing host-copy completion boundary."""
     if t.dtype not in ROUND_ONCE_DTYPES:
         raise TypeError(f"round-once all-reduce of {t.dtype}")
     flat = t.reshape(-1)
     numel = flat.numel()
     chunk = -(-numel // world)
+    if chunk == 0:
+        return t.clone()
     if chunk * world != numel:
         padded = torch.zeros(chunk * world, dtype=t.dtype, device=t.device)
         padded[:numel] = flat
@@ -92,22 +99,42 @@ def round_once_all_reduce_with(
     recvs[rank].copy_(sends[rank])
     if world > 1:
         exchange(sends, recvs)
-    acc = recv[0].double()
-    for j in range(1, world):
-        acc += recv[j].double()
-    mine = round_from_fp64(acc, t.dtype)
+    if t.is_cuda:
+        from .round_once_kernels import reduce_scattered
+        mine = reduce_scattered(recv)
+    else:
+        acc = recv[0].double()
+        largest = acc.abs()
+        smallest = torch.where(largest == 0, float("inf"), largest)
+        for j in range(1, world):
+            part = recv[j].double()
+            acc += part
+            magnitude = part.abs_()
+            torch.maximum(largest, magnitude, out=largest)
+            magnitude.masked_fill_(magnitude == 0, float("inf"))
+            torch.minimum(smallest, magnitude, out=smallest)
+        span_bits = (45 if t.dtype == torch.bfloat16 else 42) - (world - 1).bit_length()
+        invalid = ~torch.isfinite(largest) | (largest > smallest * 2.0**span_bits)
+        mine = torch.where(invalid, float("nan"), round_from_fp64(acc, t.dtype))
     gathered = torch.empty(chunk * world, dtype=t.dtype, device=t.device)
     if world > 1:
         all_gather(gathered, mine)
     else:
         gathered.copy_(mine)
+    if t.is_cuda:
+        from .round_once_kernels import record_error
+        from .step_errors import error_buffer
+        record_error(gathered, error_buffer(t.device))
+    elif bool(torch.isnan(gathered).any()):
+        raise ValueError("round-once all-reduce requires a finite exponent span on all ranks")
     return gathered[:numel].view(t.shape)
 
 
 def nccl_round_once_all_reduce(t: torch.Tensor, pynccl) -> torch.Tensor:
     """:func:`round_once_all_reduce_with` over a vLLM ``PyNcclCommunicator``
-    on the current stream: one NCCL group of sends and receives, then NCCL's
-    all-gather."""
+    on the current stream: one NCCL group of sends and receives and one
+    output all-gather. Device validation is deferred to the existing
+    output-copy boundary; it does not synchronize or add a collective."""
     rank, world = pynccl.rank, pynccl.world_size
     stream = torch.cuda.current_stream()
 

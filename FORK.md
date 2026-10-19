@@ -126,7 +126,9 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/distributed/round_once_all_reduce.py` | 144 |
+| `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
+| `vllm/sm80/distributed/round_once_kernels.py` | 71 |
+| `vllm/sm80/distributed/step_errors.py` | 155 |
 | `vllm/sm80/envs.py` | 1,246 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
@@ -159,7 +161,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **41 files** | **10,609** |
+| **43 files** | **10,862** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -330,6 +332,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/__init__.py` | 0 |
 | `tests/models/deepseek_v41/sm80/__init__.py` | 0 |
 | `tests/models/deepseek_v41/sm80/construct.py` | 209 |
+| `tests/models/deepseek_v41/sm80/dspark_draft_identity.py` | 201 |
 | `tests/models/deepseek_v41/sm80/dsv41_ref.py` | 764 |
 | `tests/models/deepseek_v41/sm80/exl3_fixture.py` | 284 |
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
@@ -339,6 +342,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
 | `tests/models/deepseek_v41/sm80/test_boot_warmup.py` | 337 |
+| `tests/models/deepseek_v41/sm80/test_dspark_draft_identity.py` | 66 |
+| `tests/models/deepseek_v41/sm80/test_dspark_draft_identity_gpu.py` | 34 |
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax.py` | 397 |
 | `tests/models/deepseek_v41/sm80/test_engram_early_gather.py` | 178 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,171 |
@@ -357,8 +362,9 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
 | `tests/models/deepseek_v41/sm80/test_sm80_moe_allreduce.py` | 197 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
-| `tests/models/deepseek_v41/sm80/test_wo_b_allreduce_bits_gpu.py` | 116 |
-| `tests/models/deepseek_v41/sm80/wo_b_allreduce_bits.py` | 341 |
+| `tests/models/deepseek_v41/sm80/test_wo_b_allreduce_bits_gpu.py` | 120 |
+| `tests/models/deepseek_v41/sm80/test_wo_b_bits_verdict.py` | 84 |
+| `tests/models/deepseek_v41/sm80/wo_b_allreduce_bits.py` | 364 |
 | `tests/models/fixtures/native_checkpoint_configs/glm53_dflash2/config.json` | 61 |
 | `tests/models/fixtures/native_checkpoint_configs/glm53_flash/config.json` | 2,636 |
 | `tests/models/fixtures/native_checkpoint_configs/provenance.json` | 19 |
@@ -385,7 +391,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/test_native_checkpoint_wrapper_meta.py` | 256 |
 | `tests/parser/engine/test_glm47_tool_choice_none.py` | 265 |
 | `tests/plugins_tests/conftest.py` | 17 |
-| `tests/sm80/round_once_allreduce_bits.py` | 159 |
+| `tests/sm80/round_once_allreduce_bits.py` | 207 |
+| `tests/sm80/round_once_unchecked.py` | 46 |
 | `tests/sm80/seams.yaml` | 1,323 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
 | `tests/sm80/test_exl3_platform_verification.py` | 65 |
@@ -405,9 +412,13 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_plugin_guard.py` | 299 |
 | `tests/sm80/test_registrations.py` | 139 |
 | `tests/sm80/test_round_once_all_reduce.py` | 203 |
-| `tests/sm80/test_round_once_all_reduce_gpu.py` | 67 |
+| `tests/sm80/test_round_once_all_reduce_gpu.py` | 86 |
+| `tests/sm80/test_round_once_kernels.py` | 88 |
+| `tests/sm80/test_round_once_span.py` | 102 |
 | `tests/sm80/test_seams.py` | 57 |
 | `tests/sm80/test_setup_envs_load.py` | 79 |
+| `tests/sm80/test_step_error_copy.py` | 66 |
+| `tests/sm80/test_step_error_dispatch.py` | 68 |
 | `tests/sm80/test_triton_mla_sparse_block_stride.py` | 151 |
 | `tests/sm80/update_seams.py` | 173 |
 | `tests/test_retired_env_vars.py` | 159 |
@@ -437,7 +448,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **183 files** | **89,976** |
+| **192 files** | **90,825** |
 
 #### `tools/`
 
@@ -511,9 +522,10 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/core/kv_cache_planning.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/core/kv_cache_utils.py` | modified | 13 | 19 | 6 |
 | `vllm/v1/core/sched/scheduler.py` | modified | 429 | 15 | 45 |
+| `vllm/v1/executor/multiproc_executor.py` | modified | 2 | 2 | 2 |
 | `vllm/v1/kv_cache_interface.py` | modified | 70 | 1 | 5 |
 | `vllm/v1/outputs.py` | modified | 6 | 0 | 2 |
-| `vllm/v1/worker/gpu/async_utils.py` | modified | 21 | 0 | 6 |
+| `vllm/v1/worker/gpu/async_utils.py` | modified | 25 | 0 | 7 |
 | `vllm/v1/worker/gpu/block_table.py` | modified | 11 | 3 | 4 |
 | `vllm/v1/worker/gpu/cudagraph_utils.py` | modified | 131 | 9 | 12 |
 | `vllm/v1/worker/gpu/model_runner.py` | modified | 203 | 13 | 32 |
@@ -527,8 +539,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
+| `vllm/v1/worker/gpu_model_runner.py` | modified | 6 | 0 | 2 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **72 files** | | **3,568** | **248** | **499** |
+| **74 files** | | **3,580** | **250** | **504** |
 
 ### Tests, docs and .github
 
@@ -562,9 +575,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 72 | 3,568 | 248 | 499 |
+| Product code | 74 | 3,580 | 250 | 504 |
 | Tests, docs and .github | 22 | 572 | 550 | 78 |
-| All | 94 | 4,140 | 798 | 577 |
+| All | 96 | 4,152 | 800 | 582 |
 
 ## 3. Fork environment variables
 
@@ -696,12 +709,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 152 |
-| Fork-added product lines | 47,234 |
-| Patched upstream files | 94 |
-| Patched upstream lines | +4,140 / -798 |
-| Patched upstream product files | 72 |
-| Patched upstream product lines | +3,568 / -248 |
-| Product lines added (new files and patches) | 50,802 |
+| Fork-added product files | 154 |
+| Fork-added product lines | 47,487 |
+| Patched upstream files | 96 |
+| Patched upstream lines | +4,152 / -800 |
+| Patched upstream product files | 74 |
+| Patched upstream product lines | +3,580 / -250 |
+| Product lines added (new files and patches) | 51,067 |
 | Fork environment variables (flags) | 104 |
 | Unreferenced fork definitions | 2 (23 lines) |

@@ -33,6 +33,8 @@ import statistics
 import torch
 import torch.distributed as dist
 
+from vllm.sm80.distributed.step_errors import copy_error_flags
+
 ROWS = [1, 7, 819, 820, 1024, 2047, 2048]
 HIDDEN = [5120, 4096]
 
@@ -45,8 +47,11 @@ def _time(fn, iters: int) -> float:
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         fn()
+        errors = copy_error_flags()
         end.record()
         torch.cuda.synchronize()
+        if errors is not None:
+            errors.raise_if_failed()
         times.append(start.elapsed_time(end) * 1000.0)
     return statistics.median(times)
 
@@ -56,6 +61,7 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--seeds", type=int, default=2)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--invalid", choices=("span", "nonfinite"))
     args = parser.parse_args()
 
     from tests.sm80.test_round_once_all_reduce import exact_sum, reference_round
@@ -88,6 +94,33 @@ def main() -> None:
     comm = get_tp_group().device_communicator
     pynccl = comm.pynccl_comm
     dev = torch.device("cuda", local_rank)
+    if args.invalid:
+        from types import SimpleNamespace
+        from vllm.v1.worker.gpu.async_utils import AsyncOutput
+        partial = torch.zeros((4, 8), dtype=torch.bfloat16, device=dev)
+        values = [1.0, 2.0**-60 if args.invalid == "span" else float("inf"), -1.0, 0.0]
+        partial.flatten()[16] = values[rank]
+        nccl_round_once_all_reduce(partial, pynccl)
+        sampler = SimpleNamespace(sampled_token_ids=torch.ones((1, 1), dtype=torch.int64, device=dev),
+                                  logprobs_tensors=None, num_nans=None, sampling_mask_tensors=None)
+        output = SimpleNamespace(prompt_logprobs_dict={}, prompt_token_id_logprobs_dict={})
+        pending = AsyncOutput(output, sampler, torch.ones(1, dtype=torch.int32, device=dev),
+                              torch.cuda.current_stream(), torch.cuda.Stream(), False, None)
+        refused = False
+        try:
+            pending.get_output()
+        except ValueError as error:
+            refused = "finite exponent span" in str(error)
+        healthy = torch.ones(1, device=dev).sum().item() == 1
+        records = [None] * world
+        dist.all_gather_object(records, dict(rank=rank, refused=refused, cuda_context_healthy=healthy))
+        if rank == 0:
+            with open(args.out, "w") as file:
+                json.dump(dict(invalid=args.invalid, records=records), file, indent=1)
+        dist.barrier()
+        dist.destroy_process_group()
+        return
+    from tests.sm80.round_once_unchecked import make_unchecked_control
     results = []
     for hidden in HIDDEN:
         for rows in ROWS:
@@ -101,15 +134,21 @@ def main() -> None:
                 partial = (
                     torch.randn(rows, hidden, generator=g, device=dev) * scale
                 ).to(torch.bfloat16)
+                partial[0, 0] = (1.0, 2.0**-8, 2.0**-30, 0.0)[rank]
+                partial[0, 1] = 2.0**-133
+                partial[0, 2] = -2.0**-133
+                partial[0, 3] = (1.0, 2.0**-43, -1.0, 0.0)[rank]
                 assert grouped_round_once_takes(partial, comm)
                 grouped = nccl_round_once_all_reduce(partial, pynccl)
+                errors = copy_error_flags(dev)
                 ring = pynccl.all_reduce(partial)
                 gathered = [torch.empty_like(partial) for _ in range(world)]
                 dist.all_gather(gathered, partial)
                 exact = reference_round(exact_sum(torch.stack(gathered)), torch.bfloat16)
                 bits = grouped.view(torch.int16)
-                same = [torch.empty_like(bits) for _ in range(world)]
-                dist.all_gather(same, bits.contiguous())
+                wire_bits = grouped.view(torch.uint8)
+                same = [torch.empty_like(wire_bits) for _ in range(world)]
+                dist.all_gather(same, wire_bits)
                 case = {
                     "rows": rows,
                     "hidden": hidden,
@@ -121,16 +160,25 @@ def main() -> None:
                     "ranks_agree": all(torch.equal(s, same[0]) for s in same),
                     "elements": rows * hidden,
                 }
+                if errors is not None:
+                    errors.raise_if_failed()
                 if seed == 0:
+                    unchecked = make_unchecked_control(partial, pynccl)
+                    assert torch.equal(unchecked().view(torch.int16), bits)
+                    case["us_grouped_unchecked"] = _time(unchecked, args.iters)
                     pf = partial.float()
                     case["us_grouped"] = _time(
                         lambda: nccl_round_once_all_reduce(partial, pynccl), args.iters
                     )
+                    case["us_validation_overhead"] = case["us_grouped"] - case["us_grouped_unchecked"]
                     case["us_ring_bf16"] = _time(
                         lambda: pynccl.all_reduce(partial), args.iters
                     )
                     case["us_ring_fp32"] = _time(lambda: pynccl.all_reduce(pf), args.iters)
                 results.append(case)
+    all_results = [None] * world
+    dist.all_gather_object(all_results, results)
+    results = [dict(case, rank=r) for r, cases in enumerate(all_results) for case in cases]
     if rank == 0:
         equal = all(c["grouped_ne_exact"] == 0 and c["ranks_agree"] for c in results)
         for c in results:

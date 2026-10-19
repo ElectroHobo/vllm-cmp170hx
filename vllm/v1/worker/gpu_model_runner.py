@@ -107,6 +107,7 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
+from vllm.sm80.distributed.step_errors import install_output_checks
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
@@ -7253,3 +7254,8 @@ class GPUModelRunner(
                     stats = self.encoder_timing_registry[req_id]
                     stats.encoder_forward_secs += per_request_time
                     stats.num_encoder_calls += 1
+
+
+install_output_checks(
+    AsyncGPUModelRunnerOutput, AsyncGPUPoolingModelRunnerOutput, sync_runner=GPUModelRunner
+)

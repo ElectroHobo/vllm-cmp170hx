@@ -86,7 +86,10 @@ def test_wo_b_bf16_allreduce_bits_tp4(tmp_path, pieces):
     assert data["pieces_switch"] is pieces, f"the run saw {PIECES_SWITCH} wrong"
     cases = data["cases"]
     assert sorted({c["rows"] for c in cases}) == sorted(bits.ROWS)
-    assert len(cases) == len(bits.ROWS) * SEEDS
+    assert data["world"] == 4
+    assert {c["rank"] for c in cases} == set(range(4))
+    assert len(cases) == 4 * len(bits.ROWS) * SEEDS
+    assert data["switched_ranks_agree"] is True
 
     seen = {c["backend_bf16"] for c in cases}
     unknown = seen - set(BF16_BACKENDS) - set(FP32_BACKENDS)
@@ -95,7 +98,8 @@ def test_wo_b_bf16_allreduce_bits_tp4(tmp_path, pieces):
     assert not missing, f"no row count reached {sorted(missing)}:\n{log}"
 
     for c in cases:
-        where = f"rows {c['rows']} seed {c['seed']} ({c['backend_bf16']})"
+        where = f"rank {c['rank']} rows {c['rows']} seed {c['seed']} ({c['backend_bf16']})"
+        assert c["switched_ranks_agree"], f"{where}: switched bits differ across ranks"
         if c["backend_bf16"] in BF16_BACKENDS:
             assert c["switched_path"] == "bf16", f"{where}: the switch kept FP32"
         elif pieces:
