@@ -719,6 +719,21 @@ def test_hybrid_explicit_draft_phase_during_prefill(monkeypatch, tmp_path):
         c.begin("hybrid", "hybrid_linear", "head", 1, point_phase="invented")
 
 
+def test_hybrid_fp32_router_is_not_a_changed_projection(monkeypatch):
+    import re
+    from types import SimpleNamespace
+    from vllm.models.deepseek_v41.nvidia import hybrid_capture as h
+
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.ones(32, 32, dtype=torch.float32), requires_grad=False)
+    model._hybrid_capture_sources = [("layers.0.ffn.gate", [32, 32])]
+    model.prefix = "layers.0.ffn.gate"
+    monkeypatch.setattr(h.capture, "config", lambda: SimpleNamespace(
+        match=re.compile(".*"), prefill_match=re.compile(".*")))
+    h.register_model(model)
+    assert not hasattr(model, "_hybrid_capture")
+
+
 # ---------------------------------------------------------------- GPU
 
 

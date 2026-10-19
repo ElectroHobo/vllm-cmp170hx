@@ -137,6 +137,9 @@ def register_model(model):
         if not (cfg.match.search(prefix) or cfg.prefill_match.search(prefix)):
             continue
         weight = module.weight
+        # The retained FP32 router is a consumer, not a changed hybrid GEMM.
+        if weight.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            continue
         scale = getattr(module, "weight_scale", None)
         indices = getattr(module, "shard_indices", None)
         module._hybrid_capture = {
