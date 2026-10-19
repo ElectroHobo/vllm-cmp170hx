@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_EXL3_OVERRIDE: str = ""
     VLLM_EXL3_OVERRIDE_SHA256: str = ""
+    VLLM_EXL3_HYBRID: bool = False
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
@@ -799,6 +800,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_OVERRIDE_SHA256": lambda: os.getenv(
         "VLLM_EXL3_OVERRIDE_SHA256", ""
     ),
+    # Load an EXL3 checkpoint whose quantization_config routes module classes
+    # to EXL3, unquantized or a second registered method (module_quantization,
+    # non_routed_quantization; vllm/sm80/kernels/exl3/hybrid.py), its tensors
+    # selected by its index. Unset: such a config is refused; EXL3
+    # checkpoints without those keys load as before either way.
+    "VLLM_EXL3_HYBRID": lambda: bool(int(os.getenv("VLLM_EXL3_HYBRID", "0"))),
     # Order Qwen QSA's native-selected blocks before expansion/attention.
     # Set 0 to retain native traversal order without changing selection.
     "VLLM_QWEN_QSA_TOPK_SORTED": lambda: bool(

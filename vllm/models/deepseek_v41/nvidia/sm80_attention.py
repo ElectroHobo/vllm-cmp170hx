@@ -47,6 +47,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.models.deepseek_v41.attention import (
     DeepseekV4Attention,
@@ -62,6 +63,7 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.sm80.kernels.exl3.quant import set_output_dtype
 from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len, prefill_step
+from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -290,9 +292,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             )
         config = vllm_config.model_config.hf_config
         if self.compressor is not None:
-            # The compressor projection is quantized in the checkpoint, so it
-            # takes the model's quantization config (upstream builds it
-            # unquantized for its fp32 GEMM).
+            # The compressor projection takes the model's quantization config
+            # (an EXL3 checkpoint quantizes it; upstream builds it unquantized
+            # for its fp32 GEMM).
             c = self.compressor
             c.fused_wkv_wgate = MergedColumnParallelLinear(
                 c.hidden_size,
@@ -306,9 +308,18 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             if c.has_gate:
                 # Above ratio 1 the reference projects in FP32 for its FP32
                 # softmax pooling (wkv and wgate are FP32 linears applied to
-                # x.float(), exactly the BF16 x): the EXL3 linear returns its
-                # FP32 result unrounded. Ratio 1 stays BF16, as there.
+                # x.float(), exactly the BF16 x): the EXL3 or BF16 linear
+                # returns its FP32 result unrounded. Ratio 1 stays BF16, as
+                # there.
                 set_output_dtype(c.fused_wkv_wgate, torch.float32)
+        wo_a_method = self.wo_a.quant_method
+        if getattr(wo_a_method, "apply_grouped", None) is None and not isinstance(
+            wo_a_method, UnquantizedLinearMethod
+        ):
+            # A quantized dense wo_a (an FP8 one in a hybrid checkpoint) runs
+            # its groups as separate GEMMs of its own method (no batched
+            # kernel on sm_80; _o_proj calls apply_grouped).
+            GroupedLinearMethod.adopt(self.wo_a, self.n_local_groups)
         tp_size = self.n_heads // self.n_local_heads
         index_n_heads = getattr(config, "index_n_heads", 0)
         cand_source = self.candidate_source_layer

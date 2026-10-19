@@ -19,6 +19,9 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -30,6 +33,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.sm80.kernels.exl3.hybrid import (
+    EXL3,
+    UNQUANTIZED,
+    HybridSpec,
+    check_plain_sources,
+    parse_hybrid,
+)
 from vllm.sm80.kernels.exl3.layout import Exl3Layout, exl3_layout
 from vllm.sm80.kernels.exl3.override import apply_override
 from vllm.sm80.kernels.exl3.utils import (
@@ -91,6 +101,11 @@ class Exl3Config(QuantizationConfig):
     Upstream model code consults the attributes and methods below through
     getattr, so they apply only to this config. The checkpoint's model family
     adds those its own model code reads (Exl3Layout.config_hooks).
+
+    A hybrid checkpoint (vllm/sm80/kernels/exl3/hybrid.py) routes each module
+    to EXL3, unquantized or its second method by the config's rules; the
+    config then also answers ``weight_block_size`` with the second method's,
+    which model code reads to name and pad that method's scales.
     """
 
     min_transform_size = 128
@@ -98,13 +113,18 @@ class Exl3Config(QuantizationConfig):
     # transform blocks.
     shared_expert_shard_group_size = min_transform_size
 
-    def __init__(self):
+    def __init__(self, hybrid: HybridSpec | None = None):
         super().__init__()
         self.manifest: Exl3Manifest | None = None
         self.mapped_prefixes: dict[str, str] = {}
         # The checkpoint's model family (vllm/sm80/kernels/exl3/layout.py),
         # chosen from the HF config by maybe_update_config.
         self.layout = Exl3Layout()
+        self.hybrid = hybrid
+        if hybrid is not None:
+            block = getattr(hybrid.secondary, "weight_block_size", None)
+            if block is not None:
+                self.weight_block_size = block
 
     @classmethod
     def get_name(cls) -> Literal["exl3"]:
@@ -140,13 +160,15 @@ class Exl3Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Exl3Config":
-        return cls()
+        return cls(parse_hybrid(config))
 
     def maybe_update_config(self, model_name, hf_config=None, revision=None):
         if not Path(model_name).is_dir():
             raise ValueError("Download the EXL3 safetensors checkpoint before loading")
         self.layout = exl3_layout(hf_config)
-        self.manifest = Exl3Manifest(model_name)
+        self.manifest = Exl3Manifest(
+            model_name, select_by_index=self.hybrid is not None
+        )
         if envs.VLLM_EXL3_OVERRIDE:
             apply_override(
                 self.manifest, envs.VLLM_EXL3_OVERRIDE, envs.VLLM_EXL3_OVERRIDE_SHA256
@@ -166,6 +188,8 @@ class Exl3Config(QuantizationConfig):
                 raise ValueError(f"Conflicting EXL3 module mapping: {mapped}")
             mapped_prefixes[mapped] = source
         self.mapped_prefixes = mapped_prefixes
+        if self.hybrid is not None:
+            self.hybrid.secondary.apply_vllm_mapper(hf_to_vllm_mapper)
 
     def __getattr__(self, name: str):
         """The layout hooks the model family's own code looks up with getattr
@@ -196,20 +220,38 @@ class Exl3Config(QuantizationConfig):
         source = self.source_prefix(prefix)
         if source in self.manifest.matrices:
             return [self.manifest.matrices[source]]
-        parent, _, leaf = source.rpartition(".")
-        members = self.layout.members(self, leaf, source, outputs)
-        if members is None:
-            members = self.packed_modules_mapping.get(leaf, [leaf])
-        names = [
-            self.source_prefix(f"{parent}.{member}" if parent else member)
-            for member in members
-        ]
+        names = self._member_names(source, outputs)
         found = [
             self.manifest.matrices[n] for n in names if n in self.manifest.matrices
         ]
         if found and len(found) != len(names):
             raise ValueError(f"Mixed plain/packed EXL3 fused projection: {prefix}")
         return found
+
+    def _member_names(self, source: str, outputs: int) -> list[str]:
+        """Checkpoint module names of the members of the fused projection
+        ``source`` with ``outputs`` logical outputs."""
+        parent, _, leaf = source.rpartition(".")
+        members = self.layout.members(self, leaf, source, outputs)
+        if members is None:
+            members = self.packed_modules_mapping.get(leaf, [leaf])
+        return [
+            self.source_prefix(f"{parent}.{member}" if parent else member)
+            for member in members
+        ]
+
+    def _module_sources(self, prefix: str, outputs: int) -> list[str]:
+        """Checkpoint module names a linear module loads from: itself when
+        the checkpoint holds it whole, else its fused members."""
+        assert self.manifest is not None
+        source = self.source_prefix(prefix)
+        if (
+            source in self.manifest.matrices
+            or f"{source}.weight" in self.manifest.tensors
+            or self.layout.grouped_members(self, source)
+        ):
+            return [source]
+        return self._member_names(source, outputs)
 
     def grouped_constituents(self, prefix: str) -> list[PackedMatrix]:
         """Per-group matrices of a block-diagonal projection stored as one
@@ -226,6 +268,43 @@ class Exl3Config(QuantizationConfig):
 
         _verify_launch_options(get_current_vllm_config_or_none())
         _require_sm80()
+        if self.hybrid is not None:
+            return self._hybrid_quant_method(layer, prefix)
+        return self._exl3_quant_method(layer, prefix)
+
+    def _hybrid_quant_method(self, layer: nn.Module, prefix: str):
+        """The method the hybrid rules give the module (hybrid.py)."""
+        assert self.hybrid is not None and self.manifest is not None
+        if isinstance(layer, RoutedExperts):
+            sources = [self.source_prefix(prefix)]
+        elif isinstance(layer, (LinearBase, ParallelLMHead)):
+            outputs = len(getattr(layer, "output_sizes", ()))
+            sources = self._module_sources(prefix, outputs)
+        else:
+            return None
+        method = self.hybrid.method_for(sources)
+        if method == EXL3:
+            quant_method = self._exl3_quant_method(layer, prefix)
+            if quant_method is None or isinstance(
+                quant_method, UnquantizedLinearMethod
+            ):
+                raise ValueError(
+                    f"{prefix} takes exl3; {sources} hold no EXL3 matrices"
+                )
+            return quant_method
+        if not isinstance(layer, RoutedExperts):
+            check_plain_sources(self.manifest, sources, method)
+        if method == UNQUANTIZED:
+            if isinstance(layer, RoutedExperts):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            return None
+        secondary = self.hybrid.secondary
+        secondary.packed_modules_mapping = self.packed_modules_mapping
+        return secondary.get_quant_method(layer, prefix)
+
+    def _exl3_quant_method(self, layer: nn.Module, prefix: str):
         if isinstance(layer, RoutedExperts):
             return Exl3MoEMethod(self, prefix, layer.moe_config)
         if isinstance(layer, (LinearBase, ParallelLMHead)):
@@ -559,17 +638,39 @@ def _linear_out_dtype(dtype: torch.dtype) -> torch.dtype:
     return dtype
 
 
+class OutDtypeLinearMethod(UnquantizedLinearMethod):
+    """An unquantized linear that returns its FP32-accumulated product in
+    ``out_dtype``: FP32 keeps the sum of the exact BF16 products unrounded,
+    as an FP32 linear of the same BF16 input and weight computes it."""
+
+    def __init__(self, out_dtype: torch.dtype):
+        super().__init__()
+        self.out_dtype = out_dtype
+
+    def apply(self, layer, x, bias=None):
+        shape = x.shape
+        output = torch.mm(
+            x.reshape(-1, shape[-1]), layer.weight.t(), out_dtype=self.out_dtype
+        )
+        if bias is not None:
+            output = output + bias.to(self.out_dtype)
+        return output.reshape(*shape[:-1], output.shape[-1])
+
+
 def set_output_dtype(layer: nn.Module, dtype: torch.dtype) -> None:
-    """Have the EXL3 linear ``layer`` return ``dtype`` (BF16 or FP32). The
-    kernels accumulate in FP32 either way; FP32 stores that result instead of
-    rounding it to BF16."""
+    """Have the EXL3 or unquantized linear ``layer`` return ``dtype`` (BF16
+    or FP32). Both accumulate in FP32; FP32 stores that result instead of
+    rounding it to BF16 (an unquantized layer takes OutDtypeLinearMethod)."""
     method = getattr(layer, "quant_method", None)
-    if not isinstance(method, Exl3LinearMethod):
+    if isinstance(method, Exl3LinearMethod):
+        method.out_dtype = _linear_out_dtype(dtype)
+    elif type(method) in (UnquantizedLinearMethod, OutDtypeLinearMethod):
+        layer.quant_method = OutDtypeLinearMethod(_linear_out_dtype(dtype))
+    else:
         raise TypeError(
-            f"{type(layer).__name__} has no EXL3 linear method "
+            f"{type(layer).__name__} has no EXL3 or unquantized linear method "
             f"({type(method).__name__}) to set an output dtype on"
         )
-    method.out_dtype = _linear_out_dtype(dtype)
 
 
 class Exl3HeadLogitsProcessor(LogitsProcessor):
