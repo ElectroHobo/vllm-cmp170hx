@@ -4,7 +4,8 @@
 
 Off by default: with the directory unset ``active`` is False, nothing is
 patched and no capture point does any work. With it set, the capture points
-(the dense EXL3 linear, the EXL3 routed experts, model attention layers)
+(the dense EXL3 linear, the EXL3 routed experts, model attention layers,
+model mHC ops)
 hand selected calls to :func:`begin`; the returned :class:`Record` keeps
 copies of the call's arguments and outputs, and every kept call becomes one
 file
@@ -28,7 +29,7 @@ graph is the served one plus these copies; nothing it computes changes.
 Reading back waits for the stream: diagnostic boots only.
 
 Selection (vllm.sm80.envs):
-- VLLM_SM80_CAPTURE_FAMILIES: the families recorded (dense, moe, attn).
+- VLLM_SM80_CAPTURE_FAMILIES: the families recorded (dense, moe, attn, mhc).
 - VLLM_SM80_CAPTURE_MATCH: a regex searched in the call's prefix (the
   checkpoint prefix for dense matrices, the module prefix otherwise) for
   every call outside prefill steps.
@@ -81,7 +82,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 SCHEMA = "lab-point-capture/1"
-FAMILIES = ("dense", "moe", "attn")
+FAMILIES = ("dense", "moe", "attn", "mhc")
 # Context, in tokens, from which a step's records count as long-context ones.
 LONG_CONTEXT = 4096
 

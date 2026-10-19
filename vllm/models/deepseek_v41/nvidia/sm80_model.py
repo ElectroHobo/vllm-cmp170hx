@@ -50,6 +50,7 @@ from vllm.models.deepseek_v41.nvidia import dspark as upstream_dspark
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
+from vllm.sm80 import capture
 from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
 from vllm.models.deepseek_v41.nvidia.sm80_moe import adopt_moe
 from vllm.sm80.kernels.exl3.quant import Exl3HeadLogitsProcessor
@@ -103,6 +104,8 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
         layer.__class__ = cls
         adopt_moe(layer.ffn, config)
         layer._mhc_ops = mhc_ops(config)
+        if capture.active:
+            layer._mhc_ops = _CapturedMhc(layer._mhc_ops, layer)
 
     def _mixes(self, attn: bool) -> tuple:
         if attn:
@@ -221,6 +224,57 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
             norm_eps=self.attn_norm.variance_epsilon,
         )
         self.attn.forward_kv(positions, x)
+
+
+class _CapturedMhc:
+    """The layer's mHC ops with ``mhc_fused_post_pre_delayed`` recorded by
+    the kernel call capture (vllm/sm80/capture.py, family ``mhc``, point
+    ``mhc_delayed``): the call's arguments by parameter name and its outputs
+    (out_residual, out_post, out_comb, out_layer_input, out_pre). The prefix
+    is the layer's, then ``hc_attn`` (the call before attention) or
+    ``hc_ffn`` (before the FFN)."""
+
+    def __init__(self, ops, layer):
+        self._ops = ops
+        self._layer = layer
+        self._base = layer.attn.prefix.removesuffix(".attn")
+
+    def __getattr__(self, name):
+        return getattr(self._ops, name)
+
+    def mhc_fused_post_pre_delayed(
+        self, x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+        pre_mix=None, norm_weight=None, norm_eps=1e-6, capture_aux=False,
+    ):
+        which = "hc_attn" if fn is self._layer.hc_attn_fn else "hc_ffn"
+        record = capture.begin(
+            "mhc", "mhc_delayed", f"{self._base}.{which}", x.shape[0]
+        )
+        if record is not None:
+            record.put(
+                x=x, residual=residual, post_layer_mix=post_layer_mix,
+                comb_res_mix=comb_res_mix, fn=fn, hc_scale=hc_scale,
+                hc_base=hc_base, rms_eps=float(rms_eps),
+                hc_pre_eps=float(hc_pre_eps),
+                hc_sinkhorn_eps=float(hc_sinkhorn_eps),
+                hc_post_mult_value=float(hc_post_mult_value),
+                sinkhorn_repeat=int(sinkhorn_repeat), pre_mix=pre_mix,
+                norm_weight=norm_weight, norm_eps=float(norm_eps),
+            )
+        out = self._ops.mhc_fused_post_pre_delayed(
+            x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+            sinkhorn_repeat, pre_mix=pre_mix, norm_weight=norm_weight,
+            norm_eps=norm_eps, capture_aux=capture_aux,
+        )
+        if record is not None:
+            streams, post, comb, layer_input, pre, _ = out
+            record.put(
+                out_residual=streams, out_post=post, out_comb=comb,
+                out_layer_input=layer_input, out_pre=pre,
+            ).done()
+        return out
 
 
 def _adopt_layers(layers, config) -> None:
