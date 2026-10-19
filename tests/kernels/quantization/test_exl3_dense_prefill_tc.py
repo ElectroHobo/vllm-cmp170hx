@@ -28,7 +28,9 @@ inside the call); ensure_extension with the switch set at TP2 opens the gate
 and warms up once.
 """
 
+import json
 import logging
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -658,6 +660,51 @@ def test_prefill_holds_linear_outs_error_against_fp64(
             _run(tc.linear_out_prefill, m, x, bits_x2, logical_out), cand, "repeat"
         )
         inc = _run(exl3_ops.linear_out, m, x, bits_x2, logical_out)
+        pool.add(cand, inc, x.double() @ weight)
+    pool.check(f"{padded_in}x{padded_out} bits_x2={bits_x2} rows {rows}")
+
+
+def _input_shapes():
+    # The lab's shape-gate V2 (tools session.py plan shapes): a shape-gate-shapes/1
+    # file, pinned input LAB_INPUT_SHAPES.
+    path = os.environ.get("LAB_INPUT_SHAPES")
+    if not path:
+        return [
+            pytest.param(
+                0, 0, 0, marks=pytest.mark.skip(reason="LAB_INPUT_SHAPES not set")
+            )
+        ]
+    with open(path) as f:
+        doc = json.load(f)
+    assert doc["schema"] == "shape-gate-shapes/1"
+    return [tuple(s) for s in doc["shapes"]]
+
+
+@needs_sm80
+@pytest.mark.parametrize("rows", [482, 1906, 3460])
+@pytest.mark.parametrize("padded_in,padded_out,bits_x2", _input_shapes())
+def test_input_shapes_hold_linear_outs_error_against_fp64(
+    padded_in, padded_out, bits_x2, rows
+):
+    from tests.kernels.quantization.test_exl3_kernels import effective_weight
+
+    _gpu_or_skip()
+    # library arithmetic, not the VALIDATED_MATRICES table
+    assert tc.linear_prefill_applies(rows, padded_in, padded_out, bits_x2, 2)
+    m = _matrix(17 * bits_x2 + padded_out, padded_in, padded_out, bits_x2)
+    weight = torch.from_numpy(effective_weight(*m["numpy"], bits_x2, 2)).cuda()
+    pool = _Pool()
+    for seed in range(2):
+        x = _inputs(1000 + rows + seed, rows, padded_in)
+        cand = _run(tc.linear_out_prefill, m, x, bits_x2, padded_out)
+        names = _prefill_kernels(
+            lambda x=x: _run(tc.linear_out_prefill, m, x, bits_x2, padded_out)
+        )
+        assert names, "the prefill GEMM did not run"
+        _bitwise(
+            _run(tc.linear_out_prefill, m, x, bits_x2, padded_out), cand, "repeat"
+        )
+        inc = _run(exl3_ops.linear_out, m, x, bits_x2, padded_out)
         pool.add(cand, inc, x.double() @ weight)
     pool.check(f"{padded_in}x{padded_out} bits_x2={bits_x2} rows {rows}")
 
