@@ -112,7 +112,7 @@ exceptions:
     Delete the notice line in the change that removes the last fork edit of
     this file, so that it no longer differs from upstream.
 - file: vllm/v1/core/sched/scheduler.py
-  hunks: [856437ee3c56, 2a416d3832a2, 22f90a26368e, 8ceddf09f07e, 7759e06de501]
+  hunks: [856437ee3c56, 2a416d3832a2, 22f90a26368e, 8ceddf09f07e, 7759e06de501, 2ba978c6ce4e]
   reason: >-
     Upstream bug fix taken ahead of upstream (vllm-project/vllm#54076, first
     part): the align-mode prefill split stops on the Mamba group's own block
@@ -128,7 +128,13 @@ exceptions:
     because these counters now determine progress as well as statistics.
     No extension point exposes both token budgets and prefill charges, and
     this correctness fix must apply to every hybrid model without a flag.
-  owner: hybrid scheduler and GLM-5.3-Flash PP4 serving
+    The existing AdaptiveKPolicy constructor must run once per scheduler,
+    before requests can be admitted. Upstream has no scheduler-local draft
+    policy factory. Its constructor cannot share the failed-input hook,
+    which runs on worker-output delivery after admission. Scope this
+    exception only to that constructor/logging hunk; failed-input handling
+    remains the file's single unexcepted fork hook.
+  owner: hybrid scheduling and adaptive speculative decoding
   removal: >-
     When the upstream base carries #54076 or another fix that splits on the
     Mamba state block: delete the mamba_state_block_size block in __init__ and
@@ -138,6 +144,10 @@ exceptions:
     splitter guarantees progress under persistent decode occupancy while
     preserving block boundaries and temporary-fragment deferral;
     tests/v1/core/test_mamba_decode_progress.py must still pass.
+    Remove the AdaptiveKPolicy constructor exception when upstream supplies
+    a per-scheduler speculative-policy factory or equivalent adaptive-depth
+    lifecycle, migrating initialization to that extension point without
+    changing its per-request acceptance history.
 - file: vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
   hunks: [21689b6f8e90, 501bbcf1c181]
   reason: >-
