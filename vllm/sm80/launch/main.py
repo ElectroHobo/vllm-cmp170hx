@@ -309,6 +309,9 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
     for name in res.checkpoint_refs:
         spec = ms.checkpoints[name]
         manifest, msha = checkpoint.load_manifest(sd.path(spec["manifest"]))
+        for rel in res.checkpoint_files.get(name, []):
+            if rel not in manifest["files"]:
+                raise Refusal(f"checkpoint {name}: referenced file {rel!r} is not in its manifest")
         st = checkpoint.status(manifest, msha, cp_paths[name], stamp_dir)
         st.update(repo=pins.get(spec["repo_key"]), revision=pins.get(spec["revision_key"]))
         if manifest.get("repo") != st["repo"] or manifest.get("revision") != st["revision"]:

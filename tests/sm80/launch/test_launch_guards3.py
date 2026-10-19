@@ -280,13 +280,18 @@ def test_linked_written_natives_match_native_manifest(tmp_path):
     man["files"][rel] = sha
     nm = str(tmp_path / "native-build" / "manifest.json")
 
-    def native(artefacts):
-        write(nm, json.dumps({"artefacts": artefacts}))
+    def native(artefacts, *, source=True):
+        data = {"artefacts": artefacts}
+        if source:
+            data["source"] = {"inputs": {"csrc": git(w.tree, "rev-parse", "HEAD:csrc").strip()}}
+        write(nm, json.dumps(data))
         man["native_manifest_sha256"], man["native_manifest_path"] = sha256_file(nm), nm
         rewrite_manifest(w.tree, man, stamp=True)
     native({rel: {"sha256": sha}})
     et = w.resolve()["engine_target"]
     assert not et["dirty"], et["dirty_paths"]
+    native({rel: {"sha256": sha}}, source=False)
+    assert "no source.inputs" in metadata(w)
     native({rel: {"sha256": "0" * 64}})
     assert "artefacts differ" in metadata(w)
     native({rel: {"sha256": sha}, "vllm/_exl3_C.abi3.so": {"sha256": "1" * 64}})
@@ -311,11 +316,14 @@ def test_built_natives_match_native_manifest(tmp_path, image):
     sha, nm = man["files"][rel], man["native_manifest_path"]
     runs = iter(range(10))
 
-    def problems(artefacts):
+    def problems(artefacts, *, source=True):
         if artefacts is None:
             man["native_manifest_sha256"] = None
             man.pop("native_manifest_path", None)
         else:
+            if source:
+                artefacts = dict(artefacts, source={"inputs": {
+                    "csrc": git(w.tree, "rev-parse", "HEAD:csrc").strip()}})
             write(nm, json.dumps(artefacts))
             man["native_manifest_sha256"], man["native_manifest_path"] = sha256_file(nm), nm
         rewrite_manifest(w.tree, man, stamp=True)
@@ -325,6 +333,8 @@ def test_built_natives_match_native_manifest(tmp_path, image):
         return " | ".join(st.dirty_paths.get("metadata_invalid", []))
 
     assert problems({"artefacts": {rel: {"sha256": sha}}}) == ""
+    if not image:
+        assert "no source.inputs" in problems({"artefacts": {rel: {"sha256": sha}}}, source=False)
     assert "artefacts differ from the built natives at " + rel in problems({"artefacts": {rel: {"sha256": "0" * 64}}})
     extra = "vllm/_exl3_C.abi3.so"
     assert "artefacts differ from the built natives at " + extra in problems(

@@ -15,8 +15,8 @@ Every key of the final object records its value, layer, source file and
 
 Guards on the object: geometry has one representation (``tp``/``pp``;
 the parallel-size arguments are derived from it); ``args.model`` is always
-a checkpoint reference, and the reference (not its directory) is part of
-the functional argv; [fixed] keys and controlled arguments change only
+a checkpoint reference, as are drafter, Engram and override-sidecar paths;
+the reference (not its directory) is part of the functional argv; [fixed] keys and controlled arguments change only
 under --experiment, whatever the channel (overlay, .env, ambient, --set,
 extra arguments, unset) and whatever the spelling: arguments are compared
 by the engine argument they set (an alias, the --no-X form, a dotted
@@ -64,10 +64,13 @@ GEOMETRY_ARGS_NAMES = tuple(k[5:] for k in GEOMETRY_ARGS)
 # what only the launcher sets: geometry (tp/pp), the served checkpoint and
 # no argument file (--config would load arguments past every check)
 LAUNCHER_ARGS = frozenset(GEOMETRY_ARGS_NAMES + ("model", "config"))
+CHECKPOINT_ARGS = {"model": (), "spec-model": None, "speculative-config": ("model",),
+                   "hf-overrides": ("engram_table_dir",)}
 LOCATION_ARGS = ("host", "port")
 _SUBST = re.compile(r"\$\{([^}]*)\}")
 _CHECKPOINT_REF = re.compile(r"^\$\{checkpoint\.([A-Za-z0-9_-]+)\.path\}$")
 _CHECKPOINT_USE = re.compile(r"\$\{checkpoint\.([A-Za-z0-9_-]+)\.path\}")
+_CHECKPOINT_FILE = re.compile(r"\$\{checkpoint\.([A-Za-z0-9_-]+)\.path\}/(.+)")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHORT_OPTION = re.compile(r"^-[A-Za-z]")
 _TOP_KEYS = ("tp", "pp", "cards", "card_ids")
@@ -349,6 +352,7 @@ class Resolved:
     # the served checkpoint, then every other one the arguments or the
     # environment name (sorted): the checkpoints this launch reads
     checkpoint_refs: list[str]
+    checkpoint_files: dict[str, list[str]]
 
 
 def declared_secrets(ms: ModelSettings) -> set[str]:
@@ -594,6 +598,64 @@ def _scalar(name: str, value: Any, kinds: tuple) -> None:
                       f"got {type(value).__name__}")
 
 
+def _checkpoint_fields(final: Final, ms: ModelSettings, inp: Inputs) -> dict[str, list[str]]:
+    """Require tracked references wherever the engine consumes checkpoint paths.
+
+    Directory fields name the entire checkpoint. File fields name a relative
+    member whose presence in that checkpoint's manifest is checked by build().
+    JSON string arguments are inspected without changing their rendered bytes.
+    """
+    files: dict[str, list[str]] = {}
+
+    def reference(value: Any, where: str, *, file: bool = False) -> None:
+        if value is None or (file and value == ""):
+            return
+        match = (_CHECKPOINT_FILE if file else _CHECKPOINT_REF).fullmatch(value) \
+            if isinstance(value, str) else None
+        if match is None or match.group(1) not in ms.checkpoints \
+                or match.group(1) not in inp.checkpoint_paths:
+            raise Refusal(f"{where} must be a manifest-backed checkpoint reference; "
+                          "move checkpoints with --checkpoint-path NAME=DIR")
+        if file:
+            rel = match.group(2)
+            if any(part in ("", ".", "..") for part in rel.split("/")):
+                raise Refusal(f"{where}: file reference must stay inside its checkpoint manifest")
+            files.setdefault(match.group(1), []).append(rel)
+
+    for key, entry in final.entries.items():
+        if key == "env.VLLM_EXL3_OVERRIDE":
+            reference(entry.value, key, file=True)
+        elif key.startswith("args."):
+            name = key[5:]
+            dest = reaches(name, CHECKPOINT_ARGS, inp.arg_options)
+            if dest is None or dest == "model":
+                continue  # args.model is required separately, including null/unset
+            if name != dest:
+                raise Refusal(f"{key}: use args.{dest} with manifest-backed checkpoint references, "
+                              "not an alias, dotted option or abbreviation")
+            value = entry.value
+            if CHECKPOINT_ARGS[dest] is None:
+                reference(value, key)
+                continue
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    raise Refusal(f"{key}: expected a JSON object with checkpoint references") from None
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                raise Refusal(f"{key}: expected an object with checkpoint references")
+            def check_fields(node: dict, where: str) -> None:
+                for field, sub in node.items():
+                    if field in CHECKPOINT_ARGS[dest]:
+                        reference(sub, f"{where}.{field}")
+                    elif dest == "hf-overrides" and isinstance(sub, dict):
+                        check_fields(sub, f"{where}.{field}")
+            check_fields(value, key)
+    return files
+
+
 def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set: set[str],
             amb: dict, variants: list[str], fork_absent: list[str], secret_names: set[str],
             classes: ClassTable) -> Resolved:
@@ -607,6 +669,7 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set:
         raise Refusal(f"args.model must be a checkpoint reference such as ${{checkpoint.target.path}} "
                       f"(got {model_value!r}); serve another directory with "
                       "--checkpoint-path NAME=DIR, which is checked against the manifest")
+    checkpoint_files = _checkpoint_fields(final, ms, inp)
     refs = [ref.group(1)]
     exe = os.path.join(inp.venv, "bin", "vllm")
     argv = [exe, "serve", substitute(model_value, subst, "args.model")]
@@ -676,7 +739,7 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set:
         ignored=amb["ignored"], fork_absent=fork_absent,
         not_validated=list(amb["not_validated"]),
         functional_sha256=functional_sha256, exe=exe, secret_names=secret_names,
-        checkpoint_refs=refs,
+        checkpoint_refs=refs, checkpoint_files=checkpoint_files,
     )
 
 
@@ -785,6 +848,10 @@ def _check_extra(ms: ModelSettings, extra: list[str], experiment: str | None,
         if hit:
             raise Refusal(f"extra argument --{name} sets --{hit}, which is set by the launcher; use "
                           "tp/pp, --checkpoint-path and the settings")
+        hit = reaches(name, CHECKPOINT_ARGS, opts)
+        if hit:
+            raise Refusal(f"extra argument --{name} sets --{hit}, which can read checkpoints; "
+                          "use settings with manifest-backed checkpoint references")
         hit = reaches(name, protected, opts)
         if hit and not experiment:
             raise Refusal(f"extra argument --{name} sets --{hit}, which is fixed by the settings; "

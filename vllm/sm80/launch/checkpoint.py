@@ -11,13 +11,14 @@ checkpoint), each with its size and sha256.
 Completeness (availability): every manifest file present, non-empty and of
 the manifest's size, and no ``.incomplete`` blob. Identity: every file's
 sha256 equals the manifest's. Hashing is done once per file and recorded in
-a stamp (schema checkpoint-stamp/1: path, inode, size, mtime_ns, sha256 and
-realpath per file, plus the manifest's sha256); later checks only stat files
+a stamp (schema checkpoint-stamp/1: path, device, inode, size, mtime_ns,
+ctime_ns, sha256 and realpath per file, plus the manifest's sha256); later checks only stat files
 against the stamp and never open a checkpoint file. A file the directory's
 own stamp does not cover is taken from any stamp in the same stamp directory
-that holds the same file (realpath, inode, size and mtime_ns) with the
+that holds the same file (realpath, device, inode, size, mtime_ns and ctime_ns) with the
 manifest's sha256, so a directory of links to stamped files, or a new
-manifest naming stamped files, hashes only the files no stamp holds.
+manifest naming stamped files, hashes only the files no stamp holds. Entries
+without device or ctime identity are stale and must be hashed again.
 
 Command line (CPU only; never needs a GPU)::
 
@@ -120,7 +121,8 @@ def read_stamp(path: str) -> dict | None:
 
 def _stat_key(path: str) -> dict:
     st = os.stat(path)
-    return {"inode": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    return {"inode": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+            "ctime_ns": st.st_ctime_ns, "dev": st.st_dev}
 
 
 def _own_entries(stamp: dict | None, manifest_sha: str, directory: str) -> dict:
@@ -253,7 +255,9 @@ def verify(manifest: dict, manifest_sha: str, directory: str, stamp_file: str, *
 
 def needed_files(spec: dict, directory: str) -> list[str]:
     """The files the server reads, from the checkpoint spec and its index."""
-    need = ["config.json"] + [r for r in spec.get("required", []) if r != "config.json"]
+    sidecar = spec.get("kind") == "sidecar"
+    need = [] if sidecar else ["config.json"]
+    need += [r for r in spec.get("required", []) if r not in need]
     index = spec.get("index")
     if index:
         if index not in need:
@@ -262,7 +266,7 @@ def needed_files(spec: dict, directory: str) -> list[str]:
             weight_map = json.load(f).get("weight_map", {})
         need += sorted(set(weight_map.values()) - set(need))
     else:
-        for w in spec.get("weights", ["model.safetensors"]):
+        for w in spec.get("weights", [] if sidecar else ["model.safetensors"]):
             if w not in need:
                 need.append(w)
     return need

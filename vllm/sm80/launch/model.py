@@ -13,7 +13,7 @@ Fields (schema launch-model/1)::
     controlled_args = ["max-num-seqs", ...]
     [layouts] allowed = [...], default = "..."
     [checkpoint.<name>] repo_key, revision_key, dir, container_dir?, index?,
-                        weights?, required, manifest
+                        weights?, required, manifest, kind? (model or sidecar)
     [args] / [env]                     # values: plain or { value = ..., why = "..." }
     [location]                         # plain, or { native = "...", container = "..." }
     [[refuse]] when = { "env.X" = "0", ... }, why = "..."
@@ -25,8 +25,14 @@ Fields (schema launch-model/1)::
         variant = "v"                       # 1/0 selects variant v
         variant = { a = "va", b = "" }      # the value picks a variant ("" none)
 
-``args.model`` is always a checkpoint reference (``${checkpoint.<name>.path}``)
-and geometry is ``tp``/``pp`` only; requires paths stay inside the tree.
+Model and drafter paths, Engram table directories and override sidecars must
+use checkpoint references (``${checkpoint.<name>.path}``). A sidecar declares
+``kind = "sidecar"`` and its ``required`` and ``weights`` files explicitly;
+unlike a model it has no implicit config.json or model.safetensors. File
+references append a manifest-listed relative path, for example
+``${checkpoint.override.path}/override.json``. Paths move only through
+``--checkpoint-path NAME=DIR``. Geometry is ``tp``/``pp`` only; requires paths
+stay inside the tree.
 """
 
 from __future__ import annotations
@@ -107,6 +113,8 @@ def load_model_settings(sd: SettingsDir) -> ModelSettings:
         raise Refusal(f"settings:model.toml: default layout {default!r} is not allowed")
     cps = d.get("checkpoint", {})
     for name, spec in cps.items():
+        if spec.get("kind", "model") not in ("model", "sidecar"):
+            raise Refusal(f"settings:model.toml: checkpoint.{name}.kind must be model or sidecar")
         for key in ("dir", "manifest", "repo_key", "revision_key"):
             if not isinstance(spec.get(key), str):
                 raise Refusal(f"settings:model.toml: checkpoint.{name}.{key} is required")
