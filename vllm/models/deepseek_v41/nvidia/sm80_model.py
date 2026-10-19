@@ -244,6 +244,10 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             )
         model.__class__ = cls
         _adopt_layers(islice(model.layers, model.start_layer, model.end_layer), model.config)
+        if envs.VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER:
+            from .sm80_engram_prefetch import adopt_early_engram
+
+            adopt_early_engram(model)
         replay = model.decoder_replay_layers
         if replay is not None:
             # Upstream bound the replay's KV write to the layer before its

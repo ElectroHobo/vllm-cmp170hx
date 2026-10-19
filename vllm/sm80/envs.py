@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX: bool = False
+    VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -968,6 +969,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Off by default.
     "VLLM_EXL3_PLE_HOSTFN_READ": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_HOSTFN_READ", "0"))
+    ),
+    # Start Engram lookups, row gathers and WKV projections before decoder
+    # layers on the registered auxiliary stream. Its EXL3 scratch is disjoint
+    # from the main stream and ordered before shared-expert GEMMs. TP only;
+    # no sequence parallelism, batched Engram projection or microbatching.
+    "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER", "0"))
     ),
     # Where the sm_80 Engram storage keeps the E4M3 values of its owned table
     # rows (vllm/models/deepseek_v41/nvidia/sm80_engram.py): "ssd" reads them

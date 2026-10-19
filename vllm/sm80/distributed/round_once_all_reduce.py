@@ -25,10 +25,11 @@ The same bytes on the wire as the ring, one rounding:
 
 Exactness: the FP64 sum of N BF16 (FP16) values is exact while their nonzero
 magnitudes lie within a factor 2^(45 - ceil(log2 N)) (2^(42 - ceil(log2 N)))
-of each other, which covers FP16's whole range and any activation, so every
-element is the exact sum correctly rounded: the same bits on every rank, in
-every rank order and for every TP size. Messages of other dtypes are not
-taken.
+of each other. Outside that span a small summand can be lost (for example,
+BF16 [1, 2**-60, -1, 0] sums to zero in this order). The result is always the
+rank-ordered FP64 sum rounded once, deterministic and independent of message
+splitting, not independent of rank order or TP size. Messages of other dtypes
+are not taken.
 
 Used only outside CUDA graph capture (the call sites ask for it on eager
 prefill steps), with the TP group's PyNccl communicator. Model call sites opt

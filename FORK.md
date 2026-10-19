@@ -41,8 +41,9 @@ Model code of one model that the fork plugin registers in place of the upstream 
 |---|---:|
 | `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 822 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 978 |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram_prefetch.py` | 78 |
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
-| `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 363 |
+| `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 367 |
 | `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 199 |
 | `vllm/models/glm5next/nvidia/model_state.py` | 113 |
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
@@ -51,7 +52,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **12 files** | **4,608** |
+| **13 files** | **4,690** |
 
 ### `vllm/sm80/kernels/`
 
@@ -125,8 +126,8 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/distributed/round_once_all_reduce.py` | 143 |
-| `vllm/sm80/envs.py` | 1,238 |
+| `vllm/sm80/distributed/round_once_all_reduce.py` | 144 |
+| `vllm/sm80/envs.py` | 1,246 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -158,7 +159,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **41 files** | **10,600** |
+| **41 files** | **10,609** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -339,6 +340,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
 | `tests/models/deepseek_v41/sm80/test_boot_warmup.py` | 337 |
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax.py` | 397 |
+| `tests/models/deepseek_v41/sm80/test_engram_early_gather.py` | 178 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,171 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 378 |
@@ -435,7 +437,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **182 files** | **89,798** |
+| **183 files** | **89,976** |
 
 #### `tools/`
 
@@ -473,7 +475,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/model_executor/models/qwen3_dflash.py` | modified | 72 | 1 | 5 |
 | `vllm/model_executor/models/qwen3_next.py` | modified | 4 | 0 | 2 |
 | `vllm/model_executor/warmup/kernel_warmup.py` | modified | 103 | 0 | 2 |
-| `vllm/models/deepseek_v41/common/engram.py` | modified | 3 | 0 | 3 |
+| `vllm/models/deepseek_v41/common/engram.py` | modified | 10 | 4 | 5 |
 | `vllm/models/deepseek_v41/nvidia/dspark.py` | modified | 3 | 0 | 3 |
 | `vllm/models/deepseek_v41/nvidia/model.py` | modified | 3 | 0 | 3 |
 | `vllm/models/glm5next/common/attention.py` | modified | 46 | 16 | 8 |
@@ -526,7 +528,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **72 files** | | **3,561** | **244** | **497** |
+| **72 files** | | **3,568** | **248** | **499** |
 
 ### Tests, docs and .github
 
@@ -560,9 +562,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 72 | 3,561 | 244 | 497 |
+| Product code | 72 | 3,568 | 248 | 499 |
 | Tests, docs and .github | 22 | 572 | 550 | 78 |
-| All | 94 | 4,133 | 794 | 575 |
+| All | 94 | 4,140 | 798 | 577 |
 
 ## 3. Fork environment variables
 
@@ -594,6 +596,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S` | `float` | `60.0` | `'60'` |
 | `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
+| `VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_FUSED_MHC` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE` | `bool` | `False` | `'0'` |
@@ -675,7 +678,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **103 variables** | | | |
+| **104 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -693,12 +696,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 151 |
-| Fork-added product lines | 47,143 |
+| Fork-added product files | 152 |
+| Fork-added product lines | 47,234 |
 | Patched upstream files | 94 |
-| Patched upstream lines | +4,133 / -794 |
+| Patched upstream lines | +4,140 / -798 |
 | Patched upstream product files | 72 |
-| Patched upstream product lines | +3,561 / -244 |
-| Product lines added (new files and patches) | 50,704 |
-| Fork environment variables (flags) | 103 |
+| Patched upstream product lines | +3,568 / -248 |
+| Product lines added (new files and patches) | 50,802 |
+| Fork environment variables (flags) | 104 |
 | Unreferenced fork definitions | 2 (23 lines) |
