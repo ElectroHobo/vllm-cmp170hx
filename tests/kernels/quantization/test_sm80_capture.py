@@ -234,3 +234,25 @@ def test_mhc_proxy_records_call_and_outputs(on):
     assert obj["family"] == "mhc_delayed" and obj["tensors"]["sinkhorn_repeat"] == 20
     assert torch.equal(obj["tensors"]["x"], x)
     assert torch.equal(obj["tensors"]["out_pre"], outs[4])
+
+
+@pytest.mark.parametrize("prefix", ["model.layers.3.self_attn.q_a_proj",
+                                   "model.layers.3.self_attn.q_proj"])
+def test_glm_qwen_plain_linear_capture_keeps_host_materialization(on, prefix):
+    """Shared GLM/Qwen EXL3 points have no model-owned deferred state."""
+    _step([1, 1])
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4).to(torch.bfloat16)
+    out = x[:, :2].clone()
+    trellis = torch.zeros(4, dtype=torch.int16)
+    cap.register_weight(trellis.data_ptr(), prefix=prefix, out_dtype="bfloat16")
+    capture_points.linear(x, trellis, out, torch.matmul)
+    (row,) = _index(on)
+    obj = torch.load(row["path"], weights_only=True)
+    expected = {k: cap._host(v) for k, v in {"x": x, "out": out}.items()}
+    assert obj["family"] == "exl3_linear" and row["phase"] == "decode"
+    for key, value in expected.items():
+        assert obj["tensors"][key].dtype == value.dtype
+        assert torch.equal(obj["tensors"][key], value)
+    plain = cap.Record("dense", "exl3_linear", prefix, 2, {}).put(x=x, out=out)
+    assert not plain.deferred
+    assert all(torch.equal(plain.materialize()[k], v) for k, v in expected.items())

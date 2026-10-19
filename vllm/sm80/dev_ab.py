@@ -482,9 +482,110 @@ def _splitk_apply(runner, on: bool) -> None:
     ops._dense_splitk = on
 
 
+def _mhc_bindings(runner):
+    for layer in _model_modules(runner):
+        bound = getattr(layer, "_mhc_ops", None)
+        if bound is not None:
+            # Preserve the diagnostic wrapper and its layer ownership.
+            holder, attr = (bound, "_ops") if hasattr(bound, "_ops") else (layer, "_mhc_ops")
+            yield layer, holder, attr
+
+
+def _mhc_unavailable(runner) -> str | None:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc, sm80_mhc_fused
+
+    bindings = list(_mhc_bindings(runner))
+    if not bindings:
+        return "the served model has no sm_80 DeepSeek delayed mHC layers"
+    modes = set()
+    for layer, holder, attr in bindings:
+        current = getattr(holder, attr)
+        if current is not sm80_mhc and current is not sm80_mhc_fused:
+            return "a DeepSeek layer has an unsupported delayed mHC implementation"
+        reason = sm80_mhc_fused.supports(layer.hc_mult, layer.hidden_size)
+        if reason is not None:
+            return reason
+        modes.add(current is sm80_mhc_fused)
+    if len(modes) != 1:
+        return "DeepSeek delayed mHC layers have inconsistent active implementations"
+    _STATE.saved["dsv41_mhc"] = bindings
+    return None
+
+
+def _mhc_current(runner) -> bool:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
+
+    return any(getattr(holder, attr) is sm80_mhc_fused
+               for _, holder, attr in _mhc_bindings(runner))
+
+
+def _mhc_apply(runner, on: bool) -> None:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc, sm80_mhc_fused
+
+    _set_env("VLLM_DEEPSEEK_V41_FUSED_MHC", on)
+    for _, holder, attr in _STATE.saved["dsv41_mhc"]:
+        setattr(holder, attr, sm80_mhc_fused if on else sm80_mhc)
+
+
+def _mhc_finish_unavailable(runner) -> str | None:
+    reason = _mhc_unavailable(runner)
+    if reason is not None:
+        return reason
+    if not _mhc_current(runner):
+        return "boot with VLLM_DEEPSEEK_V41_FUSED_MHC=1 for the fused finish"
+    return None
+
+
+def _mhc_finish_current(runner) -> bool:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
+
+    return sm80_mhc_fused.FINISH_KERNEL
+
+
+def _mhc_finish_apply(runner, on: bool) -> None:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
+
+    _set_env("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", on)
+    sm80_mhc_fused.FINISH_KERNEL = on
+
+
+def _dense_prefill_unavailable(runner) -> str | None:
+    from vllm.sm80.kernels.exl3 import dense_prefill_tc, ops
+
+    if not ops._loaded or not dense_prefill_tc.active:
+        return ("boot with VLLM_EXL3_DENSE_PREFILL_TC=1: "
+                "the dense prefill gate and kernel warmup must already be complete")
+    return None
+
+
+def _dense_prefill_current(runner) -> bool:
+    from vllm.sm80.kernels.exl3 import dense_prefill_tc
+
+    return dense_prefill_tc.active
+
+
+def _dense_prefill_apply(runner, on: bool) -> None:
+    from vllm.sm80.kernels.exl3 import dense_prefill_tc
+
+    _set_env("VLLM_EXL3_DENSE_PREFILL_TC", on)
+    dense_prefill_tc.active = on
+
+
 SWITCHES: dict[str, Switch] = {
     s.name: s
     for s in (
+        Switch(
+            "dsv41_fused_mhc", "VLLM_DEEPSEEK_V41_FUSED_MHC", True, False,
+            _mhc_unavailable, _mhc_current, _mhc_apply,
+        ),
+        Switch(
+            "dsv41_fused_mhc_finish", "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", True, False,
+            _mhc_finish_unavailable, _mhc_finish_current, _mhc_finish_apply,
+        ),
+        Switch(
+            "exl3_dense_prefill_tc", "VLLM_EXL3_DENSE_PREFILL_TC", True, False,
+            _dense_prefill_unavailable, _dense_prefill_current, _dense_prefill_apply,
+        ),
         Switch(
             "dsv41_attn_pipeline", "VLLM_DEEPSEEK_V41_ATTN_PIPELINE", True, False,
             _pipeline_unavailable, _pipeline_current, _pipeline_apply,

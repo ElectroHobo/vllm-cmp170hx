@@ -312,3 +312,92 @@ def test_changed_manager_mode_cannot_silently_enable_eager(monkeypatch, state, f
     reply = ab._set_arm(NS(rank=0, model_runner=runner), "on", 1)
     assert not reply["ok"] and "re-specialized" in reply["reason"]
     assert state.arm is False and state.generation == 0
+
+
+@pytest.mark.parametrize("boot", [False, True])
+def test_mhc_adapter_changes_loaded_target_and_draft_without_losing_capture(monkeypatch, state, boot):
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc, sm80_mhc_fused
+    from vllm.models.deepseek_v41.nvidia.sm80_model import _CapturedMhc
+
+    initial = sm80_mhc_fused if boot else sm80_mhc
+    target = NS(_mhc_ops=initial, hc_mult=4, hidden_size=5120)
+    draft = NS(hc_mult=4, hidden_size=5120, attn=NS(prefix="draft.layers.0.attn"))
+    wrapper = _CapturedMhc(initial, draft)
+    draft._mhc_ops = wrapper
+    runner = NS(model=NS(modules=lambda: [target]),
+                speculator=NS(model=NS(modules=lambda: [target, draft])))
+    monkeypatch.setenv("VLLM_DEEPSEEK_V41_FUSED_MHC", str(int(boot)))
+    switch = ab.SWITCHES["dsv41_fused_mhc"]
+    assert switch.unavailable(runner) is None
+    assert len(state.saved["dsv41_mhc"]) == 2
+    assert switch.current(runner) is boot
+    for on in (not boot, boot):
+        switch.apply(runner, on)
+        expected = sm80_mhc_fused if on else sm80_mhc
+        assert target._mhc_ops is expected and wrapper._ops is expected
+        assert draft._mhc_ops is wrapper and wrapper._layer is draft
+        assert switch.current(runner) is on
+    target.hc_mult = 3
+    assert "hc_mult" in switch.unavailable(runner)
+    target.hc_mult = 4
+    target._mhc_ops = object()
+    assert "unsupported" in switch.unavailable(runner)
+    assert "no sm_80" in switch.unavailable(NS())
+
+
+def test_mhc_finish_requires_fused_parent_and_changes_latched_dispatch(monkeypatch, state):
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc, sm80_mhc_fused
+
+    layer = NS(_mhc_ops=sm80_mhc, hc_mult=4, hidden_size=5120)
+    runner = NS(model=NS(modules=lambda: [layer]))
+    switch = ab.SWITCHES["dsv41_fused_mhc_finish"]
+    assert "boot with" in switch.unavailable(runner)
+    layer._mhc_ops = sm80_mhc_fused
+    monkeypatch.setattr(sm80_mhc_fused, "FINISH_KERNEL", False)
+    monkeypatch.setenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", "0")
+    assert switch.unavailable(runner) is None
+    for on in (True, False):
+        switch.apply(runner, on)
+        assert switch.current(runner) is on
+        assert layer._mhc_ops is sm80_mhc_fused
+
+
+def test_dense_prefill_requires_boot_warmup_and_preserves_route_configuration(monkeypatch, state):
+    from vllm.sm80.kernels.exl3 import dense_prefill_tc as dense, ops
+
+    switch = ab.SWITCHES["exl3_dense_prefill_tc"]
+    monkeypatch.setattr(ops, "_loaded", True)
+    monkeypatch.setattr(dense, "active", False)
+    monkeypatch.setenv("VLLM_EXL3_DENSE_PREFILL_TC", "0")
+    assert "boot with" in switch.unavailable(None)
+    dense.active = True
+    assert switch.unavailable(None) is None
+    fixed = dense._max_decode_query_len, dense._sms, dense._fake_registered
+    for on in (False, True):
+        switch.apply(None, on)
+        assert switch.current(None) is on
+        assert (dense._max_decode_query_len, dense._sms, dense._fake_registered) == fixed
+
+
+@pytest.mark.parametrize("name", [
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC",
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE", "VLLM_EXL3_HYBRID", "VLLM_DSPARK_PER_K_WIDTH",
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE",
+    "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE",
+    "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER",
+    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX",
+])
+def test_combined_features_keep_default_off(monkeypatch, name):
+    from vllm.sm80.envs import FORK_ENV_VARS
+
+    monkeypatch.delenv(name, raising=False)
+    assert FORK_ENV_VARS[name]() is False
+
+
+@pytest.mark.parametrize("name", ["VLLM_DEV_AB_SWITCH", "VLLM_EXL3_EXPERT_PLACEMENT",
+                                  "VLLM_EXL3_EXPERT_PLACEMENT_SHA256", "VLLM_SM80_CAPTURE_DIR"])
+def test_combined_optional_paths_keep_empty_default(monkeypatch, name):
+    from vllm.sm80.envs import FORK_ENV_VARS
+
+    monkeypatch.delenv(name, raising=False)
+    assert FORK_ENV_VARS[name]() == ""

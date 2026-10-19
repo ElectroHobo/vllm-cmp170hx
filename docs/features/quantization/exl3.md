@@ -110,3 +110,29 @@ experts require a separate per-rank byte ledger despite equal slot counts.
 Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.
 
 The hidden-5120 shape of `moe_out_v2` follows Curtis White's Apache-2.0 port of that operator; its credit is in the same `NOTICE`.
+
+## DeepSeek switch control
+
+`VLLM_DEV_AB_SWITCH` is empty by default. When explicitly configured, the
+worker captures both implementations before serving and switches only while
+requests are drained. Available DeepSeek selectors are
+`dsv41_fused_attn_decode`, `dsv41_attn_pipeline`, `dsv41_moe_prefill_tc`,
+`dsv41_fused_mhc`, `dsv41_fused_mhc_finish`, `exl3_dense_splitk`, and
+`exl3_dense_prefill_tc`. The mHC selectors change the loaded decoder operation
+module or its cached finish dispatch; capture wrappers retain their ownership.
+The dense-prefill selector changes the cached dispatcher, not its decode bound,
+workspace, hardware gate, or schedule.
+
+MoE-prefill and dense-prefill selection require their feature enabled at
+construction so that the existing workspace and warmup have completed.
+Selecting the fused mHC finish requires fused mHC enabled at construction.
+Attention pipeline selection reserves both implementations' scratch before
+profiling. None of these selectors changes the speculative-width policy,
+graph-size ladder, checkpoint, or loaded expert placement.
+
+Hybrid checkpoint selection, expert-placement maps and digests, true per-K
+DSpark construction, reduction transports/output dtypes, early Engram gathers,
+and draft-only shard argmax require a new process. Environment changes alone
+cannot update their constructed modules, storage, graph geometry, or cached
+sampler configuration. Numerical and model-quality qualification remains
+separate from successful switch control.
