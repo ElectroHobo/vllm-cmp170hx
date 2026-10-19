@@ -82,7 +82,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 SCHEMA = "lab-point-capture/1"
-FAMILIES = ("dense", "moe", "attn", "mhc")
+FAMILIES = ("dense", "moe", "attn", "mhc", "hybrid")
 # Context, in tokens, from which a step's records count as long-context ones.
 LONG_CONTEXT = 4096
 
@@ -205,6 +205,9 @@ def set_step(scheduler_output, decode_len: int, dummy: bool) -> None:
     """Called by the model runner before every step it executes.
     ``context_lens``: the tokens each request had computed before the step
     (new requests first, then the running ones)."""
+    if _cfg is not None and "hybrid" in _cfg.families:
+        from vllm.models.deepseek_v41.nvidia.hybrid_capture import reset_links
+        reset_links()
     if dummy:
         _step["real"] = False
         return
@@ -400,6 +403,9 @@ class _BindingGraphs(dict):
 
 
 def _bind(manager) -> None:
+    if _cfg is not None and "hybrid" in _cfg.families:
+        from vllm.models.deepseek_v41.nvidia.hybrid_capture import reset_links
+        reset_links()
     if not isinstance(manager.graphs, _BindingGraphs):
         manager.graphs = _BindingGraphs(manager.graphs)
     # Copies made by a capture that never stored its graph go with it.
@@ -470,3 +476,7 @@ def _install() -> None:
         return execute(self, scheduler_output, *args, **kwargs)
 
     runner.execute_model = execute_model
+    if "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+        from vllm.models.deepseek_v41.nvidia.hybrid_capture import install
+
+        install()

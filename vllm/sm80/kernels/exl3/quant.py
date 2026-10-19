@@ -276,6 +276,8 @@ class Exl3Config(QuantizationConfig):
     def _hybrid_quant_method(self, layer: nn.Module, prefix: str):
         """The method the hybrid rules give the module (hybrid.py)."""
         assert self.hybrid is not None and self.manifest is not None
+        if capture.active:
+            capture.config()
         if isinstance(layer, RoutedExperts):
             sources = [self.source_prefix(prefix)]
         elif isinstance(layer, (LinearBase, ParallelLMHead)):
@@ -295,6 +297,11 @@ class Exl3Config(QuantizationConfig):
             return quant_method
         if not isinstance(layer, RoutedExperts):
             check_plain_sources(self.manifest, sources, method)
+            if capture.active:
+                layer._hybrid_capture_sources = [
+                    (source, list(self.manifest.tensors[f"{source}.weight"].shape))
+                    for source in sources
+                ]
         if method == UNQUANTIZED:
             if isinstance(layer, RoutedExperts):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
@@ -694,7 +701,8 @@ class Exl3HeadLogitsProcessor(LogitsProcessor):
         lm_head: nn.Module,
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None,
-    ) -> torch.Tensor:        method = lm_head.quant_method
+    ) -> torch.Tensor:
+        method = lm_head.quant_method
         if not isinstance(method, Exl3LinearMethod):
             return super()._apply_head(lm_head, hidden_states, embedding_bias)
         head_dtype = self.head_dtype or hidden_states.dtype

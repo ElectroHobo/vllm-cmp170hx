@@ -729,10 +729,24 @@ def mhc_pre_delayed(a: dict, device: torch.device, src: Source) -> Call:
 
 
 # Families with several outputs: the case names the one it judges.
-MULTI_OUTPUT = {"mhc_delayed", "mhc_pre_delayed"}
+MULTI_OUTPUT = {"mhc_delayed", "mhc_pre_delayed", "hybrid_linear_consumer"}
+
+
+def hybrid_linear(a, device, src):
+    from tests.models.deepseek_v41.sm80.hybrid_linear_cases import hybrid_linear as run
+
+    return run(a, device, src)
+
+
+def hybrid_linear_consumer(a, device, src):
+    from tests.models.deepseek_v41.sm80.hybrid_consumer_cases import hybrid_linear_consumer as run
+
+    return run(a, device, src)
 
 
 FAMILIES = {
+    "hybrid_linear": hybrid_linear,
+    "hybrid_linear_consumer": hybrid_linear_consumer,
     "sparse_attention": sparse_attention,
     "index_scores": index_scores,
     "qdq_fp8": qdq_fp8,
@@ -758,6 +772,8 @@ _MHC = "vllm.models.deepseek_v41.nvidia.ops.sm80_mhc"
 _MHC_ARGS = ["fn", "hc_scale", "hc_base", "rms_eps", "hc_pre_eps", "hc_sinkhorn_eps",
              "hc_post_mult_value", "sinkhorn_repeat", "pre_mix", "norm_weight", "norm_eps"]
 POINTS = {
+    "hybrid_linear": ("vllm.model_executor.layers.quantization.modelopt:ModelOptLinearMethod.apply", ["x"]),
+    "hybrid_linear_consumer": ("vllm.models.deepseek_v41.nvidia.hybrid_capture:_record", ["op", "args"]),
     "sparse_attention": (f"{_CORE}:sparse_attention",
                          ["q", "swa_cache", "swa_indices", "comp_cache",
                           "comp_block_table", "comp_local", "req", "sink", "scale"]),
@@ -853,6 +869,12 @@ def header(device: torch.device) -> dict:
         "cuda": torch.version.cuda,
         "gpu": gpu,
         "sm_count": sms,
+        "reference_math": {
+            "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "allow_bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+            "allow_fp16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        },
     }
 
 
@@ -864,6 +886,10 @@ def run(cases: Path, out: Path, device: torch.device) -> int:
     if not isinstance(doc, dict) or doc.get("schema") not in SCHEMAS:
         print(f"{cases}: schema is not one of {SCHEMAS}", file=sys.stderr)
         return 2
+    if any(str(c.get("family", "")).startswith("hybrid_linear") for c in doc.get("cases", [])):
+        from tests.models.deepseek_v41.sm80.hybrid_linear_cases import reference_settings
+
+        reference_settings()
     with Path(out).open("w") as f, torch.inference_mode():
         f.write(json.dumps({"header": header(device)}) + "\n")
         checkpoint = doc.get("checkpoint") or {}

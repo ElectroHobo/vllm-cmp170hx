@@ -418,3 +418,21 @@ def test_real_fp8_blocks_dequantize_as_official():
                 ours.view(torch.int16),
                 _official_dequant(weight, scale).view(torch.int16),
             ), name
+
+
+def test_replay_uses_official_bytes_and_rejects_loader_mismatch(hybrid):
+    from .hybrid_linear_cases import digest, official_parts
+
+    directory, _, source = hybrid
+    prefix = "layers.0.attn.wq_a"
+    weight = source[prefix + ".weight"]
+    scale = source[prefix + ".scale"].view(torch.uint8).repeat_interleave(32, 0)
+    facts = {"shape": list(weight.shape), "sources": [(prefix, list(weight.shape))],
+             "rank": 0, "tp": 1, "layer_type": "ReplicatedLinear", "groups": 1,
+             "weight_sha256": digest(weight), "scale_sha256": digest(scale)}
+    got, got_scale, exact = official_parts(directory, facts)
+    assert torch.equal(got.view(torch.uint8), weight.view(torch.uint8))
+    assert torch.equal(got_scale, scale)
+    assert torch.equal(exact.to(torch.bfloat16), _official_dequant(weight, source[prefix + ".scale"]))
+    with pytest.raises(ValueError, match="loader weight differs"):
+        official_parts(directory, dict(facts, weight_sha256="0" * 64))
