@@ -645,6 +645,35 @@ def test_hybrid_state_export_preserves_aliases_and_write_guards():
         exporter.compact_state({"meta": {}, "tensors": args})
 
 
+def test_hybrid_explicit_draft_phase_during_prefill(monkeypatch, tmp_path):
+    import json
+    import re
+    from vllm.sm80 import capture as c
+
+    cfg = c._Config(str(tmp_path), frozenset({"hybrid"}), re.compile(".*"),
+                    re.compile(".*"), frozenset({1}), 2, frozenset({1}), 65,
+                    1 << 20, 0, 0)
+    monkeypatch.setattr(c, "_cfg", cfg)
+    monkeypatch.setattr(c, "_step", {"real": True, "step": 1, "phase": "prefill",
+                                   "query_lens": [128], "context_lens": [0], "context": "short"})
+    monkeypatch.setattr(c, "_counts", {})
+    monkeypatch.setattr(c, "_prefill_calls", {})
+    monkeypatch.setattr(c, "_bytes", [0])
+    monkeypatch.setattr(c, "_capturing", lambda: False)
+    monkeypatch.setattr(c.torch.cuda, "is_available", lambda: False)
+    assert c.begin("hybrid", "hybrid_linear", "head", 1) is None
+    with c.phase_scope("draft"):
+        rec = c.begin("hybrid", "hybrid_linear", "head", 1)
+        assert rec is not None and rec.point_phase == "draft"
+        rec.put(x=torch.ones(1, 32)).done()
+    row = json.loads((tmp_path / "index.jsonl").read_text())
+    assert row["phase"] == "draft" and row["step_phase"] == "prefill"
+    assert "-draft-eager-" in row["path"]
+    assert c._point_phase.get() is None
+    with pytest.raises(ValueError, match="unknown capture point phase"):
+        c.begin("hybrid", "hybrid_linear", "head", 1, point_phase="invented")
+
+
 # ---------------------------------------------------------------- GPU
 
 

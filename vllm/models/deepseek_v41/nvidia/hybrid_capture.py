@@ -100,7 +100,10 @@ def _record(op, args, run, *, linear=None, boundary=False):
     if first is None:
         return run()
     family = "hybrid_linear" if linear is not None else "hybrid_linear_consumer"
-    rec = capture.begin("hybrid", family, f"{prefix}.{op}.D{first.shape[-1]}", first.shape[0], op=op,
+    point_phase = ("draft" if linear and linear.get("draft") else
+                   next((p.get("point_phase") for p in parents.values() if p.get("point_phase")), None))
+    rec = capture.begin("hybrid", family, f"{prefix}.{op}.D{first.shape[-1]}", first.shape[0],
+                        point_phase=point_phase, op=op,
                         call_id=next(_serial), parents=parents, linear=linear, tp_boundary=boundary)
     if rec is None:
         return run()
@@ -116,7 +119,7 @@ def _record(op, args, run, *, linear=None, boundary=False):
     rec.meta["outputs"] = list(outputs)
     for name, value in outputs.items():
         _outputs[value.untyped_storage().data_ptr()] = ({
-            "call_id": rec.meta["call_id"], "output": name, "prefix": prefix,
+            "call_id": rec.meta["call_id"], "output": name, "prefix": prefix, "point_phase": rec.point_phase,
             "storage_offset": value.storage_offset(), "dtype": str(value.dtype),
         }, weakref.ref(value))
     rec.done()
@@ -137,7 +140,7 @@ def register_model(model):
         scale = getattr(module, "weight_scale", None)
         indices = getattr(module, "shard_indices", None)
         module._hybrid_capture = {
-            "prefix": prefix, "sources": sources,
+            "prefix": prefix, "sources": sources, "draft": any(source.startswith("mtp.") for source, _ in sources),
             "layer_type": type(module).__name__,
             "rank": int(getattr(module, "tp_rank", 0)),
             "tp": int(getattr(module, "tp_size", 1)),
@@ -284,3 +287,16 @@ def install():
             return moe_forward(self, *args, **kwargs)
 
     MoERunner.forward = combine_forward
+
+    from vllm.models.deepseek_v41.nvidia.sm80_model import DSparkDeepseekV4ForCausalLM
+
+    def draft_scope(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            with capture.phase_scope("draft"):
+                return fn(*args, **kwargs)
+        return wrapped
+
+    for name in ("forward", "compute_logits"):
+        setattr(DSparkDeepseekV4ForCausalLM, name,
+                draft_scope(getattr(DSparkDeepseekV4ForCausalLM, name)))
