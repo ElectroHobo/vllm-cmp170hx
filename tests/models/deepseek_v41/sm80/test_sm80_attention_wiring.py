@@ -185,7 +185,7 @@ def test_o_proj_grouped_wo_a_and_fp32_reduce(monkeypatch) -> None:
     layer = _bare_layer(
         n_local_groups=G, o_lora_rank=R, gemm_rs=None,
         wo_a=_Linear(wo_a), wo_b=_Linear(wo_b, tp_size=4),
-        _wo_b_bf16_allreduce=False,
+        _wo_b_bf16_allreduce=False, _wo_b_bf16_pieces=False,
     )
     got = layer._o_proj(attn_out, torch.arange(T))
     want = (torch.nn.functional.linear(z, wo_b).float() * 3).to(BF16)
@@ -267,7 +267,7 @@ def test_wo_b_bf16_allreduce_switch(monkeypatch, switch, comm, bf16_message) -> 
     )
     g = torch.Generator().manual_seed(2)
     partial = torch.randn(5, 64, generator=g).to(BF16)
-    got = sm80.wo_b_all_reduce(partial, switch)
+    got = sm80.wo_b_all_reduce(partial, switch, False)
     assert seen == [BF16 if bf16_message else torch.float32]
     assert got.dtype == BF16
     if not bf16_message:
@@ -281,3 +281,201 @@ def test_wo_b_bf16_allreduce_default_off(monkeypatch) -> None:
     assert envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE is False
     monkeypatch.setenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", "1")
     assert envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE is True
+
+
+class _PieceCustomAllreduce:
+    """A custom all-reduce with a ``max_size`` buffer: like upstream's
+    ``should_custom_ar`` it takes contiguous float messages of whole 16-byte
+    units below the buffer size when the ranks are fully connected. Its
+    ``all_reduce`` stands for four ranks holding the same partial: it writes
+    the FP32 sum rounded once into ``out`` and records each piece."""
+
+    def __init__(self, max_size: int, fully_connected: bool = True):
+        self.max_size = max_size
+        self.fully_connected = fully_connected
+        self.disabled = False
+        self.pieces: list[torch.Tensor] = []
+
+    def should_custom_ar(self, t: torch.Tensor) -> bool:
+        size = t.numel() * t.element_size()
+        return (
+            self.fully_connected
+            and t.dtype in (torch.float32, BF16)
+            and size % 16 == 0
+            and t.is_contiguous()
+            and size < self.max_size
+        )
+
+    def all_reduce(self, inp, *, out=None, registered=False):
+        assert not registered and out is not None
+        assert inp.numel() * inp.element_size() < self.max_size
+        self.pieces.append(inp)
+        out.copy_((inp.float() * 4).to(inp.dtype))
+        return out
+
+
+def _piece_comm(ca, host_takes=False, preempt=None):
+    return SimpleNamespace(
+        ca_comm=ca,
+        hostshm_comm=SimpleNamespace(should_host_ar=lambda t: host_takes),
+        pynccl_comm=None,
+        fi_ar_comm=preempt,
+    )
+
+
+# 1 KiB buffer: the largest piece is 63 units of 16 bytes (504 BF16 values).
+_MAX = 1024
+
+
+@pytest.mark.parametrize(
+    "case,rows,cols,in_pieces",
+    [
+        ("switch_off", 40, 64, False),
+        ("too_large", 40, 64, True),
+        ("one_row_over", 9, 64, True),
+        ("whole_fits", 7, 64, False),
+        ("host_takes", 40, 64, False),
+        ("preempted", 40, 64, False),
+        ("not_fully_connected", 40, 64, False),
+        ("capture_warmup", 40, 64, False),
+        ("not_contiguous", 40, 64, False),
+        ("odd_bytes", 41, 63, False),
+    ],
+)
+def test_wo_b_bf16_prefill_allreduce_pieces(
+    monkeypatch, case, rows, cols, in_pieces
+) -> None:
+    """VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE sends a BF16 partial too
+    large for the custom all-reduce whole through it in storage-order pieces
+    below its buffer, each taken by its own predicate, into one output; any
+    other message keeps the FP32 sum rounded once."""
+    ca = _PieceCustomAllreduce(_MAX, fully_connected=case != "not_fully_connected")
+    if case == "capture_warmup":
+        ca._IS_CAPTURING = True
+    comm = _piece_comm(
+        ca,
+        host_takes=case == "host_takes",
+        preempt=SimpleNamespace(disabled=False) if case == "preempted" else None,
+    )
+    seen = []
+
+    def all_reduce(t):
+        seen.append(t.dtype)
+        return t * 4
+
+    monkeypatch.setattr(sm80, "tensor_model_parallel_all_reduce", all_reduce)
+    monkeypatch.setattr(
+        sm80, "get_tp_group", lambda: SimpleNamespace(device_communicator=comm)
+    )
+    g = torch.Generator().manual_seed(3)
+    partial = torch.randn(rows, cols, generator=g).to(BF16)
+    if case == "not_contiguous":
+        partial = torch.randn(cols, rows, generator=g).to(BF16).t()
+    got = sm80.wo_b_all_reduce(partial, False, case != "switch_off")
+    want = (partial.float() * 4).to(BF16)
+    assert got.dtype == BF16 and got.shape == partial.shape
+    assert torch.equal(got, want)
+    if not in_pieces:
+        assert seen == [torch.float32] and not ca.pieces
+        return
+    assert not seen
+    sizes = [p.numel() * p.element_size() for p in ca.pieces]
+    assert all(s < _MAX and s % 16 == 0 for s in sizes)
+    assert sizes[:-1] == [_MAX - 16] * (len(sizes) - 1)
+    assert sum(p.numel() for p in ca.pieces) == partial.numel()
+    flat = partial.view(-1)
+    start = 0
+    for p in ca.pieces:
+        assert p.data_ptr() == flat[start:].data_ptr()
+        start += p.numel()
+
+
+def test_wo_b_bf16_prefill_allreduce_whole_message_keeps_custom_path(
+    monkeypatch,
+) -> None:
+    """With both switches on, a message the custom all-reduce takes whole goes
+    to the communicator as BF16 (the decode switch), never in pieces."""
+    ca = _PieceCustomAllreduce(_MAX)
+    comm = _piece_comm(ca)
+    seen = []
+
+    def all_reduce(t):
+        seen.append(t.dtype)
+        return t
+
+    monkeypatch.setattr(sm80, "tensor_model_parallel_all_reduce", all_reduce)
+    monkeypatch.setattr(
+        sm80, "get_tp_group", lambda: SimpleNamespace(device_communicator=comm)
+    )
+    sm80.wo_b_all_reduce(torch.ones(7, 64, dtype=BF16), True, True)
+    assert seen == [BF16] and not ca.pieces
+
+
+def test_o_proj_passes_the_pieces_switch(monkeypatch) -> None:
+    calls = []
+
+    def wo_b_all_reduce(partial, whole, pieces):
+        calls.append((whole, pieces))
+        return partial
+
+    monkeypatch.setattr(sm80, "wo_b_all_reduce", wo_b_all_reduce)
+    H, K = 5, 16
+    layer = _bare_layer(
+        n_local_groups=1, o_lora_rank=K, gemm_rs=None,
+        wo_a=_Linear(torch.eye(K, dtype=BF16)),
+        wo_b=_Linear(torch.ones(H, K, dtype=BF16), tp_size=4),
+        _wo_b_bf16_allreduce=False, _wo_b_bf16_pieces=True,
+    )
+    layer._o_proj(torch.ones(2, 1, K, dtype=BF16), torch.arange(2))
+    assert calls == [(False, True)]
+
+
+def test_wo_b_bf16_prefill_allreduce_default_off(monkeypatch) -> None:
+    import vllm.envs as envs
+
+    name = "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE"
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) is False
+    monkeypatch.setenv(name, "1")
+    assert getattr(envs, name) is True
+
+
+def _frexp_exponent(x: torch.Tensor) -> torch.Tensor:
+    return torch.frexp(x)[1]
+
+
+def test_wo_b_fp32_sum_of_bf16_partials_is_order_free_within_2_14() -> None:
+    """The basis of both BF16 wo_b switches: four BF16 partials whose nonzero
+    magnitudes lie within a factor 2^14 of each other have an exact FP32 sum
+    (every partial sum is a multiple of the smallest one's last bit and needs
+    at most 24 bits), so every summation order (the FP32 ring's, the custom
+    all-reduce's rotated one, the reference's) rounds the same exact value
+    to BF16 once. Elsewhere orders can differ in the last bit."""
+    import itertools
+
+    g = torch.Generator().manual_seed(11)
+    rows, cols, world = 256, 512, 4
+    # The wo_b partials of the bits check: per-rank, per-row scales 2^-6..2^3.
+    parts = torch.stack(
+        [
+            (
+                torch.randn(rows, cols, generator=g)
+                * torch.exp2(torch.randint(-6, 4, (rows, 1), generator=g).float())
+            ).to(BF16)
+            for _ in range(world)
+        ]
+    )
+    exact = parts.double().sum(0)
+    e = _frexp_exponent(parts.float().abs())
+    nonzero = parts != 0
+    e_max = torch.where(nonzero, e, torch.full_like(e, -(2**30))).amax(0)
+    e_min = torch.where(nonzero, e, torch.full_like(e, 2**30)).amin(0)
+    within = (e_max - e_min) <= 14
+    assert within.float().mean() > 0.95
+    want = exact.float().to(BF16)
+    for order in itertools.permutations(range(world)):
+        acc = parts[order[0]].float()
+        for r in order[1:]:
+            acc = acc + parts[r].float()
+        assert torch.equal(acc[within], exact.float()[within])
+        assert torch.equal(acc.to(BF16)[within], want[within])

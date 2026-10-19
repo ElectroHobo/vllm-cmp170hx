@@ -1210,6 +1210,20 @@ seams:
   sha256: 90b653eeb223b37da75a5ecc6a3ba5bea05530e945c301f5117d3d5576ad4c0d
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''', use_sequence_parallel: bool = False, *, num_hash_layers: int, reduce_results: bool = True, n_routed_experts: int | None = None, n_activated_experts: int | None = None, image_sentinel_lo: int = 129257)'
 
+- id: dsv41-moe-forward
+  kind: method
+  target: vllm.models.deepseek_v4.nvidia.model:DeepseekV4MoE.forward
+  why: with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE sm80_moe.Sm80DeepseekV41MoE calls it with (hidden_states, input_ids, mega_gate_metadata) and all-reduces the [tokens, hidden] output it returns, which on the modular (non-MegaMoE) path is the runner's output with the final all-reduce skipped
+  sha256: 53c36c52f5aec0d99b54534382463313148f151f77e01f0f57fb4da3e9dd946b
+  signature: '(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None, mega_gate_metadata: vllm.models.deepseek_v4.nvidia.model.MegaGateRoutingMetadata | None = None) -> torch.Tensor'
+
+- id: dsv41-moe-runner-final-all-reduce
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner._maybe_reduce_final_output
+  why: sm80_moe sets moe_config.skip_final_all_reduce after construction; the runner then returns the un-reduced combined routed + shared output (TP or EP > 1, no sequence parallelism, a fused output not reduced by the kernel) and the layer does the one all-reduce the runner would have done
+  sha256: 6a699287ced46d4ada35e4a7dcd1c173af1fae2c45e4110878d74fa765108ffe
+  signature: '(self, states: torch.Tensor, trunc_size: int | None, output_is_reduced: bool | None = None) -> torch.Tensor'
+
 - id: dsv41-topk-bias-router-init
   kind: method
   target: vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router:FusedTopKBiasRouter.__init__
@@ -1342,3 +1356,30 @@ seams:
   why: the proof inventory resolves the actual target and draft descriptor with the same batch-query compatibility rule as dispatch
   sha256: 67db5906f69666159eba6290ae57a5bc1230c975ca012f9acecc79d702f8ffa5
   signature: '(desc: vllm.v1.worker.gpu.cudagraph_utils.BatchExecutionDescriptor, num_reqs: int, num_tokens: int, uniform_token_count: int | None, num_active_loras: int, max_query_len: int | None, num_ubatches: int) -> bool'
+- id: dsv41-dspark-sample-sequential
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential
+  why: vllm/sm80/spec_decode/shard_argmax.py replaces its dense greedy path (base logits of every draft position once, then per step the anchor or last draft through markov_embed and markov_bias added to the base logits, the draft written to draft_tokens, the confidence head over the stacked Markov embeddings) and must draft the same tokens
+  sha256: 3781858bbd960f6c82e81332f716a8ca97e58dcdc260a6431fb2e9077f3c0160
+  signature: '(self, num_reqs: int, head_hidden: torch.Tensor) -> None'
+
+- id: dsv41-dspark-sample-logits
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_logits
+  why: with draft_logits None and no acceptance estimator a greedy draft is logits.argmax(dim=-1) mapped by map_draft_to_target; shard_argmax.py reproduces exactly that argmax (first index of the maximum, first NaN) and refuses the other cases
+  sha256: 28e1320d397e53507e39c01d7d54583147386a0a5a328e6d2452ab6957d1a92c
+  signature: '(self, logits: torch.Tensor, idx_map: torch.Tensor, sample_pos: torch.Tensor, step: int) -> torch.Tensor'
+
+- id: dsv41-logits-processor-forward
+  kind: method
+  target: vllm.model_executor.layers.logits_processor:LogitsProcessor.forward
+  why: with skip_gather the shard logits get the same soft cap and scale as the gathered ones, so shard_argmax.py compares the values the gathered row holds
+  sha256: 8d59778d071858e84cbd263207ebc0b2ef96e54cee5e8a37912ce1b02b02ba57
+  signature: '(self, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None = None, skip_gather: bool = False) -> torch.Tensor | None'
+
+- id: dsv41-logits-processor-get-logits
+  kind: method
+  target: vllm.model_executor.layers.logits_processor:LogitsProcessor._get_logits
+  why: the gathered row is the ranks' head outputs concatenated in rank order (all-gather on the last dim) and cut at org_vocab_size; shard_argmax.py numbers a rank's columns from rank * local width and stops at org_vocab_size
+  sha256: 50f037e79ede7e763cdc90b3bf38d87faa466101ca2088f23576aabb4cbedda6
+  signature: '(self, hidden_states: torch.Tensor, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, embedding_bias: torch.Tensor | None, skip_gather: bool = False) -> torch.Tensor | None'

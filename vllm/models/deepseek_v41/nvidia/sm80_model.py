@@ -298,6 +298,10 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             )
         model.__class__ = cls
         _adopt_layers(islice(model.layers, model.start_layer, model.end_layer), model.config)
+        if envs.VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER:
+            from .sm80_engram_prefetch import adopt_early_engram
+
+            adopt_early_engram(model)
         replay = model.decoder_replay_layers
         if replay is not None:
             # Upstream bound the replay's KV write to the layer before its
@@ -397,6 +401,14 @@ class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
         # Base logits through the target's EXL3 head; the Markov bias through
         # the upstream unquantized-head path, in the head dtype too.
         Exl3HeadLogitsProcessor.adopt(self.logits_processor)
+
+    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocabulary shard of ``compute_logits`` (no all-gather,
+        padding columns kept), for the per-rank greedy argmax
+        (``vllm/sm80/spec_decode/shard_argmax.py``)."""
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
 
     def load_weights(self, weights) -> set[str]:
         """Upstream ``load_weights``, without dropping the confidence head

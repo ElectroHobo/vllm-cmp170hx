@@ -31,11 +31,17 @@ import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
 )
 from vllm.sm80.kernels.exl3.quant import set_moe_prefill_v2
+from vllm.models.deepseek_v41.nvidia import model as upstream_model
+from vllm.models.deepseek_v41.nvidia.sm80_attention import (
+    large_round_once_all_reduce,
+    round_once_transport,
+)
 
 logger = init_logger(__name__)
 
@@ -155,3 +161,51 @@ def adopt_moe(ffn: nn.Module, config) -> None:
                 "%s; these MoE layers keep their kernels in prefill steps.",
                 reason,
             )
+    if envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE:
+        _adopt_round_once_all_reduce(ffn)
+
+
+def moe_all_reduce(out: torch.Tensor) -> torch.Tensor:
+    """The MoE output's TP all-reduce: rounded once per element when the fast
+    paths do not take ``out`` whole (``large_round_once_all_reduce`` of
+    sm80_attention); otherwise the runner's own ``tensor_model_parallel_all_reduce``."""
+    reduced = large_round_once_all_reduce(out)
+    if reduced is not None:
+        return reduced
+    return tensor_model_parallel_all_reduce(out)
+
+
+class Sm80DeepseekV41MoE(upstream_model.DeepseekV4MoE):
+    """The upstream DSv4.1 MoE with its runner's final all-reduce moved here
+    (``skip_final_all_reduce``) as :func:`moe_all_reduce`."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        mega_gate_metadata=None,
+    ) -> torch.Tensor:
+        out = super().forward(hidden_states, input_ids, mega_gate_metadata)
+        return moe_all_reduce(out)
+
+
+def _adopt_round_once_all_reduce(ffn: nn.Module) -> None:
+    """VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: the layer, not the runner,
+    all-reduces the MoE output, where the runner would."""
+    if type(ffn) is not upstream_model.DeepseekV4MoE:
+        raise TypeError(f"Unexpected DeepSeek-V4.1 MoE: {type(ffn).__name__}")
+    moe_config = ffn.experts.moe_config
+    if moe_config.is_sequence_parallel or moe_config.skip_final_all_reduce:
+        raise ValueError("the MoE output is not all-reduced by the runner")
+    if moe_config.tp_size == 1 and moe_config.ep_size == 1:
+        return
+    moe_config.skip_final_all_reduce = True
+    ffn.__class__ = Sm80DeepseekV41MoE
+    logger.info_once(
+        "DeepSeek-V4.1 sm_80: MoE outputs too large for the custom all-reduce "
+        "whole are all-reduced with one rounding per element on eager steps, "
+        "over %s (VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE=1; set 0 for the "
+        "runner's all-reduce)",
+        round_once_transport(),
+        scope="global",
+    )
