@@ -262,6 +262,7 @@ class Record:
     tensors: dict = field(default_factory=dict)
     in_graph: bool = False
     point_phase: str | None = None
+    deferred: list = field(default_factory=list)
 
     def put(self, **values: Any) -> Record:
         """Keep copies of ``values`` as they are now (tensors are copied on
@@ -271,6 +272,28 @@ class Record:
                 value = value.detach().clone()
             self.tensors[name] = value
         return self
+
+    def defer(self, materialize) -> Record:
+        """Resolve model-owned state after this eager call/graph replay.
+
+        The adapter must retain pre-write values for state the call mutates.
+        Never defer an ephemeral intermediate or a state another graph can
+        mutate before this record drains. Callbacks return flat tensor fields;
+        no callback is serialized. This avoids graph-sized copies of unused
+        paged cache capacity and duplicate table aliases.
+        """
+        self.deferred.append(materialize)
+        return self
+
+    def materialize(self) -> dict:
+        values = {k: _host(v) for k, v in self.tensors.items()}
+        for materialize in self.deferred:
+            extra = materialize()
+            overlap = values.keys() & extra.keys()
+            if overlap:
+                raise ValueError(f'duplicate deferred capture fields: {overlap}')
+            values.update({k: _host(v) for k, v in extra.items()})
+        return values
 
     def done(self) -> None:
         if self.in_graph:
@@ -351,7 +374,7 @@ def _write(
             continue
         key = _key(rec.family, rec.prefix, rec.rows, record_phase, owner)
         n = _counts.get(key, 0)
-        tensors = {k: _host(v) for k, v in rec.tensors.items()}
+        tensors = rec.materialize()
         size = sum(
             t.numel() * t.element_size()
             for t in tensors.values()

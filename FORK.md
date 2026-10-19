@@ -48,7 +48,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
 | `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 409 |
 | `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 141 |
-| `vllm/models/deepseek_v41/nvidia/sm80_pipeline_capture.py` | 143 |
+| `vllm/models/deepseek_v41/nvidia/sm80_pipeline_capture.py` | 184 |
 | `vllm/models/glm5next/nvidia/model_state.py` | 113 |
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
 | `vllm/models/glm5next/nvidia/sm80_mla.py` | 123 |
@@ -56,7 +56,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **14 files** | **5,170** |
+| **14 files** | **5,211** |
 
 ### `vllm/sm80/kernels/`
 
@@ -127,7 +127,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/__init__.py` | 34 |
 | `vllm/sm80/attention/__init__.py` | 2 |
 | `vllm/sm80/attention/triton_mla_sparse.py` | 386 |
-| `vllm/sm80/capture.py` | 509 |
+| `vllm/sm80/capture.py` | 532 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
 | `vllm/sm80/distributed/communicator.py` | 356 |
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
@@ -165,7 +165,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **41 files** | **10,779** |
+| **41 files** | **10,802** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -194,8 +194,8 @@ Files added elsewhere, grouped by top-level directory.
 | `CITATION.cff` | 7 |
 | `COMMUNITY_RECIPES.md` | 68 |
 | `NOTICE` | 9 |
-| `REVIEW.md` | 93 |
-| **4 files** | **177** |
+| `REVIEW.md` | 97 |
+| **4 files** | **181** |
 
 #### `.github/`
 
@@ -337,7 +337,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/model_executor/model_loader/test_exl3_override.py` | 247 |
 | `tests/models/deepseek_v41/__init__.py` | 0 |
 | `tests/models/deepseek_v41/sm80/__init__.py` | 0 |
-| `tests/models/deepseek_v41/sm80/attn_pipeline_cases.py` | 323 |
+| `tests/models/deepseek_v41/sm80/attn_pipeline_cases.py` | 326 |
 | `tests/models/deepseek_v41/sm80/construct.py` | 209 |
 | `tests/models/deepseek_v41/sm80/dsv41_ref.py` | 764 |
 | `tests/models/deepseek_v41/sm80/exl3_fixture.py` | 284 |
@@ -345,7 +345,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
 | `tests/models/deepseek_v41/sm80/fixtures/exl3_headers.json` | 25,297 |
 | `tests/models/deepseek_v41/sm80/fp64_cases.py` | 1,168 |
-| `tests/models/deepseek_v41/sm80/hybrid_consumer_cases.py` | 280 |
+| `tests/models/deepseek_v41/sm80/hybrid_consumer_cases.py` | 281 |
 | `tests/models/deepseek_v41/sm80/hybrid_fixture.py` | 189 |
 | `tests/models/deepseek_v41/sm80/hybrid_linear_cases.py` | 223 |
 | `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,508 |
@@ -364,9 +364,9 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 283 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attn_fused.py` | 212 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attn_fused_gpu.py` | 279 |
-| `tests/models/deepseek_v41/sm80/test_sm80_attn_pipeline_gpu.py` | 242 |
+| `tests/models/deepseek_v41/sm80/test_sm80_attn_pipeline_gpu.py` | 268 |
 | `tests/models/deepseek_v41/sm80/test_sm80_decoder_replay.py` | 37 |
-| `tests/models/deepseek_v41/sm80/test_sm80_index_topk.py` | 69 |
+| `tests/models/deepseek_v41/sm80/test_sm80_index_topk.py` | 98 |
 | `tests/models/deepseek_v41/sm80/test_sm80_index_topk_gpu.py` | 102 |
 | `tests/models/deepseek_v41/sm80/test_sm80_kernels_gpu.py` | 312 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused.py` | 299 |
@@ -450,7 +450,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **189 files** | **91,833** |
+| **189 files** | **91,892** |
 
 #### `tools/`
 
@@ -720,11 +720,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 158 |
-| Fork-added product lines | 49,570 |
+| Fork-added product lines | 49,634 |
 | Patched upstream files | 93 |
 | Patched upstream lines | +4,130 / -794 |
 | Patched upstream product files | 71 |
 | Patched upstream product lines | +3,558 / -244 |
-| Product lines added (new files and patches) | 53,128 |
+| Product lines added (new files and patches) | 53,192 |
 | Fork environment variables (flags) | 113 |
 | Unreferenced fork definitions | 2 (23 lines) |

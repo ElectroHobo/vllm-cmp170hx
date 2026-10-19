@@ -233,6 +233,9 @@ def pipeline_outputs(a, device, src):
                            ('scaled_index_weights', 'scaled_index_weights'), ('scores', 'index_scores_unmasked')):
         if recorded in a:
             ref[name] = a[recorded].to(device)
+    for name in ('qr', 'swa'):
+        if not F.bits_equal(cand[name], ref[name]):
+            raise ValueError(f'unchanged seed prologue boundary differs: {name}')
     # Reference score capture is unmasked at a source and later sources mask
     # only after the producer. Keep that same policy for the numerical rows.
     cfg = objects[0]

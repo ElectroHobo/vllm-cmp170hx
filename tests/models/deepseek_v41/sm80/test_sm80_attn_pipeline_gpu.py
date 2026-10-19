@@ -240,3 +240,29 @@ def test_preprofile_runner_scratch_survives_capture_streams_without_growth(monke
             assert get() is original
         torch.cuda.current_stream().wait_stream(capture_stream)
         assert torch.cuda.memory_allocated() == allocated
+
+
+def test_coupled_cache_graph_snapshot_retains_only_prewrite_rows():
+    from types import SimpleNamespace
+    from vllm.sm80.capture import Record
+    from vllm.models.deepseek_v41.nvidia.sm80_pipeline_capture import defer_cache
+
+    cache = torch.arange(6 * 4 * 8, device='cuda').view(6, 4, 8)
+    slots = torch.tensor([8, 21], device='cuda')
+    batch = SimpleNamespace(comp_block_table=torch.tensor([[2, 5]], device='cuda'),
+        comp_slots=slots, positions=torch.tensor([9, 10], device='cuda'),
+        token_to_req=torch.tensor([0, 0], device='cuda'), swa_slots=slots)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        record = Record('attn', 'attn_pipeline', 'test', 2, {})
+        record.defer(defer_cache('comp', cache, batch, 2))
+        cache[slots // 4, slots % 4] += 1
+    for _ in range(3):
+        before = cache.cpu().clone()
+        graph.replay()
+        captured = record.materialize()
+        ids = captured['blocks.comp']
+        assert torch.equal(captured['comp'], before[ids])
+        assert torch.equal(captured['post.comp'], cache.cpu()[ids])

@@ -7,7 +7,7 @@ import torch
 
 from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
 from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_pipeline as pipe
-from vllm.models.deepseek_v41.nvidia.sm80_pipeline_capture import snapshot_cache
+from vllm.models.deepseek_v41.nvidia.sm80_pipeline_capture import defer_cache
 
 
 def config(**kwargs):
@@ -36,18 +36,47 @@ def test_pipeline_and_pre_rope_modes_are_mutually_exclusive():
                           fused=True, pipeline=True, workspace=object())
 
 
-def test_cache_snapshot_preserves_aliases_and_negative_slots():
+def test_deferred_cache_preserves_prestate_aliases_and_ignores_unused_capacity():
+    from types import SimpleNamespace
+    from vllm.sm80.capture import Record
+
     cache = torch.arange(6 * 4 * 8).view(6, 4, 8)
-    table = torch.tensor([[2, 4], [2, 5]], dtype=torch.int32)
+    original = cache.clone()
+    table = torch.full((2, 65536), 9999, dtype=torch.int32)
+    table[:, :2] = torch.tensor([[2, 4], [2, 5]], dtype=torch.int32)
+    slots = torch.tensor([8, 9, 21, -1])
+    batch = SimpleNamespace(comp_block_table=table, comp_slots=slots,
+        positions=torch.tensor([9, 10, 11, 0]), token_to_req=torch.tensor([0, 0, 1, 1]),
+        swa_slots=slots)
+    record = Record('attn', 'attn_pipeline', 'test', 4, {})
+    record.defer(defer_cache('comp', cache, batch, 2))
+    valid = slots[slots >= 0]
+    cache[valid // 4, valid % 4] += 1000
+    out = record.materialize()
+    ids, before, after = out['blocks.comp'], out['comp'], out['post.comp']
+    assert ids.unique().numel() == ids.numel() <= cache.shape[0]
+    assert torch.equal(before, original[ids])
+    assert torch.equal(after, cache[ids])
+    bt, ss = out['batch.comp_block_table'], out['batch.comp_slots']
+    assert bt[0, 0] == bt[1, 0]
+    assert ss[-1] == -1 and bool((bt[:, 2:] == 0).all())
+    for slot, mapped in zip(slots[:-1], ss[:-1]):
+        assert torch.equal(original[slot // 4, slot % 4], before[mapped // 4, mapped % 4])
+    with pytest.raises(ValueError, match='duplicate deferred'):
+        record.put(comp=torch.empty(0)).materialize()
+
+
+def test_deferred_window_keeps_negative_indices_and_slot_aliases():
+    from types import SimpleNamespace
+
+    cache = torch.arange(6 * 4 * 8).view(6, 4, 8)
     slots = torch.tensor([8, 9, 21, -1])
     indices = torch.tensor([[8, 9, -1], [8, 21, -1]], dtype=torch.int32)
-    copied, ids, bt, ss, ii = snapshot_cache(cache, table=table, slots=slots, indices=indices)
-    assert bt[0, 0] == bt[1, 0]
+    batch = SimpleNamespace(swa_slots=slots, swa_indices=indices)
+    out = defer_cache('swa', cache, batch, 0)()
+    ss, ii = out['batch.swa_slots'], out['batch.swa_indices']
     assert ss[0] == ii[0, 0] == ii[1, 0]
     assert ss[-1] == -1 and bool((ii[:, -1] == -1).all())
-    for s, mapped in zip(slots[:-1], ss[:-1]):
-        assert torch.equal(cache[s // 4, s % 4], copied[mapped // 4, mapped % 4])
-    assert bool((ids == 0).any())
 
 
 def test_index_select_family_rejects_nonfinite_visible_arithmetic():

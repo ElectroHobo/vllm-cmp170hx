@@ -49,7 +49,11 @@ hashes, duplicate sources, missing coverage and a non-unique or non-byte-linked
 actual grouped output consumer. Coverage includes every reached supported
 padded count in each rank's scheduler census, with target/draft short/long
 contexts. Aliased physical cache blocks are checked and compacted; exports
-are immutable and use the existing captured_sha256/concurrency protocol. Independent FP64 references retain BF16
+are immutable and use the existing captured_sha256/concurrency protocol.
+The unified diagnostic boot retains only pre-write cache slots in each graph;
+model-owned deferred materialization gathers unique visible physical blocks at
+the synchronized drain and reconstructs pre-state. It does not retain one
+full-capacity, duplicate-padded cache shadow per layer and graph shape. Independent FP64 references retain BF16
 storage points and official weights. Preselected captures can screen the
 output epilogue only; they are never complete pipeline evidence.
 
