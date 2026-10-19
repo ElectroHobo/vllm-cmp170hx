@@ -58,6 +58,10 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV41SparseSWAMetadataBuilder,
 )
 from vllm.platforms import current_platform
+from vllm.sm80.distributed.round_once_all_reduce import (
+    grouped_round_once_takes,
+    nccl_round_once_all_reduce,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.sm80.kernels.exl3.quant import set_output_dtype
 from vllm.v1.attention.backend import MultipleOf
@@ -368,10 +372,11 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         if self._wo_b_bf16_pieces:
             logger.info_once(
                 "DeepSeek-V4.1 sm_80: wo_b partials too large for the custom "
-                "all-reduce whole are all-reduced in BF16 through it in pieces "
-                "on eager steps, FP32 accumulation and one rounding per element "
+                "all-reduce whole are all-reduced in BF16 with one rounding per "
+                "element on eager steps, over %s "
                 "(VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE=1; set 0 to "
                 "all-reduce them in FP32)",
+                round_once_transport(),
                 scope="global",
             )
 
@@ -692,21 +697,51 @@ def custom_all_reduce_pieces(t: torch.Tensor) -> list[torch.Tensor] | None:
     return pieces
 
 
+def round_once_transport() -> str:
+    return (
+        "grouped NCCL send/recv (VLLM_ROUND_ONCE_ALLREDUCE_GROUPED=1)"
+        if envs.VLLM_ROUND_ONCE_ALLREDUCE_GROUPED
+        else "the custom all-reduce in pieces"
+    )
+
+
+def large_round_once_all_reduce(t: torch.Tensor) -> torch.Tensor | None:
+    """The round-once all-reduce of a message the TP group's fast paths do not
+    take whole (the host-staged path and the custom all-reduce; prefill-sized
+    messages): with VLLM_ROUND_ONCE_ALLREDUCE_GROUPED over grouped NCCL
+    send/recv (the exact sum correctly rounded), else through the custom
+    all-reduce in pieces (:func:`custom_all_reduce_pieces`, the FP32 sum in a
+    fixed order rounded once). None when the chosen transport does not apply:
+    the caller keeps its own path."""
+    if envs.VLLM_ROUND_ONCE_ALLREDUCE_GROUPED:
+        comm = get_tp_group().device_communicator
+        host = getattr(comm, "hostshm_comm", None)
+        ca = getattr(comm, "ca_comm", None)
+        if (host is not None and host.should_host_ar(t)) or (
+            ca is not None and not ca.disabled and ca.should_custom_ar(t)
+        ):
+            return None
+        if not grouped_round_once_takes(t, comm):
+            return None
+        return nccl_round_once_all_reduce(t, comm.pynccl_comm)
+    pieces = custom_all_reduce_pieces(t)
+    return None if pieces is None else all_reduce_in_pieces(t, pieces)
+
+
 def wo_b_all_reduce(
-    partial: torch.Tensor, bf16_when_custom: bool, bf16_in_pieces: bool
+    partial: torch.Tensor, bf16_when_custom: bool, bf16_large: bool
 ) -> torch.Tensor:
     """Sum the ``wo_b`` partials of the TP ranks, rounding once to BF16: in
     FP32; with ``bf16_when_custom`` as BF16 when the custom all-reduce (FP32
     accumulation in a fixed order, one rounding) takes the message; with
-    ``bf16_in_pieces`` as BF16 through that custom all-reduce piece by piece
-    when the message is too large for it whole but it takes the pieces
-    (:func:`custom_all_reduce_pieces`)."""
+    ``bf16_large`` as BF16 through :func:`large_round_once_all_reduce` when
+    the message is too large for it whole."""
     if bf16_when_custom and custom_all_reduce_takes(partial):
         return tensor_model_parallel_all_reduce(partial)
-    if bf16_in_pieces:
-        pieces = custom_all_reduce_pieces(partial)
-        if pieces is not None:
-            return all_reduce_in_pieces(partial, pieces)
+    if bf16_large:
+        out = large_round_once_all_reduce(partial)
+        if out is not None:
+            return out
     return tensor_model_parallel_all_reduce(partial.float()).to(partial.dtype)
 
 

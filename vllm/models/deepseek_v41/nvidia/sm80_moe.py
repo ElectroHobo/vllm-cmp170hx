@@ -35,8 +35,8 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 )
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia.sm80_attention import (
-    all_reduce_in_pieces,
-    custom_all_reduce_pieces,
+    large_round_once_all_reduce,
+    round_once_transport,
 )
 
 logger = init_logger(__name__)
@@ -154,14 +154,12 @@ def adopt_moe(ffn: nn.Module, config) -> None:
 
 
 def moe_all_reduce(out: torch.Tensor) -> torch.Tensor:
-    """The MoE output's TP all-reduce: through the custom all-reduce in pieces
-    when it takes ``out`` only in pieces (see
-    :func:`~vllm.models.deepseek_v41.nvidia.sm80_attention.custom_all_reduce_pieces`),
-    FP32 accumulation and one rounding per element; otherwise the runner's
-    own ``tensor_model_parallel_all_reduce``."""
-    pieces = custom_all_reduce_pieces(out)
-    if pieces is not None:
-        return all_reduce_in_pieces(out, pieces)
+    """The MoE output's TP all-reduce: rounded once per element when the fast
+    paths do not take ``out`` whole (``large_round_once_all_reduce`` of
+    sm80_attention); otherwise the runner's own ``tensor_model_parallel_all_reduce``."""
+    reduced = large_round_once_all_reduce(out)
+    if reduced is not None:
+        return reduced
     return tensor_model_parallel_all_reduce(out)
 
 
@@ -193,9 +191,9 @@ def _adopt_round_once_all_reduce(ffn: nn.Module) -> None:
     ffn.__class__ = Sm80DeepseekV41MoE
     logger.info_once(
         "DeepSeek-V4.1 sm_80: MoE outputs too large for the custom all-reduce "
-        "whole are all-reduced through it in pieces on eager steps, FP32 "
-        "accumulation and one rounding per element "
-        "(VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE=1; set 0 for the runner's "
-        "all-reduce)",
+        "whole are all-reduced with one rounding per element on eager steps, "
+        "over %s (VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE=1; set 0 for the "
+        "runner's all-reduce)",
+        round_once_transport(),
         scope="global",
     )

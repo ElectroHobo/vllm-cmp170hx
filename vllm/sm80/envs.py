@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
     VLLM_HOST_ALLREDUCE: bool = False
+    VLLM_ROUND_ONCE_ALLREDUCE_GROUPED: bool = False
     VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_EXL3_DENSE_SPLITK: bool = False
     VLLM_EXL3_DENSE_MMA: bool = False
@@ -706,6 +707,20 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_HOST_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_HOST_ALLREDUCE", "0"))
     ),
+    # Round-once all-reduce of large messages for the model call sites that ask
+    # for one (DeepSeek-V4.1: VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE and
+    # VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE) over grouped NCCL send/recv:
+    # a reduce-scatter in the message dtype, each rank's chunk summed in FP64
+    # in rank order and rounded once (the exact sum correctly rounded while the
+    # partials' magnitudes lie within about 2^40 of each other), then an
+    # all-gather. The same bytes as NCCL's ring, which instead rounds every hop
+    # (TP4: about a third of BF16 elements differ from the correct rounding).
+    # Off: those call sites use the custom all-reduce in pieces (slower at
+    # prefill sizes). Eager steps only. Default OFF. Any TP size; see
+    # vllm/sm80/distributed/round_once_all_reduce.py.
+    "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED": lambda: bool(
+        int(os.getenv("VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", "0"))
+    ),
     # Largest message the host path serves; anything above goes to NCCL. 512 KiB
     # is where the measured curve stops paying: at 8-256 KiB the host path is
     # 1.06-2.04x NCCL, while prefill-sized messages (>= 2 MiB) already run near
@@ -825,8 +840,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # DeepSeek-V4.1 on sm_80: all-reduce a wo_b partial that is too large for
     # the custom all-reduce to take whole (prefill and mixed steps; above 819
-    # rows of 5120 at the 8 MiB buffer) in BF16 through that same custom
-    # all-reduce, in pieces below its buffer size, when it takes every piece.
+    # rows of 5120 at the 8 MiB buffer) in BF16, rounded once: over grouped
+    # NCCL send/recv with VLLM_ROUND_ONCE_ALLREDUCE_GROUPED, else through that
+    # same custom all-reduce in pieces below its buffer when it takes them.
     # Each element is summed in FP32 in a fixed order and rounded to BF16
     # once, as on the FP32 path and in the reference's RowParallelLinear
     # (y.float(), all_reduce, type_as). The FP32 sum of four BF16 partials is
@@ -843,15 +859,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # DeepSeek-V4.1 on sm_80: all-reduce the MoE output partial (routed experts
     # plus the shared-expert shard, BF16) that is too large for the custom
-    # all-reduce to take whole (prefill and mixed steps) through that custom
-    # all-reduce in pieces, as VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE does
-    # for wo_b, instead of NCCL's BF16 ring. Precision: NCCL's ring stores every
+    # all-reduce to take whole (prefill and mixed steps) rounded once, as
+    # VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE does for wo_b (grouped NCCL
+    # with VLLM_ROUND_ONCE_ALLREDUCE_GROUPED, else the custom all-reduce in
+    # pieces), instead of NCCL's BF16 ring. Precision: NCCL's ring stores every
     # hop's sum in BF16, so a TP4 element is rounded three times (CPU emulation:
     # about a third of the elements differ from one rounding of the FP32 sum);
-    # the custom all-reduce sums each element in FP32 in a fixed order and rounds
-    # once, as it already does for the decode-sized messages it takes whole and
-    # as the reference all-reduces its MoE output in FP32. Speed: the custom
-    # all-reduce moves the same BF16 bytes more slowly than NCCL at these sizes.
+    # round-once paths round each element once (grouped: the correctly rounded
+    # sum; pieces: the FP32 sum in a fixed order), as the custom all-reduce
+    # already does for the decode-sized messages it takes whole and as the
+    # reference all-reduces its MoE output in FP32. Speed: grouped moves the
+    # ring's bytes; the custom all-reduce pieces move them more slowly.
     # The layer does the reduction the runner would do (skip_final_all_reduce);
     # every other message takes the communicator's usual path. Eager steps
     # only. Default OFF: unset, the runner all-reduces the MoE output as today.
