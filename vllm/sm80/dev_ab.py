@@ -44,6 +44,20 @@ returning to true reuses them, never recaptures. Both operations require a drain
 server and a newer generation. RPC replies include the full graph inventory,
 K-table dispatch coverage and per-arm capture bytes. These are allocation deltas,
 not standalone graph-pool measurements; shared pool reuse is charged once.
+
+Diagnostic ``VLLM_SM80_CAPTURE_DIR`` cannot be combined with the A/B switch:
+its graph-store bindings do not preserve both arm stores. Configuration refuses
+this composition before installing either A/B extension.
+
+With server dev mode enabled, the scheduler extension also accepts declared
+completion arrays via ``vllm_xargs.dev_ab_batch`` (a JSON manifest with ``id``
+and ``rows`` containing token counts and SHA256 hashes). ``begin_ab_batch``
+installs actual per-step execution tracing against an established same-arm
+reference; ``end_ab_batch`` validates completeness and removes tracing. Both
+RPCs and ordered admission require both development gates. They record actual
+row order, verification/draft K, input tensors and target/draft descriptors,
+not merely the graphs captured at boot. Pin mismatches never count as identity.
+These synchronizing controls are for correctness, not timing.
 """
 
 import functools
@@ -678,6 +692,10 @@ def configure(vllm_config) -> None:
     name = envs.VLLM_DEV_AB_SWITCH
     if not name:
         return
+    if envs.VLLM_SM80_CAPTURE_DIR:
+        raise ValueError(
+            "VLLM_DEV_AB_SWITCH cannot be combined with VLLM_SM80_CAPTURE_DIR"
+        )
     if name not in SWITCHES:
         raise ValueError(
             f"VLLM_DEV_AB_SWITCH={name!r} is not one of: "
@@ -690,6 +708,9 @@ def configure(vllm_config) -> None:
             f"{parallel_config.worker_extension_cls!r} is already set"
         )
     parallel_config.worker_extension_cls = EXTENSION_QUALNAME
+    if envs.VLLM_SERVER_DEV_MODE:
+        from vllm.sm80.dev_ab_batch import configure as configure_ordered_batches
+        configure_ordered_batches(vllm_config)
     if not envs.VLLM_SERVER_DEV_MODE:
         logger.warning_once(
             "VLLM_DEV_AB_SWITCH=%s without VLLM_SERVER_DEV_MODE=1: "
@@ -1154,6 +1175,7 @@ def _all_ranks_same_state() -> bool:
 
 
 def _report(worker, ok: bool, reason: str) -> dict[str, Any]:
+    from vllm.sm80.dev_ab_batch import capability
     switch = _STATE.switch
     return {
         "ok": ok,
@@ -1170,6 +1192,7 @@ def _report(worker, ok: bool, reason: str) -> dict[str, Any]:
         "graph_bytes": _STATE.capture_bytes,
         "dynamic_coverage": _STATE.saved.get("dynamic_coverage", []),
         "graph_inventory": _STATE.saved.get("graph_inventory", []),
+        "ordered_batch_protocol": capability(worker.model_runner),
     }
 
 
@@ -1186,6 +1209,8 @@ def _set_arm(worker, arm: str, generation: int, replay: bool = True) -> dict[str
         reason = f"arm {arm!r} is not one of {ARMS}"
     elif type(generation) is not int or generation <= _STATE.generation:
         reason = f"generation {generation!r} is not newer than {_STATE.generation}"
+    elif "batch_trace" in _STATE.saved:
+        reason = "end the ordered batch before changing arm or replay"
     else:
         resident = _resident_requests(runner)
         if resident:
@@ -1257,3 +1282,14 @@ class DevABWorkerExtension:
         """This worker's switch state."""
         _resolve(self.model_runner)
         return _report(self, True, "")
+
+
+    def begin_ab_batch(self, manifest: dict, reference: str, establish: bool) -> dict:
+        """Begin exclusive ordered input and execution-shape attestation."""
+        from vllm.sm80.dev_ab_batch import begin
+        return begin(self, manifest, reference, establish)
+
+    def end_ab_batch(self) -> dict:
+        """Remove instrumentation and return actual per-step batch evidence."""
+        from vllm.sm80.dev_ab_batch import end
+        return end(self)
