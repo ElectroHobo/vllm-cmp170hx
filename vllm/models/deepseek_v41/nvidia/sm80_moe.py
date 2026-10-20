@@ -18,6 +18,8 @@ experts, and changes two things before the weights load:
   to select the top-k, the weights gathered from the unbiased scores,
   divided by their sum ``+ 1e-20`` and multiplied by the routed scaling
   factor, all in FP32 torch ops (graph-safe, no host synchronisation).
+  With ``VLLM_DEEPSEEK_V41_FUSED_ROUTE`` the same arithmetic after the gate
+  GEMM runs as one kernel (``ops/sm80_route.py``, the torch ops' bytes).
 
 The experts and the SwiGLU clamp run in the EXL3 MoE kernels
 (vllm/sm80/kernels/exl3/quant.py, ``swiglu_limit``). With
@@ -38,6 +40,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 )
 from vllm.sm80.kernels.exl3.quant import set_moe_prefill_v2
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
+from vllm.models.deepseek_v41.nvidia.ops import sm80_route
 from vllm.models.deepseek_v41.nvidia.sm80_attention import (
     large_round_once_all_reduce,
     round_once_transport,
@@ -96,6 +99,8 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
     """The upstream DSv4.1 router with the reference routing arithmetic."""
 
     gate_temp = 1.0
+    # VLLM_DEEPSEEK_V41_FUSED_ROUTE: route() as one kernel (ops/sm80_route.py).
+    fused_route = False
 
     def _compute_routing(
         self,
@@ -107,6 +112,21 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if router_logits.dtype != torch.float32:
             raise ValueError("DeepSeek-V4.1 routing needs FP32 router logits")
+        if self.fused_route and router_logits.is_cuda:
+            weights, ids = sm80_route.route_fused(
+                router_logits,
+                self.e_score_correction_bias,
+                self.top_k,
+                bias_vl=self.bias_vl,
+                input_ids=input_ids,
+                sentinel_lo=self.image_sentinel_lo,
+                sentinel_hi=self.image_sentinel_lo + IMAGE_SENTINEL_IDS,
+                renormalize=self.renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            if indices_type is None or indices_type == torch.int32:
+                return weights, ids
+            return weights, ids.to(indices_type)
         weights, ids = route(
             router_logits,
             self.e_score_correction_bias,
@@ -153,6 +173,18 @@ def adopt_moe(ffn: nn.Module, config) -> None:
         raise TypeError(f"Unexpected DeepSeek-V4.1 router: {type(router).__name__}")
     router.__class__ = Sm80DeepseekV41Router
     router.gate_temp = float(getattr(config, "gate_temp", 1.0))
+    if envs.VLLM_DEEPSEEK_V41_FUSED_ROUTE:
+        reason = sm80_route.supports(
+            router.global_num_experts, router.top_k, router.gate_temp
+        )
+        if reason is not None:
+            raise ValueError(f"VLLM_DEEPSEEK_V41_FUSED_ROUTE: {reason}")
+        router.fused_route = True
+        logger.info_once(
+            "DeepSeek-V4.1 sm_80: MoE routing after the gate GEMM runs as one "
+            "kernel (VLLM_DEEPSEEK_V41_FUSED_ROUTE=1)",
+            scope="global",
+        )
     if envs.VLLM_DEEPSEEK_V41_MOE_PREFILL_TC:
         reason = set_moe_prefill_v2(ffn.experts.routed_experts)
         if reason is not None:

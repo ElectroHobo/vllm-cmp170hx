@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
@@ -925,6 +926,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Default OFF. Read in vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
     "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the MoE routing after the FP32 gate GEMM
+    # (sqrt-softplus, bias select and add, top-k, gather, renormalisation,
+    # scale, int32 ids: fifteen torch kernels per layer) as one Triton kernel
+    # (ops/sm80_route.py) with the torch ops' arithmetic and order, so the
+    # same bytes. Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_FUSED_ROUTE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ROUTE", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the attention core of decode, speculative verify
     # and draft steps (the norms and window row of prepare_layer, the query

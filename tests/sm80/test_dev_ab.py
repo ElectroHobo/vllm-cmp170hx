@@ -173,6 +173,7 @@ def test_allowlist():
         "exl3_dense_prefill_tc",
         "dsv41_fused_mhc",
         "dsv41_fused_mhc_finish",
+        "dsv41_fused_route",
         "dsv41_fused_attn_decode",
         "dsv41_attn_pipeline",
         "dsv41_moe_prefill_tc",

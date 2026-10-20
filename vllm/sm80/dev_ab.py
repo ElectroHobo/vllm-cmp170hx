@@ -583,6 +583,38 @@ def _mhc_finish_apply(runner, on: bool) -> None:
     sm80_mhc_fused.FINISH_KERNEL = on
 
 
+def _route_routers(runner):
+    from vllm.models.deepseek_v41.nvidia.sm80_moe import Sm80DeepseekV41Router
+
+    seen = set()
+    for module in _model_modules(runner):
+        router = getattr(module, "router", None)
+        if isinstance(router, Sm80DeepseekV41Router) and id(router) not in seen:
+            seen.add(id(router))
+            yield router
+
+
+def _route_unavailable(runner) -> str | None:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_route
+
+    routers = list(_route_routers(runner))
+    if not routers:
+        return "the served target/drafter has no sm_80 DeepSeek-V4.1 MoE routers"
+    for router in routers:
+        reason = sm80_route.supports(
+            router.global_num_experts, router.top_k, router.gate_temp
+        )
+        if reason is not None:
+            return reason
+    return None
+
+
+def _route_apply(runner, on: bool) -> None:
+    _set_env("VLLM_DEEPSEEK_V41_FUSED_ROUTE", on)
+    for router in _route_routers(runner):
+        router.fused_route = on
+
+
 def _dense_prefill_unavailable(runner) -> str | None:
     from vllm.sm80.kernels.exl3 import dense_prefill_tc, ops
 
@@ -615,6 +647,12 @@ SWITCHES: dict[str, Switch] = {
         Switch(
             "dsv41_fused_mhc_finish", "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", True, False,
             _mhc_finish_unavailable, _mhc_finish_current, _mhc_finish_apply,
+        ),
+        Switch(
+            "dsv41_fused_route", "VLLM_DEEPSEEK_V41_FUSED_ROUTE", True, True,
+            _route_unavailable,
+            lambda runner: any(r.fused_route for r in _route_routers(runner)),
+            _route_apply,
         ),
         Switch(
             "exl3_dense_prefill_tc", "VLLM_EXL3_DENSE_PREFILL_TC", True, False,
