@@ -1,3 +1,30 @@
+# Pipeline compressor circular predecessor
+
+The default-off attention pipeline now wraps a position-zero predecessor
+within its own ring, matching the existing Torch compressor. Triton lowers
+signed integer remainder to LLVM `srem`; `(position - 1) % capacity` is -1
+at position zero. The first row of a dummy request reads that predecessor
+even when its compressed-cache slot is padding. Clamping the ring slot to
+zero therefore previously read one row before the null ring block.
+Adding the capacity before subtracting one preserves the circular index for
+all supported nonnegative positions without changing pooling arithmetic,
+workspace ownership, graph mode, supported limits or flag defaults.
+
+The only production change is in `sm80_attn_pipeline.py`. Direct sibling
+ring stores require a nonnegative slot; the Torch reference already uses
+nonnegative remainder. No shared or upstream-owned production file changes.
+
+`test_sm80_pipeline_lifecycle.py` drives the actual launch wrapper and
+Triton interpreter through both predecessor loads, checking their addresses
+before dereferencing. It covers position zero, wrap boundaries, maximum
+context, null/owned blocks and padded strides. It also exercises actual
+manager-owned workspace allocations, ownership separation and locking.
+The address probe deliberately stops before unsupported libdevice math;
+it is not a GPU lifetime or numerical qualification. A focused CUDA test in
+`test_sm80_attn_pipeline_gpu.py` covers a fresh ring and graph pool before
+and after retirement with persistent production scratch; it remains unrun.
+The observed asynchronous CUDA fault still needs targeted device attribution.
+
 # Bounded prefill capture selection
 
 `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` is an opt-in integer control, default

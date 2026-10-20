@@ -50,7 +50,8 @@ def _compress_latent_kernel(raw, norm, ring, pos, req, qsl, slots, ring_slots,
         r = tl.load(req + t).to(tl.int64)
         first = t == tl.load(qsl + r)
         rs = tl.maximum(tl.load(ring_slots + t), 0).to(tl.int64)
-        ro = (rs // CAP) * rb + ((p - 1) % CAP) * re
+        # Triton uses signed remainder; position zero must wrap within the ring.
+        ro = (rs // CAP) * rb + ((p + CAP - 1) % CAP) * re
         if first:
             prev = tl.load(ring + ro + d)
             ps = tl.load(ring + ro + D + d)

@@ -266,3 +266,48 @@ def test_coupled_cache_graph_snapshot_retains_only_prewrite_rows():
         ids = captured['blocks.comp']
         assert torch.equal(captured['comp'], before[ids])
         assert torch.equal(captured['post.comp'], cache.cpu()[ids])
+
+
+def test_padding_ring_read_after_profile_pool_retirement(monkeypatch):
+    import gc
+    from vllm.v1.worker import workspace as wm
+
+    manager = wm.WorkspaceManager(torch.device('cuda'))
+    monkeypatch.setattr(wm, 'current_workspace_manager', lambda: manager)
+    execution_stream = torch.cuda.current_stream().cuda_stream
+    ws = pipe.workspace(48, 262144, 1280, 'cuda', 'target',
+                        execution_stream=execution_stream)
+    pointer = ws.latent.data_ptr()
+    raw = torch.zeros((1, 1024), dtype=torch.float32, device='cuda')
+    norm = torch.ones(512, dtype=BF16, device='cuda')
+    pos = torch.zeros(1, dtype=torch.int64, device='cuda')
+    req = torch.zeros(1, dtype=torch.int32, device='cuda')
+    qsl = torch.tensor([0, 1], dtype=torch.int32, device='cuda')
+    slots = torch.full((1,), -1, dtype=torch.int64, device='cuda')
+    for _ in range(2):
+        # Each phase owns a fresh cache and graph pool, like profiling then
+        # real capture. The manager-owned pipeline scratch remains live.
+        ring = torch.zeros((2, 8, 1024), dtype=torch.float32, device='cuda')
+        ring[0, 7, :512] = 2
+        _, expected = core.compress_rows(raw, norm, ring.clone(), pos, req,
+            qsl, slots, slots, 2, 512, 1e-6)
+        def run():
+            pipe.compress_rows(raw, norm, ring, pos, req, qsl, slots, slots,
+                2, 512, 1e-6, latent=ws.latent, closes=ws.closes)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        pool = torch.cuda.graph_pool_handle()
+        with torch.cuda.graph(graph, pool=pool, stream=stream):
+            run()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert F.bits_equal(ws.latent[:1], expected)
+        assert not bool(ws.closes[0])
+        assert ws.latent.data_ptr() == pointer
+        del graph, pool, ring, expected, run, stream
+        gc.collect()
+        torch.cuda.empty_cache()
