@@ -715,7 +715,7 @@ def test_hybrid_explicit_draft_phase_during_prefill(monkeypatch, tmp_path):
 
     cfg = c._Config(str(tmp_path), frozenset({"hybrid"}), re.compile(".*"),
                     re.compile(".*"), frozenset({1}), 2, frozenset({1}), 65,
-                    1 << 20, 0, 0)
+                    1 << 20, 0, 0, prefill_per_key=0)
     monkeypatch.setattr(c, "_cfg", cfg)
     monkeypatch.setattr(c, "_step", {"real": True, "step": 1, "phase": "prefill",
                                    "query_lens": [128], "context_lens": [0], "context": "short"})

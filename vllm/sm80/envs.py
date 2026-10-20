@@ -135,6 +135,7 @@ if TYPE_CHECKING:
     VLLM_SM80_CAPTURE_PER_KEY: int = 2
     VLLM_SM80_CAPTURE_PREFILL_MATCH: str = ""
     VLLM_SM80_CAPTURE_PREFILL_CALLS: str = "1"
+    VLLM_SM80_CAPTURE_PREFILL_PER_KEY: int = 0
     VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS: int = 65
     VLLM_SM80_CAPTURE_MAX_MB: int = 4096
     VLLM_QWEN4_ROUTER_FP32: bool = False
@@ -1131,6 +1132,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # step calls (of at least _PREFILL_MIN_ROWS rows) that are saved.
     "VLLM_SM80_CAPTURE_PREFILL_CALLS": lambda: os.getenv(
         "VLLM_SM80_CAPTURE_PREFILL_CALLS", "1"
+    ),
+    # Positive: first N eligible prefill attempts per semantic key, including
+    # point and short/long context. Quota refusals count. Zero keeps ordinals.
+    "VLLM_SM80_CAPTURE_PREFILL_PER_KEY": lambda: int(
+        os.getenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "0")
     ),
     "VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS": lambda: int(
         os.getenv("VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS", "65")

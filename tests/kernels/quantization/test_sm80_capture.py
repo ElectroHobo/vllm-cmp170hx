@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kernel call capture (vllm/sm80/capture.py, VLLM_SM80_CAPTURE_DIR), CPU
-only: off by default; eager prefill calls are kept by prefix and ordinal;
+only: off by default; eager prefill calls use ordinals or opt-in semantic keys;
 decode calls by prefix up to the per-key count; records made while a CUDA
 graph is captured are bound to that graph and written after its replays,
 with the replaying manager as owner; dummy steps record nothing."""
@@ -34,6 +34,7 @@ def on(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_SM80_CAPTURE_ROWS", "6")
     monkeypatch.setenv("VLLM_SM80_CAPTURE_PER_KEY", "1")
     monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_CALLS", "2")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "0")
     monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS", "65")
     monkeypatch.setattr(cap, "active", True)
     monkeypatch.setattr(cap, "_cfg", None)
@@ -256,3 +257,152 @@ def test_glm_qwen_plain_linear_capture_keeps_host_materialization(on, prefix):
     plain = cap.Record("dense", "exl3_linear", prefix, 2, {}).put(x=x, out=out)
     assert not plain.deferred
     assert all(torch.equal(plain.materialize()[k], v) for k, v in expected.items())
+
+
+@pytest.mark.parametrize("setting", [None, "0"])
+def test_prefill_default_retains_sparse_ordinals(on, monkeypatch, setting):
+    if setting is None:
+        monkeypatch.delenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY")
+    else:
+        monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", setting)
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_CALLS", "1,3")
+    _step([2048])
+    for ordinal in range(1, 5):
+        rec = cap.begin("dense", "exl3_linear", PREFIX, 80)
+        assert (rec is not None) == (ordinal in (1, 3))
+        if rec is not None:
+            rec.put(x=torch.ones(80, 1)).done()
+    assert cap.config().prefill_per_key == 0
+    assert [torch.load(row["path"], weights_only=True)["meta"]["prefill_call"]
+            for row in _index(on)] == [1, 3]
+    # Legacy prefill deliberately ignores the ordinary per-key limit of one.
+    assert list(cap._counts.values()) == [2]
+
+
+@pytest.mark.parametrize("family", cap.FAMILIES)
+@pytest.mark.parametrize("limit", [1, 2])
+def test_prefill_per_key_covers_reached_rows_context_points(on, monkeypatch, family, limit):
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", family)
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", str(limit))
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_CALLS", "9999")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS", "1")
+    ordinals, calls, expected = {}, {}, []
+    for context in (0, cap.LONG_CONTEXT):
+        _step([2048], context=[context])
+        for rows in (17, 2048):
+            for point in ("producer", "consumer"):
+                for prefix in (PREFIX, PREFIX + ".other"):
+                    for attempt in range(limit + 1):
+                        ordinals[prefix] = ordinals.get(prefix, 0) + 1
+                        calls[rows] = calls.get(rows, 0) + 1
+                        rec = cap.begin(family, point, prefix, rows)
+                        assert (rec is not None) == (attempt < limit)
+                        if rec is not None:
+                            assert rec.meta["prefill_call"] == ordinals[prefix]
+                            rec.put(x=torch.full((rows, 1), float(ordinals[prefix]))).done()
+                            expected.append((point, prefix, rows, cap._step["context"],
+                                             ordinals[prefix]))
+    lines = _index(on)
+    assert len({row["path"] for row in lines}) == len(expected)
+    assert all(row["saved"] and row["phase"] == "prefill" for row in lines)
+    actual = []
+    for row in lines:
+        payload = torch.load(row["path"], weights_only=True)
+        ordinal = payload["meta"]["prefill_call"]
+        actual.append((row["point"], row["prefix"], row["rows"], row["context"], ordinal))
+        assert payload["family"] == row["point"]
+        assert payload["meta"]["module_prefix"] == row["prefix"]
+        assert torch.equal(payload["tensors"]["x"], torch.full((row["rows"], 1), float(ordinal)))
+    assert actual == expected
+    assert set(cap._counts.values()) == {limit}
+    assert cap._prefill_calls == {(family, prefix): n for prefix, n in ordinals.items()}
+    _step([1])  # Flush every reached call, including repeats rejected by the bound.
+    seen = json.loads((on / "rows_seen.json").read_text())
+    assert sorted(seen["eager_calls"], key=lambda x: x["rows"]) == [
+        {"family": family, "phase": "prefill", "rows": rows, "calls": n}
+        for rows, n in sorted(calls.items())
+    ]
+
+
+def test_prefill_per_key_preserves_filters_and_actual_phase(on, monkeypatch):
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "1")
+    _step([80], dummy=True)
+    assert cap.begin("dense", "projection", PREFIX, 80) is None
+    assert cap._prefill_calls == cap._seen == {}
+    _step([2048])
+    assert cap.begin("dense", "projection", PREFIX, 64) is None
+    assert cap.begin("dense", "projection", "layers.4.attn.wq_a", 80) is None
+    assert cap._prefill_calls == {}
+    with cap.phase_scope("draft"):
+        rec = cap.begin("dense", "projection", PREFIX, 80)
+        rec.put(x=torch.ones(80, 1)).done()
+        assert cap.begin("dense", "projection", PREFIX, 80) is None
+    rec = cap.begin("dense", "projection", PREFIX, 80)
+    assert rec.meta["prefill_call"] == 1
+    rec.put(x=torch.ones(80, 1)).done()
+    assert cap.begin("dense", "projection", PREFIX, 80) is None
+    assert [row["phase"] for row in _index(on)] == ["draft", "prefill"]
+    assert cap._prefill_calls == {("dense", PREFIX): 2}
+
+
+def test_prefill_per_key_distinguishes_exact_prefixes(on, monkeypatch):
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "1")
+    _step([80])
+    prefixes = [PREFIX + ".a/b", PREFIX + ".a_b"]
+    for number, prefix in enumerate(prefixes):
+        rec = cap.begin("dense", "projection", prefix, 80)
+        rec.put(x=torch.full((80, 1), number)).done()
+    lines = _index(on)
+    assert len({row["path"] for row in lines}) == 2
+    for number, row in enumerate(lines):
+        payload = torch.load(row["path"], weights_only=True)
+        assert payload["meta"]["module_prefix"] == prefixes[number]
+        assert torch.equal(payload["tensors"]["x"], torch.full((80, 1), number))
+
+
+def test_prefill_per_key_write_bound_is_per_owner(on, monkeypatch):
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "2")
+    _step([80])
+    records = [cap.begin("attn", "attention", PREFIX, 80) for _ in range(3)]
+    for rec in records:
+        rec.put(q=torch.ones(80, 1))
+    for owner in ("FirstOwner", "SecondOwner"):
+        cap._write(records, "prefill", owner, None)
+        cap._write(records, "prefill", owner, None)
+    lines = _index(on)
+    assert [row["owner"] for row in lines] == ["FirstOwner"] * 2 + ["SecondOwner"] * 2
+    assert [torch.load(row["path"], weights_only=True)["meta"]["prefill_call"]
+            for row in lines] == [1, 2, 1, 2]
+    assert set(cap._counts.values()) == {2}
+
+
+def test_prefill_per_key_quota_refusals_are_bounded_and_counted(on, monkeypatch):
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "2")
+    cfg = cap.config()
+    x = torch.ones(80, 1)
+    size = x.numel() * x.element_size()
+    cfg.max_bytes = 2 * size
+    _step([80])
+    for point in ("producer", "consumer"):
+        for _ in range(2):
+            cap.begin("dense", point, PREFIX, 80).put(x=x).done()
+        assert cap.begin("dense", point, PREFIX, 80) is None
+    lines = _index(on)
+    assert [row["saved"] for row in lines] == [True, True, False, False]
+    assert all(row["bytes"] == size for row in lines)
+    assert all("path" not in row and "sha256" not in row for row in lines if not row["saved"])
+    assert cap._bytes == [cfg.max_bytes]
+    assert set(cap._counts.values()) == {2}
+    assert cap._prefill_calls == {("dense", PREFIX): 6}
+    _step([1])
+    seen = json.loads((on / "rows_seen.json").read_text())
+    assert seen["eager_calls"] == [
+        {"family": "dense", "phase": "prefill", "rows": 80, "calls": 6}
+    ]
+
+
+def test_prefill_per_key_rejects_negative_limit_before_hooks(on, monkeypatch):
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "-1")
+    with pytest.raises(ValueError, match="PREFILL_PER_KEY must be nonnegative"):
+        cap.config()
+    assert cap._cfg is None and not on.exists()

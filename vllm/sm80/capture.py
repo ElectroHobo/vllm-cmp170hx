@@ -10,7 +10,7 @@ hand selected calls to :func:`begin`; the returned :class:`Record` keeps
 copies of the call's arguments and outputs, and every kept call becomes one
 file
 
-    <dir>/r<rank>/<family>/<prefix>-M<rows>-<phase>-<owner>-s<step>-<n>.pt
+    <dir>/r<rank>/<family>/<prefix-or-key>-M<rows>-<phase>-<owner>-s<step>-<n>.pt
     {"schema": "lab-point-capture/1", "family": <point>,
      "meta": {...}, "tensors": {argument or output: value}}
 
@@ -41,6 +41,12 @@ Selection (vllm.sm80.envs):
   _PREFILL_MIN_ROWS: in prefill steps, the prefixes and the ordinals (per
   family and prefix, from 1, over calls of at least _PREFILL_MIN_ROWS rows)
   that are kept.
+- VLLM_SM80_CAPTURE_PREFILL_PER_KEY: default 0 keeps the ordinal policy.
+  Positive N instead keeps the first N eligible attempts per (family, point,
+  exact prefix, rows, phase, owner, short/long context). Quota refusals also
+  consume an attempt; the reached-row census and actual prefill call ordinal
+  continue counting. These records use the semantic key hash in their filename
+  so different points at the same prefix cannot overwrite one another.
 - VLLM_SM80_CAPTURE_MAX_MB: bytes of tensors written per process; past it
   the index says ``saved: false``.
 
@@ -119,6 +125,7 @@ class _Config:
     max_bytes: int
     rank: int
     tp_rank: int
+    prefill_per_key: int
 
 
 def _ints(text: str) -> frozenset:
@@ -167,15 +174,19 @@ def config() -> _Config:
             max_bytes=envs.VLLM_SM80_CAPTURE_MAX_MB << 20,
             rank=rank,
             tp_rank=tp_rank,
+            prefill_per_key=envs.VLLM_SM80_CAPTURE_PREFILL_PER_KEY,
         )
+        if cfg.prefill_per_key < 0:
+            raise ValueError("VLLM_SM80_CAPTURE_PREFILL_PER_KEY must be nonnegative")
         os.makedirs(cfg.root, exist_ok=True)
         _install()
         _cfg = cfg
         logger.info(
             "Kernel call capture active (VLLM_SM80_CAPTURE_DIR=%s): families %s, "
-            "graph rows %s, %d per key, prefill calls %s; diagnostic boots only.",
+            "graph rows %s, %d per key, prefill calls %s, %d prefill attempts "
+            "per semantic key (0 uses ordinals); diagnostic boots only.",
             cfg.root, ",".join(sorted(families)), sorted(cfg.rows), cfg.per_key,
-            sorted(cfg.prefill_calls),
+            sorted(cfg.prefill_calls), cfg.prefill_per_key,
         )
     return _cfg
 
@@ -331,25 +342,40 @@ def begin(
             return None
         key = (family, prefix)
         _prefill_calls[key] = _prefill_calls.get(key, 0) + 1
-        if _prefill_calls[key] not in cfg.prefill_calls:
+        if cfg.prefill_per_key:
+            if _full(family, point, prefix, rows, phase, "eager"):
+                return None
+        elif _prefill_calls[key] not in cfg.prefill_calls:
             return None
         meta = dict(meta, prefill_call=_prefill_calls[key])
     elif not cfg.match.search(prefix) or _full(
-        family, prefix, rows, phase, "eager"
+        family, point, prefix, rows, phase, "eager"
     ):
         return None
     return Record(family, point, prefix, rows, meta, point_phase=point_phase)
 
 
-def _key(family: str, prefix: str, rows: int, phase: str, owner: str) -> tuple:
-    return (family, prefix, rows, phase, owner, _step.get("context"))
+def _key(
+    family: str, point: str, prefix: str, rows: int, phase: str, owner: str
+) -> tuple:
+    key = (family, prefix, rows, phase, owner, _step.get("context"))
+    if phase == "prefill" and config().prefill_per_key:
+        key += (point,)
+    return key
 
 
-def _full(family: str, prefix: str, rows: int, phase: str, owner: str) -> bool:
+def _full(
+    family: str, point: str, prefix: str, rows: int, phase: str, owner: str
+) -> bool:
+    cfg = config()
     if phase == "prefill":
-        return False
-    key = _key(family, prefix, rows, phase, owner)
-    return _counts.get(key, 0) >= config().per_key
+        if not cfg.prefill_per_key:
+            return False
+        limit = cfg.prefill_per_key
+    else:
+        limit = cfg.per_key
+    key = _key(family, point, prefix, rows, phase, owner)
+    return _counts.get(key, 0) >= limit
 
 
 def _host(value: Any) -> Any:
@@ -370,9 +396,10 @@ def _write(
     lines = []
     for rec in records:
         record_phase = rec.point_phase or phase
-        if _full(rec.family, rec.prefix, rec.rows, record_phase, owner):
+        if _full(rec.family, rec.point, rec.prefix, rec.rows, record_phase, owner):
             continue
-        key = _key(rec.family, rec.prefix, rec.rows, record_phase, owner)
+        key = _key(rec.family, rec.point, rec.prefix, rec.rows, record_phase, owner)
+        bounded_prefill = record_phase == "prefill" and cfg.prefill_per_key > 0
         n = _counts.get(key, 0)
         tensors = rec.materialize()
         size = sum(
@@ -397,6 +424,8 @@ def _write(
                 rows=rec.rows, graph=graph, sm_count=sm_count,
             )
             name = re.sub(r"[^A-Za-z0-9_.]", "_", rec.prefix)
+            if bounded_prefill:
+                name = hashlib.sha256(repr(key).encode()).hexdigest()
             folder = os.path.join(cfg.root, rec.family)
             os.makedirs(folder, exist_ok=True)
             path = os.path.join(
@@ -411,6 +440,7 @@ def _write(
                 line["sha256"] = hashlib.sha256(f.read()).hexdigest()
             line.update(saved=True, path=path)
             _bytes[0] += size
+        if line["saved"] or bounded_prefill:
             _counts[key] = n + 1
         lines.append(json.dumps(line) + "\n")
     if lines:
@@ -483,7 +513,10 @@ def _drain(manager, desc) -> None:
     records = getattr(manager.graphs.get(desc), "_sm80_capture_records", None)
     if not records:
         return
-    if all(_full(r.family, r.prefix, r.rows, r.point_phase or phase, owner) for r in records):
+    if all(
+        _full(r.family, r.point, r.prefix, r.rows, r.point_phase or phase, owner)
+        for r in records
+    ):
         return
     torch.cuda.current_stream().synchronize()
     graph = {

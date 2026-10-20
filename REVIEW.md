@@ -1,3 +1,31 @@
+# Bounded prefill capture selection
+
+`VLLM_SM80_CAPTURE_PREFILL_PER_KEY` is an opt-in integer control, default
+zero. Zero retains the existing sparse prefill ordinals and non-prefill
+limits. Positive values retain the first N eligible attempts per family,
+point, exact prefix, rows, actual phase, writer owner and existing short/long
+context. Existing prefix/minimum-row selectors still apply. Actual global
+prefill call ordinals and the full reached-row census remain unchanged.
+
+Quota refusals stay explicitly unsaved and consume an attempt in this mode,
+so an oversized repeated call cannot keep copying tensors indefinitely.
+Saved-byte accounting only advances on a successful write. Semantic-key
+filenames prevent different points or sanitized prefixes overwriting each
+other. No tensor, hook, driver, numerical threshold or disabled-path work
+is added; all changes are in fork-owned capture configuration and tests.
+
+Changed files: `vllm/sm80/capture.py`, `vllm/sm80/envs.py`,
+`tests/kernels/quantization/test_sm80_capture.py`, and the explicit config
+construction in `tests/models/deepseek_v41/sm80/test_fp64_cases.py`.
+The focused CPU checks cover all capture families, unseen rows/points and
+contexts, bounded repeats/refusals, exact prefix identity, writer owners,
+actual draft phase, selectors, census and unchanged ordinal defaults.
+The focused batch passed, including the existing graph ownership and plain
+GLM/Qwen materialization controls. CPU import preparation is not a native
+build or GPU qualification.
+No GPU or integrated-capture coverage is claimed; missing real source
+classes and byte-quota refusals must still fail downstream coverage checks.
+
 # Consolidated DeepSeek-V4.1 execution paths
 
 ## Intent and ownership
