@@ -3,6 +3,7 @@
 """EXL3 packed linear and whole-expert inference with BF16 activations."""
 
 import math
+import re
 from functools import cache, partial
 from pathlib import Path
 from typing import Any, Literal
@@ -341,21 +342,30 @@ EXPERT_VIEW_ALIGN_BYTES = 512
 
 def expert_buffer_views(
     matrices: list[PackedMatrix],
+    slices: list[tuple[slice, list[slice]]] | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """(trellis, suh, svh) views of whole packed matrices, in ``matrices``
-    order, into one new buffer per tensor kind (int16 trellis, FP16 suh, FP16
-    svh) on the default device. Each view is a contiguous tensor of the shape
-    Exl3PackedWeight allocates for the whole matrix, at an offset that is a
-    multiple of EXPERT_VIEW_ALIGN_BYTES (VLLM_EXL3_EXPERTS_CONTIGUOUS)."""
+    """(trellis, suh, svh) views of packed matrices, in ``matrices`` order,
+    into one new buffer per tensor kind (int16 trellis, FP16 suh, FP16 svh)
+    on the default device. ``slices``: per matrix the (input slice, output
+    slices) its Exl3PackedWeight loads (default: the whole matrix). Each view
+    is a contiguous tensor of the shape Exl3PackedWeight allocates for them,
+    at an offset that is a multiple of EXPERT_VIEW_ALIGN_BYTES
+    (VLLM_EXL3_EXPERTS_CONTIGUOUS)."""
+    if slices is None:
+        slices = [(slice(0, m.padded_in), [slice(0, m.padded_out)]) for m in matrices]
+    dims = [
+        (rows.stop - rows.start, sum(c.stop - c.start for c in cols), m.bits_x2)
+        for m, (rows, cols) in zip(matrices, slices, strict=True)
+    ]
     kinds = (
-        (torch.int16, lambda m: (m.padded_in // 16, m.padded_out // 16, 8 * m.bits_x2)),
-        (torch.float16, lambda m: (m.padded_in,)),
-        (torch.float16, lambda m: (m.padded_out,)),
+        (torch.int16, lambda k, n, bits_x2: (k // 16, n // 16, 8 * bits_x2)),
+        (torch.float16, lambda k, n, bits_x2: (k,)),
+        (torch.float16, lambda k, n, bits_x2: (n,)),
     )
     columns = []
     for dtype, shape_of in kinds:
         step = EXPERT_VIEW_ALIGN_BYTES // dtype.itemsize
-        shapes = [shape_of(matrix) for matrix in matrices]
+        shapes = [shape_of(*dim) for dim in dims]
         offsets, total = [], 0
         for shape in shapes:
             offsets.append(total)
@@ -802,11 +812,86 @@ class Exl3GroupedLinearMethod(Exl3LinearMethod):
         return torch.cat(outputs, dim=-1)
 
 
+def expert_tp_closed_reason(parallel) -> str | None:
+    """Why the routed experts cannot be split across the tensor-parallel
+    ranks of ``parallel`` (a FusedMoEParallelConfig with tp_size > 1), or
+    None."""
+    if (
+        parallel.use_ep
+        or parallel.dp_size != 1
+        or parallel.pcp_size != 1
+        or parallel.is_sequence_parallel
+        or parallel.enable_eplb
+        or parallel.use_all2all_kernels
+    ):
+        return (
+            "EXL3 tensor-parallel routed experts support no expert, data, "
+            "context or sequence parallelism, EPLB or all-to-all dispatch"
+        )
+    return None
+
+
+def tensor_parallel_expert_split(moe, prefix: str) -> tuple[int, slice]:
+    """(whole intermediate, this rank's columns) of every routed expert of
+    the MoE layer ``prefix`` at MoE tensor parallel size > 1 (vLLM without
+    --enable-expert-parallel). Each rank holds whole H128 blocks of every
+    expert's intermediate, in chunks as even as the blocks allow with the
+    larger chunks first (block_shard); rank r of layer L holds chunk
+    (r + L) mod the tensor parallel size, so the larger chunks move between
+    ranks from layer to layer. Gate and up keep the chunk's output columns,
+    down its input rows. Routing is unchanged: every rank holds every expert,
+    and the MoE's all-reduce sums the ranks' partial outputs."""
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    parallel = moe.moe_parallel_config
+    reason = expert_tp_closed_reason(parallel)
+    if reason is not None:
+        raise ValueError(reason)
+    for name in ("VLLM_EXL3_EXPERT_REPLICAS", "VLLM_EXL3_EXPERT_PLACEMENT"):
+        if getattr(envs, name):
+            raise ValueError(
+                f"{name} plans whole experts per rank: it needs "
+                "--enable-expert-parallel, not tensor-parallel routed experts"
+            )
+    intermediate = moe.intermediate_size
+    size, rank = parallel.tp_size, parallel.tp_rank
+    layer_index = extract_layer_index(prefix)
+
+    def chunk(rotation: int) -> slice:
+        return block_shard(intermediate, intermediate, rank, size, rotation)
+
+    columns = chunk(layer_index)
+    logger.info_once(
+        "EXL3 routed experts of %s are split across %d tensor-parallel ranks "
+        "(no expert parallelism): rank %d holds %s of each expert's %d "
+        "intermediate columns at layer index mod %d = 0..%d.",
+        re.sub(r"\d+", "<L>", prefix),
+        size,
+        rank,
+        tuple(part.stop - part.start for part in map(chunk, range(size))),
+        intermediate,
+        size,
+        size - 1,
+    )
+    logger.debug(
+        "EXL3 routed experts of %s: rank %d holds intermediate columns [%d, %d)",
+        prefix,
+        rank,
+        columns.start,
+        columns.stop,
+    )
+    return intermediate, columns
+
+
 class Exl3MoEMethod(FusedMoEMethodBase):
     # VLLM_EXL3_EXPERT_REPLICAS: this layer's replicas (create_weights) and
     # the resident bytes their copies add; None and 0 when off.
     replicas = None
     replica_bytes = 0
+    # Routed experts at MoE tensor parallel size > 1: (whole intermediate,
+    # this rank's columns of every expert) from tensor_parallel_expert_split;
+    # None with whole experts per rank.
+    expert_split = None
 
     @property
     def home_experts(self) -> int:
@@ -821,7 +906,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.config = config
         self.prefix = prefix
         if moe.moe_parallel_config.tp_size != 1:
-            raise ValueError("EXL3 routed experts require whole-expert EP, not TP")
+            self.expert_split = tensor_parallel_expert_split(moe, prefix)
         if moe.has_bias or moe.activation != MoEActivation.SILU:
             raise ValueError("EXL3 experts require bias-free SiLU gate/up/down")
         if moe.is_lora_enabled:
@@ -838,6 +923,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # Set by set_moe_prefill_v2 before the weights load: this layer's
         # prefill calls may take moe_out_prefill_v2 (its gate decides at load).
         self.prefill_v2 = False
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size,
+        intermediate_size_per_partition,
+        act_dtype,
+        moe_parallel_config,
+    ):
+        """Under tensor parallelism a rank's intermediate is its chunk of
+        whole H128 blocks (tensor_parallel_expert_split), not an even share."""
+        hidden_size, intermediate = super().maybe_roundup_sizes(
+            hidden_size, intermediate_size_per_partition, act_dtype, moe_parallel_config
+        )
+        if self.expert_split is not None:
+            columns = self.expert_split[1]
+            intermediate = columns.stop - columns.start
+        return hidden_size, intermediate
 
     def create_weights(
         self,
@@ -857,12 +959,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.replicas = expert_replicas.plan_layer(layer, self.config, self.prefix)
         if self.replicas is not None:
             num_experts += len(self.replicas.copies)
+        if self.expert_split is None:
+            intermediate, columns = intermediate_size_per_partition, None
+        else:
+            intermediate, columns = self.expert_split
+            if intermediate_size_per_partition != columns.stop - columns.start:
+                raise ValueError(
+                    "EXL3 tensor-parallel experts need this rank's intermediate "
+                    f"{columns.stop - columns.start}, not "
+                    f"{intermediate_size_per_partition}"
+                )
         self.intermediate_size = intermediate_size_per_partition
         self.local_experts = num_experts
         self.hidden_size = hidden_size
         self.global_expert_ids = [-1] * num_experts
         self.nonlocal_keys = []
-        # (local expert, matrix, logical in, logical out) in allocation order.
+        # (local expert, matrix, (logical in, logical out, input slice, output
+        # slices)) in allocation order.
         local_matrices = []
         for expert in range(layer.global_num_experts):
             local = layer._map_global_expert_id_to_local_expert_id(expert)
@@ -875,35 +988,39 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 matrix = self.config.manifest.matrices.get(prefix)
                 if matrix is None:
                     raise ValueError(f"Missing EXL3 expert matrix: {prefix}")
-                k, n = hidden_size, intermediate_size_per_partition
+                k, n = hidden_size, intermediate
                 if role == "down_proj":
                     k, n = n, k
                 matrix.validate_logical(k, n)
                 if local < 0:
                     self.nonlocal_keys.extend(matrix.keys)
+                    continue
+                self.global_expert_ids[local] = expert
+                whole_in = slice(0, matrix.padded_in)
+                whole_out = [slice(0, matrix.padded_out)]
+                if columns is None:
+                    part = (k, n, whole_in, whole_out)
+                elif role == "down_proj":
+                    # Down keeps this rank's input rows and every output.
+                    part = (columns.stop - columns.start, n, columns, whole_out)
                 else:
-                    self.global_expert_ids[local] = expert
-                    local_matrices.append((local, matrix, k, n))
+                    # Gate and up keep every input and this rank's outputs.
+                    part = (k, columns.stop - columns.start, whole_in, [columns])
+                local_matrices.append((local, matrix, part))
         views = [None] * len(local_matrices)
         if envs.VLLM_EXL3_EXPERTS_CONTIGUOUS and local_matrices:
-            views = expert_buffer_views([m for _, m, _, _ in local_matrices])
+            views = expert_buffer_views(
+                [matrix for _, matrix, _ in local_matrices],
+                [(part[2], part[3]) for _, _, part in local_matrices],
+            )
             logger.info_once(
                 "EXL3 routed experts in one buffer per MoE layer and tensor kind "
                 "(VLLM_EXL3_EXPERTS_CONTIGUOUS): trellis, suh and svh of every "
                 "local expert matrix are views."
             )
         weights = [[] for _ in range(num_experts)]
-        for (local, matrix, k, n), view in zip(local_matrices, views):
-            weights[local].append(
-                Exl3PackedWeight(
-                    matrix,
-                    k,
-                    n,
-                    slice(0, matrix.padded_in),
-                    [slice(0, matrix.padded_out)],
-                    views=view,
-                )
-            )
+        for (local, matrix, part), view in zip(local_matrices, views):
+            weights[local].append(Exl3PackedWeight(matrix, *part, views=view))
         if any(len(expert) != 3 for expert in weights):
             raise ValueError("EXL3 expert assignment is incomplete or duplicated")
         layer.exl3_experts = nn.ModuleList(nn.ModuleList(w) for w in weights)
@@ -1365,7 +1482,12 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config):
-        return moe_parallel_config.tp_size == 1
+        # Whole experts per rank, or every expert split across the
+        # tensor-parallel ranks (tensor_parallel_expert_split).
+        return (
+            moe_parallel_config.tp_size == 1
+            or expert_tp_closed_reason(moe_parallel_config) is None
+        )
 
     def moe_problem_size(self, a1, w1, w2, topk_ids):
         return (

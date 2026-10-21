@@ -135,6 +135,32 @@ not with data parallelism, EPLB, all-to-all dispatch, fused shared experts or
 `VLLM_EXL3_EXPERT_PLACEMENT`. Unknown checkpoint prefixes or experts and digest
 mismatches fail at startup.
 
+## Tensor-parallel routed experts
+
+With `--tensor-parallel-size` above 1 and without `--enable-expert-parallel`,
+every rank holds every routed expert, cut into whole 128-column blocks of the
+expert intermediate (the EXL3 Hadamard block). The blocks go to the ranks in
+chunks as even as they allow, the larger chunks first, and rank r of layer L
+holds chunk (r + L) mod the tensor parallel size, so the larger chunks move
+between ranks from layer to layer (the layer index is the one in vLLM's module
+name; an MTP drafter's layers follow the target's). DeepSeek-V4.1-Flash's
+2304-wide experts give 640, 640, 512 and 512 columns at tensor parallel size
+4: each rank holds 640 in 20 of the 40 target layers. Gate and up keep all
+inputs and the chunk's output columns (`suh` whole, `svh` of the chunk); down
+keeps the chunk's input rows (`suh` of the chunk) and all outputs (`svh`
+whole). The native operators run at the rank's width. Routing is unchanged:
+each rank routes the same rows over all experts with the identity expert map,
+and the MoE's tensor-parallel all-reduce adds the ranks' partial outputs, so
+final MoE bits need not match whole-expert EP. The startup log names each
+rank's widths. Not supported with data, context or sequence parallelism,
+EPLB, all-to-all dispatch, `VLLM_EXL3_EXPERT_REPLICAS` or
+`VLLM_EXL3_EXPERT_PLACEMENT` (both plan whole experts per rank). Whether the
+decode and prefill operators take a rank width is up to their gates
+(`ops.MOE_V2_CONFIGS`, `ops.MOE_PREFILL_V2_CONFIGS`); `moe_out` takes any.
+The block-aligned split rotated per layer follows the idea of the
+DeepSeek-V4.1-Flash CMP 170HX recipes of GNmac-lab and Curtis White
+(CurtisAccelerate); no code is taken from them.
+
 ## Third-party material
 
 Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.

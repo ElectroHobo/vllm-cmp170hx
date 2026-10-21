@@ -156,13 +156,18 @@ def aligned_shard(logical: int, padded: int, rank: int, size: int) -> slice:
     return slice(rank * width, (rank + 1) * width)
 
 
-def block_shard(logical: int, padded: int, rank: int, size: int) -> slice:
+def block_shard(
+    logical: int, padded: int, rank: int, size: int, rotation: int = 0
+) -> slice:
     """A TP shard of whole H128 blocks when the blocks need not divide evenly:
-    ranks below ``blocks % size`` take one block more. Only for a projection
-    whose shard width no other rank or layer depends on (Exl3Layout
-    .shards_unevenly)."""
-    if size <= 0 or not 0 <= rank < size:
-        raise ValueError("Invalid EXL3 shard rank/size")
+    chunks below ``blocks % size`` take one block more, and rank ``rank``
+    takes chunk ``(rank + rotation) % size``. Only for a projection whose
+    shard width no other rank or layer depends on (Exl3Layout
+    .shards_unevenly; routed experts at tensor parallel size > 1, whose
+    rotation is the layer index so the larger chunks move between ranks from
+    layer to layer)."""
+    if size <= 0 or not 0 <= rank < size or rotation < 0:
+        raise ValueError("Invalid EXL3 shard rank/size/rotation")
     if size == 1:
         return slice(0, padded)
     if logical != padded or logical % 128:
@@ -170,8 +175,9 @@ def block_shard(logical: int, padded: int, rank: int, size: int) -> slice:
     base, extra = divmod(logical // 128, size)
     if base == 0:
         raise ValueError(f"EXL3 cannot give {size} ranks a block of {logical}")
-    start = rank * base + min(rank, extra)
-    return slice(start * 128, (start + base + (rank < extra)) * 128)
+    chunk = (rank + rotation) % size
+    start = chunk * base + min(chunk, extra)
+    return slice(start * 128, (start + base + (chunk < extra)) * 128)
 
 
 class Exl3Manifest:
