@@ -615,6 +615,34 @@ def _route_apply(runner, on: bool) -> None:
         router.fused_route = on
 
 
+def _gemv_gates(runner) -> list:
+    """Every adopted DeepSeek-V4.1 MoE gate of the target and the drafter."""
+    from vllm.models.deepseek_v41.nvidia.sm80_moe import Sm80DeepseekV41Gate
+
+    return [m for m in _model_modules(runner) if isinstance(m, Sm80DeepseekV41Gate)]
+
+
+def _gate_gemv_unavailable(runner) -> str | None:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv
+
+    gates = _gemv_gates(runner)
+    if not gates:
+        return "the served target/drafter has no sm_80 DeepSeek-V4.1 MoE gates"
+    for gate in gates:
+        reason = sm80_gate_gemv.supports(*gate.weight.shape)
+        if reason is not None:
+            return reason
+    return None
+
+
+def _gate_gemv_apply(runner, on: bool) -> None:
+    """The kernel compiles and its scratch is allocated by the arm's eager
+    warmup call, before its graphs are captured."""
+    _set_env("VLLM_DEEPSEEK_V41_GATE_GEMV", on)
+    for gate in _gemv_gates(runner):
+        gate.gemv = on
+
+
 def _dense_prefill_unavailable(runner) -> str | None:
     from vllm.sm80.kernels.exl3 import dense_prefill_tc, ops
 
@@ -653,6 +681,11 @@ SWITCHES: dict[str, Switch] = {
             _route_unavailable,
             lambda runner: any(r.fused_route for r in _route_routers(runner)),
             _route_apply,
+        ),
+        Switch(
+            "dsv41_gate_gemv", "VLLM_DEEPSEEK_V41_GATE_GEMV", True, False,
+            _gate_gemv_unavailable,
+            lambda runner: any(g.gemv for g in _gemv_gates(runner)), _gate_gemv_apply,
         ),
         Switch(
             "exl3_dense_prefill_tc", "VLLM_EXL3_DENSE_PREFILL_TC", True, False,

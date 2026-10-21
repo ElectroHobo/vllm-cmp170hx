@@ -1234,7 +1234,7 @@ seams:
 - id: dsv41-gate-linear-forward
   kind: method
   target: vllm.model_executor.layers.fused_moe.router.gate_linear:GateLinear.forward
-  why: with every allow_* tier off and an FP32 weight, the fallback casts the BF16 input to FP32 and returns FP32 logits (the reference gate GEMM)
+  why: with every allow_* tier off and an FP32 weight, the fallback casts the BF16 input to FP32 and returns FP32 logits (the reference gate GEMM); sm80_moe.Sm80DeepseekV41Gate overrides it and delegates every call its GEMV does not take, returning the GEMV's logits through GateLinear._return
   sha256: ba0ba5a74fb55d4ed8e48537a38c464ef63acfe7612c977efd0d98af91e7043f
   signature: '(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.nn.parameter.Parameter | None]'
 

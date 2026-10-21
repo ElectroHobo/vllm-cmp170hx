@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
+    VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
@@ -949,6 +950,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # same bytes. Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
     "VLLM_DEEPSEEK_V41_FUSED_ROUTE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ROUTE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the MoE gate GEMM of calls of at most 64 rows
+    # (decode, speculative verify, draft) as one Triton kernel
+    # (ops/sm80_gate_gemv.py) that reads the BF16 input as is and computes the
+    # logits in FP64, rounded once to FP32, in place of the FP32 copy of the
+    # input, the FP32 GEMM and its split-K reduce. Not the FP32 GEMM's bytes:
+    # the correctly rounded FP32 logits, except where the exact value lies
+    # within the FP64 summation error of an FP32 rounding midpoint. Default
+    # OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_GATE_GEMV": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the attention core of decode, speculative verify
     # and draft steps (the norms and window row of prepare_layer, the query

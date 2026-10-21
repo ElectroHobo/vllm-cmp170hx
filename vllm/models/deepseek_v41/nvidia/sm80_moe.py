@@ -11,7 +11,10 @@ normalisation and scale differ from the reference in rounding (fast
 experts, and changes two things before the weights load:
 
 - the gate weight is kept in FP32 (the FP16 checkpoint values exactly) and
-  the gate computes ``x.float() @ weight.T`` in FP32;
+  the gate (:class:`Sm80DeepseekV41Gate`) computes ``x.float() @ weight.T``
+  in FP32; with ``VLLM_DEEPSEEK_V41_GATE_GEMV`` its decode-sized calls take
+  the BF16 input and compute the logits in FP64, rounded once to FP32, in one
+  kernel (``ops/sm80_gate_gemv.py``);
 - the runner's router is :class:`Sm80DeepseekV41Router`, whose
   :func:`route` is the reference ``Gate.forward``: ``sqrt(softplus(logits /
   gate_temp))``, the correction bias (``bias_vl`` for image tokens) used only
@@ -38,9 +41,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
 )
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.sm80.kernels.exl3.quant import set_moe_prefill_v2
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
-from vllm.models.deepseek_v41.nvidia.ops import sm80_route
+from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv, sm80_route
 from vllm.models.deepseek_v41.nvidia.sm80_attention import (
     large_round_once_all_reduce,
     round_once_transport,
@@ -140,9 +144,31 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
         return weights, ids.to(torch.int32 if indices_type is None else indices_type)
 
 
+class Sm80DeepseekV41Gate(GateLinear):
+    """The adopted gate: FP32 weight, FP32 logits. With ``gemv``
+    (VLLM_DEEPSEEK_V41_GATE_GEMV) a call that ``sm80_gate_gemv.serves`` (CUDA,
+    BF16, at most ``sm80_gate_gemv.MAX_ROWS`` rows) runs ``gate_gemv``; every
+    other call is ``GateLinear.forward`` (its FP32 fallback)."""
+
+    # VLLM_DEEPSEEK_V41_GATE_GEMV: decode-sized calls run gate_gemv.
+    gemv = False
+
+    def forward(self, x: torch.Tensor):
+        if (
+            self.gemv
+            and self.bias is None
+            and sm80_gate_gemv.serves(x, self.weight)
+        ):
+            return self._return(sm80_gate_gemv.gate_gemv(x, self.weight))
+        return super().forward(x)
+
+
 def _fp32_gate_weight(gate: nn.Module) -> None:
     """Hold the gate weight in FP32 so the checkpoint's FP16 values load
-    exactly, and route the gate's forward to its FP32 fallback."""
+    exactly, route the gate's forward to its FP32 fallback, and make an
+    upstream ``GateLinear`` a :class:`Sm80DeepseekV41Gate` (``gemv`` off)."""
+    if type(gate) is GateLinear:
+        gate.__class__ = Sm80DeepseekV41Gate
     weight = gate.weight
     if weight.dtype != torch.float32:
         fp32 = nn.Parameter(
@@ -183,6 +209,23 @@ def adopt_moe(ffn: nn.Module, config) -> None:
         logger.info_once(
             "DeepSeek-V4.1 sm_80: MoE routing after the gate GEMM runs as one "
             "kernel (VLLM_DEEPSEEK_V41_FUSED_ROUTE=1)",
+            scope="global",
+        )
+    if envs.VLLM_DEEPSEEK_V41_GATE_GEMV:
+        gate = ffn.gate
+        if not isinstance(gate, Sm80DeepseekV41Gate):
+            raise TypeError(
+                "VLLM_DEEPSEEK_V41_GATE_GEMV: unexpected DeepSeek-V4.1 gate "
+                f"{type(gate).__name__}"
+            )
+        reason = sm80_gate_gemv.supports(*gate.weight.shape)
+        if reason is not None:
+            raise ValueError(f"VLLM_DEEPSEEK_V41_GATE_GEMV: {reason}")
+        gate.gemv = True
+        logger.info_once(
+            "DeepSeek-V4.1 sm_80: MoE gate calls of at most %d rows compute the "
+            "logits in FP64 in one kernel (VLLM_DEEPSEEK_V41_GATE_GEMV=1)",
+            sm80_gate_gemv.MAX_ROWS,
             scope="global",
         )
     if envs.VLLM_DEEPSEEK_V41_MOE_PREFILL_TC:
