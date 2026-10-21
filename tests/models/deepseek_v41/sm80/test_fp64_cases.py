@@ -871,6 +871,11 @@ def test_call_order_keeps_a_call_together_and_alternates_strata():
     cases = [case(0, ["a"], "verify", 0), case(1, ["b", "c"], "verify", 0), case(2, ["d"], "decode", 1),
              case(3, ["a"], "verify", 0), case(4, ["b", "c"], "verify", 0), case(5, ["d"], "decode", 1)]
     assert [c["id"] for c in F.call_order(cases)] == ["c2", "c5", "c0", "c3", "c1", "c4"]
+    # The pipeline export also holds index_select cases (capture r3: 180 of 3072).
+    select = dict(case(6, ["e"], "verify", 0), family="index_select")
+    order = ["c2", "c5", "c0", "c3", "c6", "c1", "c4"]
+    assert [c["id"] for c in F.call_order(cases + [select])] == order
+    assert [c["id"] for c in F.call_order([select] + cases)] == order
 
 
 def test_the_outputs_of_one_call_replay_it_once(monkeypatch):

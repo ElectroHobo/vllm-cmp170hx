@@ -1061,6 +1061,8 @@ POINTS = {
 # Families whose outputs of one captured call are replayed once (the replay
 # caches its last arguments by identity): their cases share the loaded source.
 REPLAYED_ONCE = {"attn_pipeline", "attn_wo_a_consumer"}
+# The families of the attention pipeline exports, ordered by call_order.
+PIPELINE_EXPORT = REPLAYED_ONCE | {"index_select"}
 _LOADED: dict[str, dict] = {}
 
 
@@ -1077,7 +1079,7 @@ def call_order(cases: list[dict]) -> list[dict]:
     round-robin over their strata (family, phase, context, drafter, rank), so
     a run stopped early has judged every stratum evenly. Files of other
     families keep their order."""
-    if not all(c.get("family") in REPLAYED_ONCE for c in cases):
+    if not all(c.get("family") in PIPELINE_EXPORT for c in cases):
         return cases
     calls: dict[tuple, list[dict]] = {}
     for case in cases:
