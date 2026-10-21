@@ -6,7 +6,12 @@ With ``VLLM_DSPARK_CONFIDENCE_DUMP`` set to a directory, the drafter computes
 its confidence head in every draft step, as adaptive verification does, but
 without enabling adaptive verification. Nothing it drafts or the target
 verifies changes; the head adds one small FP32 projection per drafted position
-to the captured draft step.
+to the captured draft step. Where the drafter samples each position from its
+gathered draft logits (``_sample_logits``; not with
+``VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX``, which never gathers them), the draft
+step also records, per drafted position, the top-1 probability and the entropy
+(nats) of the logits it sampled from, before temperature: a log-sum-exp, a max
+and a softmax-weighted sum over each position's ``[requests, vocab]`` logits.
 
 Each ``propose`` call first stages, stream-ordered and without waiting:
 
@@ -14,6 +19,7 @@ Each ``propose`` call first stages, stream-ordered and without waiting:
   one row per request of the previous batch, one sigmoid output per drafted
   position: the head's probability that this draft is accepted given that the
   ones before it were);
+* the draft-logit statistics the same draft step wrote, when it wrote them;
 * this step's ``num_sampled`` and ``num_rejected``, the verification result of
   exactly those drafts.
 
@@ -26,7 +32,9 @@ file per server start)::
      "batch": requests in the verifying step, "t": time.monotonic() when the
      verifying step's draft call began (CLOCK_MONOTONIC: comparable with a
      client's time.monotonic() on the same host, so rows can be assigned to
-     benchmark windows)}
+     benchmark windows),
+     "top1": [q_1, ...], "ent": [H_1, ...] (only with the draft-logit
+     statistics: top-1 probability and entropy of each drafted position)}
 
 ``verified`` and ``accepted`` come from ``num_sampled - 1 + num_rejected`` and
 ``num_sampled - 1``. Rows that verified nothing are skipped: prefill chunks,
@@ -69,6 +77,7 @@ WARMUP_PREFIXES = ("_warmup", "_v2_mixed_warmup")
 @dataclass
 class _Slot:
     conf: torch.Tensor  # [max_num_reqs, max_width] float32
+    stats: torch.Tensor  # [max_num_reqs, 2, max_width] float32: top-1, entropy
     num_sampled: torch.Tensor  # [max_num_reqs] int32
     num_rejected: torch.Tensor  # [max_num_reqs] int32
 
@@ -80,6 +89,7 @@ class _Pending:
     step: int
     prev_req_ids: list[str]
     prev_width: int
+    has_stats: bool
     req_ids: list[str]
     t: float
 
@@ -122,6 +132,9 @@ class ConfidenceDump:
                 torch.empty(
                     max_num_reqs, max_width, dtype=torch.float32, pin_memory=pin
                 ),
+                torch.empty(
+                    max_num_reqs, 2, max_width, dtype=torch.float32, pin_memory=pin
+                ),
                 torch.empty(max_num_reqs, dtype=torch.int32, pin_memory=pin),
                 torch.empty(max_num_reqs, dtype=torch.int32, pin_memory=pin),
             )
@@ -139,9 +152,12 @@ class ConfidenceDump:
         req_ids: list[str],
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
+        stats: torch.Tensor | None = None,
     ) -> None:
-        """Stage the previous draft step's ``confidences`` against this step's
-        verification result (``num_sampled``/``num_rejected`` of ``req_ids``)."""
+        """Stage the previous draft step's ``confidences`` (and its draft-logit
+        ``stats``, [max_num_reqs, 2, max_width], when it wrote them) against
+        this step's verification result (``num_sampled``/``num_rejected`` of
+        ``req_ids``)."""
         now = time.monotonic()
         self._step += 1
         prev = self._prev
@@ -158,6 +174,8 @@ class ConfidenceDump:
         # strided device-to-host copy stages through unpinned memory and waits
         # for the stream. _write reads only the drafted columns.
         slot.conf[:n_prev].copy_(confidences[:n_prev], non_blocking=True)
+        if stats is not None:
+            slot.stats[:n_prev].copy_(stats[:n_prev], non_blocking=True)
         slot.num_sampled[:n].copy_(num_sampled[:n], non_blocking=True)
         slot.num_rejected[:n].copy_(num_rejected[:n], non_blocking=True)
         event = None
@@ -166,7 +184,14 @@ class ConfidenceDump:
             event.record()
         self._pending.append(
             _Pending(
-                event, slot_idx, self._step, prev_req_ids, prev_width, req_ids, now
+                event,
+                slot_idx,
+                self._step,
+                prev_req_ids,
+                prev_width,
+                stats is not None,
+                req_ids,
+                now,
             )
         )
         self.drain(wait=False)
@@ -211,6 +236,10 @@ class ConfidenceDump:
                 "batch": len(p.req_ids),
                 "t": p.t,
             }
+            if p.has_stats:
+                w = p.prev_width
+                row["top1"] = [float(x) for x in slot.stats[j, 0, :w].tolist()]
+                row["ent"] = [float(x) for x in slot.stats[j, 1, :w].tolist()]
             self._file.write(json.dumps(row, separators=(",", ":")) + "\n")
             self.rows_written += 1
 
@@ -226,6 +255,11 @@ class ConfidenceDumpMixin:
     """Mixed in front of a DSpark speculator class by ``confidence_dump_class``."""
 
     _confidence_dump: ConfidenceDump | None = None
+    # [max_num_reqs, 2, max_width]: per drafted position, the top-1 probability
+    # and the entropy of the draft logits; written inside the draft step.
+    _draft_stats: torch.Tensor | None = None
+    # _sample_logits ran (set while tracing the draft step, so also on capture).
+    _draft_stats_written = False
 
     def load_draft_model(self, target_model, target_attn_layer_names):
         model = super().load_draft_model(target_model, target_attn_layer_names)
@@ -245,6 +279,12 @@ class ConfidenceDumpMixin:
             device=self.device,
             rank=_tp_rank(),
         )
+        self._draft_stats = torch.full(
+            (self.max_num_reqs, 2, self.max_width),
+            float("nan"),
+            dtype=torch.float32,
+            device=self.device,
+        )
         atexit.register(_close_dump, weakref.ref(dump))
         if dump.writes:
             logger.info(
@@ -256,6 +296,12 @@ class ConfidenceDumpMixin:
                 bool(torch.isfinite(weight).all()),
             )
         return model
+
+    def _sample_logits(self, logits, idx_map, sample_pos, step):
+        if self._draft_stats is not None:
+            write_draft_stats(self._draft_stats, logits, step)
+            self._draft_stats_written = True
+        return super()._sample_logits(logits, idx_map, sample_pos, step)
 
     def propose(self, input_batch, *args, **kwargs):
         dump = self._confidence_dump
@@ -270,6 +316,7 @@ class ConfidenceDumpMixin:
                 list(input_batch.req_ids),
                 arguments["num_sampled"],
                 arguments["num_rejected"],
+                self._draft_stats if self._draft_stats_written else None,
             )
         result = super().propose(input_batch, *args, **kwargs)
         if real:
@@ -282,6 +329,18 @@ class ConfidenceDumpMixin:
                 width = int(getattr(self, "width", self.max_width))
                 dump.drafted(input_batch.req_ids, width)
         return result
+
+
+def write_draft_stats(out: torch.Tensor, logits: torch.Tensor, step: int) -> None:
+    """Write column ``step`` of ``out`` [max_num_reqs, 2, max_width]: per row of
+    ``logits`` [requests, vocab], its top-1 probability and entropy (nats)."""
+    x = logits.float()
+    n = x.shape[0]
+    lse = torch.logsumexp(x, dim=-1)
+    out[:n, 0, step] = torch.exp(x.amax(dim=-1) - lse)
+    p = torch.softmax(x, dim=-1)
+    # xlogy: a masked (-inf) column has p == 0 and adds 0, not nan.
+    out[:n, 1, step] = -torch.special.xlogy(p, p).sum(dim=-1)
 
 
 def _full_confidence(speculator: Any) -> torch.Tensor:

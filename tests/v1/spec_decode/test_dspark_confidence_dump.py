@@ -245,3 +245,62 @@ def test_other_ranks_stage_nothing(tmp_path):
     dump.stage(torch.zeros(2, 5), ["a"], t, t)
     dump.close()
     assert not list(tmp_path.glob("dspark-confidence.*"))
+
+
+def test_draft_stats_are_the_top1_probability_and_entropy_of_the_logits():
+    logits = torch.tensor([[2.0, 0.0, -1.0, float("-inf")], [0.0, 0.0, 0.0, 0.0]])
+    out = torch.full((3, 2, 5), float("nan"))
+    dump_module.write_draft_stats(out, logits.to(torch.bfloat16), 2)
+    p = torch.softmax(logits, dim=-1)
+    assert out[:2, 0, 2].tolist() == pytest.approx(p.amax(dim=-1).tolist(), rel=1e-6)
+    entropy = [-(q[q > 0] * q[q > 0].log()).sum().item() for q in p]
+    assert out[:2, 1, 2].tolist() == pytest.approx(entropy, rel=1e-6)
+    assert out[1, 1, 2].item() == pytest.approx(torch.log(torch.tensor(4.0)).item())
+    # Only column `step` of the given rows is written.
+    assert torch.isnan(out[2]).all() and torch.isnan(out[:, :, [0, 1, 3, 4]]).all()
+
+
+def test_rows_carry_the_draft_stats_of_the_positions_the_drafter_sampled(
+    make, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        upstream.DSparkSpeculator,
+        "_sample_logits",
+        lambda self, logits, idx_map, sample_pos, step: logits.argmax(dim=-1),
+        raising=False,
+    )
+    # Position i of request r: all mass on one token, or uniform over 4.
+    sharp = torch.tensor([[50.0, 0.0, 0.0, 0.0]])
+    flat = torch.zeros(1, 4)
+
+    def fake_propose(self, input_batch, *args, **kwargs):
+        for i in range(5):
+            rows = [sharp if (r + i) % 2 == 0 else flat for r in range(input_batch.num_reqs)]
+            self._sample_logits(torch.cat(rows), None, None, i)
+
+    monkeypatch.setattr(upstream.DSparkSpeculator, "propose", fake_propose, raising=False)
+    drafter = make()
+    drafter.load_draft_model(None, set())
+    _propose_positional(drafter, ["a", "b"], [1, 1], [0, 0])
+    _propose_positional(drafter, ["a", "b"], [2, 4], [3, 1])
+    drafter._confidence_dump.close()
+    rows = _rows(tmp_path)
+    assert [r["req"] for r in rows] == ["a", "b"]
+    ln4 = torch.log(torch.tensor(4.0)).item()
+    assert rows[0]["top1"] == pytest.approx([1.0, 0.25, 1.0, 0.25, 1.0], abs=1e-6)
+    assert rows[0]["ent"] == pytest.approx([0.0, ln4, 0.0, ln4, 0.0], abs=1e-5)
+    assert rows[1]["top1"] == pytest.approx([0.25, 1.0, 0.25, 1.0, 0.25], abs=1e-6)
+
+
+def test_rows_carry_no_draft_stats_when_the_drafter_never_sampled_logits(
+    make, monkeypatch, tmp_path
+):
+    # Per-rank argmax (shard_argmax.py) drafts without _sample_logits.
+    _fake_draft_step(monkeypatch)
+    drafter = make()
+    drafter.load_draft_model(None, set())
+    _propose_positional(drafter, ["a"], [1], [0])
+    _propose_positional(drafter, ["a"], [3], [2])
+    drafter._confidence_dump.close()
+    (row,) = _rows(tmp_path)
+    assert "top1" not in row and "ent" not in row
