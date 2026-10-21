@@ -45,7 +45,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 |---|---:|
 | `vllm/models/deepseek_v41/nvidia/hybrid_capture.py` | 364 |
 | `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 1,068 |
-| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,129 |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,314 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_prefetch.py` | 79 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_projection.py` | 18 |
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
@@ -60,7 +60,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **17 files** | **6,047** |
+| **17 files** | **6,232** |
 
 ### `vllm/sm80/kernels/`
 
@@ -143,7 +143,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
 | `vllm/sm80/distributed/step_errors.py` | 155 |
-| `vllm/sm80/envs.py` | 1,408 |
+| `vllm/sm80/envs.py` | 1,410 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -177,7 +177,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **48 files** | **13,472** |
+| **48 files** | **13,474** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -373,7 +373,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_dspark_draft_identity_gpu.py` | 34 |
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax.py` | 397 |
 | `tests/models/deepseek_v41/sm80/test_engram_early_gather.py` | 196 |
-| `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,559 |
+| `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,757 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 379 |
 | `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 921 |
@@ -496,7 +496,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **221 files** | **99,866** |
+| **221 files** | **100,064** |
 
 #### `tools/`
 
@@ -775,7 +775,7 @@ Functions, methods and classes in fork-added product files whose name occurs now
 | Path | Line | Name | Lines | Used by tests |
 |---|---:|---|---:|---|
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 914 | `forward_layer` | 19 | yes |
-| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 272 | `engram_telemetry` | 4 | yes |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 286 | `engram_telemetry` | 4 | yes |
 | `vllm/sm80/dev_ab.py` | 1319 | `get_ab_arm` | 4 | yes |
 | **3 definitions** | | | **27** | |
 
@@ -786,11 +786,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 172 |
-| Fork-added product lines | 55,175 |
+| Fork-added product lines | 55,362 |
 | Patched upstream files | 97 |
 | Patched upstream lines | +4,183 / -803 |
 | Patched upstream product files | 75 |
 | Patched upstream product lines | +3,611 / -253 |
-| Product lines added (new files and patches) | 58,786 |
+| Product lines added (new files and patches) | 58,973 |
 | Fork environment variables (flags) | 128 |
 | Unreferenced fork definitions | 3 (27 lines) |

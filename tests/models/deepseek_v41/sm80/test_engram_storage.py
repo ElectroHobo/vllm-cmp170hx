@@ -828,6 +828,204 @@ def test_direct_read_flag(tmp_path, monkeypatch):
         table.close()
 
 
+# ---------------------------------------------------------------------------
+# Resident tables: exact size, past the page cache, startup refusal
+# ---------------------------------------------------------------------------
+
+
+def _evict(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
+def _file_residency(path):
+    from vllm.models.qwen4_exp.nvidia.exl3_ple import page_cache_residency
+
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return page_cache_residency(fd, 0, os.path.getsize(path))
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("owner", [(0, DIRECT_ROWS), (5, DIRECT_ROWS - 3)])
+def test_ram_placement_reads_exact_tables_past_the_page_cache(tmp_path, owner):
+    """The resident values and scales are the file's bytes, take exactly
+    their size and leave the page cache as it was; lookups match ssd."""
+    files = _direct_table(tmp_path)
+    lo, hi = owner
+    _evict(files.values_path)
+    before, total = _file_residency(files.values_path)
+    assert before < total
+    ram = _store(files, lo, hi, cache_bytes=0, placement="ram")
+    try:
+        assert _file_residency(files.values_path)[0] == before
+        assert ram.direct_load
+        want_values, want_scales = _direct_expected(np.arange(lo, hi), lo, hi)
+        np.testing.assert_array_equal(ram.table.numpy(), want_values)
+        np.testing.assert_array_equal(ram.scales.numpy(), want_scales)
+        assert ram.table.untyped_storage().nbytes() == (hi - lo) * DIM
+        assert ram.scales.untyped_storage().nbytes() == (hi - lo) * SCALE_DIM
+        ids = np.random.default_rng(5).integers(-3, DIRECT_ROWS + 3, 700)
+        ssd = _store(files, lo, hi, cache_bytes=0)
+        try:
+            for a, b, c in zip(
+                _fetch(ram, ids), _fetch(ssd, ids), _direct_expected(ids, lo, hi)
+            ):
+                np.testing.assert_array_equal(a, c)
+                np.testing.assert_array_equal(a, b)
+        finally:
+            ssd.close()
+    finally:
+        ram.close()
+
+
+def test_ram_placement_buffered_fallback_drops_its_pages(tmp_path, monkeypatch):
+    _buffered_preload(monkeypatch)
+    files = _direct_table(tmp_path)
+    _evict(files.values_path)
+    before = _file_residency(files.values_path)[0]
+    ram = _store(files, 0, DIRECT_ROWS, cache_bytes=0, placement="ram")
+    try:
+        assert not ram.direct_load
+        assert _file_residency(files.values_path)[0] == before
+        np.testing.assert_array_equal(
+            ram.table.numpy(),
+            _direct_expected(np.arange(DIRECT_ROWS), 0, DIRECT_ROWS)[0],
+        )
+    finally:
+        ram.close()
+
+
+def test_resident_tables_bypass_the_pinned_allocator(tmp_path, monkeypatch):
+    """Only the small staging goes through the (power-of-two rounding)
+    pinned allocator: resident values and scales never do."""
+    calls = []
+
+    def recording(shape, dtype, pin):
+        calls.append((tuple(shape), pin))
+        return torch.empty(shape, dtype=dtype)
+
+    monkeypatch.setattr(sm80_engram, "_host_empty", recording)
+    files = _direct_table(tmp_path)
+    store = EngramRowStore(
+        files, 0, DIRECT_ROWS, placement="ram", cache_bytes=0, capacity=16, pin=True
+    )
+    try:
+        assert {shape[0] for shape, _ in calls} == {16}
+        assert all(pin for _, pin in calls)
+    finally:
+        store.close()
+
+
+def _fake_host(tmp_path, available_gib, limits):
+    """A /proc and cgroup tree: MemTotal 256 GiB, MemAvailable as given and
+    cgroups from the root down to the process's, each (memory.max or
+    "max", memory.current, file) in GiB."""
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    (proc / "meminfo").write_text(
+        f"MemTotal: {256 << 20} kB\nMemAvailable: {int(available_gib * (1 << 20))} kB\n"
+    )
+    root = tmp_path / "cgroup"
+    group = root
+    for name, (limit, current, file) in limits:
+        group = group / name
+        group.mkdir(parents=True)
+        (group / "memory.max").write_text(
+            "max\n" if limit == "max" else f"{int(limit * GiB)}\n"
+        )
+        (group / "memory.current").write_text(f"{int(current * GiB)}\n")
+        (group / "memory.stat").write_text(f"anon 0\nfile {int(file * GiB)}\n")
+    (proc / "self" / "cgroup").write_text(f"0::/{group.relative_to(root).as_posix()}\n")
+    return str(proc), str(root)
+
+
+GiB = 1 << 30
+
+
+def test_host_memory_headroom_takes_the_binding_limit(tmp_path):
+    proc, root = _fake_host(
+        tmp_path,
+        200,
+        [("pool.slice", (222, 60, 20)), ("job.scope", ("max", 30, 10))],
+    )
+    headroom = sm80_engram.host_memory_headroom(proc, root)
+    # 222 - (60 - 20) = 182 < 200.
+    assert headroom.bytes == 182 * GiB
+    assert headroom.limit == "/pool.slice"
+    assert headroom.limit_bytes == 222 * GiB and headroom.host_total == 256 * GiB
+    assert "holds back 34.00 GiB" in headroom.describe()
+    proc, root = _fake_host(tmp_path / "b", 150, [("pool.slice", (222, 10, 5))])
+    headroom = sm80_engram.host_memory_headroom(proc, root)
+    assert (headroom.bytes, headroom.limit) == (150 * GiB, "MemAvailable")
+
+
+def test_ram_placement_refuses_what_the_host_cannot_hold(tmp_path, monkeypatch):
+    proc, root = _fake_host(tmp_path, 250, [("pool.slice", (222, 40, 0))])
+    measure = sm80_engram.host_memory_headroom
+    monkeypatch.setattr(
+        sm80_engram,
+        "host_memory_headroom",
+        lambda: measure(proc, root),
+    )
+
+    def four_ranks(entry):
+        return [entry] * 4
+
+    # 182 GiB left: four 43 GiB shares plus 2 GiB each fit, 44 GiB do not.
+    sm80_engram.check_ram_placement_fits(43 * GiB, four_ranks)
+    with pytest.raises(ValueError) as refusal:
+        sm80_engram.check_ram_placement_fits(44 * GiB, four_ranks)
+    message = str(refusal.value)
+    assert "is 2.00 GiB short" in message
+    assert "need 176.00 GiB plus 8 GiB margin" in message
+    assert "holds back 34.00 GiB" in message
+    # The builder checks before it allocates the table.
+    monkeypatch.setattr(
+        sm80_engram,
+        "check_ram_placement_fits",
+        lambda need, gather: (_ for _ in ()).throw(ValueError("refused")),
+    )
+    monkeypatch.setenv("VLLM_ENGRAM_PLACEMENT", "ram")
+    layout = SimpleNamespace(
+        layer_ids=(14,),
+        num_embeddings=(SMALL_ROWS,),
+        primes=((SMALL_HEADS,),),
+        head_dim=DIM,
+    )
+    config = SimpleNamespace(
+        engram_config=None,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(engram_table_dir=str(tmp_path)),
+            hf_text_config=SimpleNamespace(),
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=None),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+    )
+    built = []
+    monkeypatch.setattr(
+        sm80_engram, "Sm80EngramEmbedding", lambda *a, **k: built.append(1)
+    )
+    monkeypatch.setattr(sm80_engram, "locate_engram_table", lambda *a: None)
+    import vllm.config
+    import vllm.distributed
+
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(vllm.distributed, "get_engram_dp_size", lambda: 1)
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: TP
+    )
+    with pytest.raises(ValueError, match="refused"):
+        sm80_engram.build_sm80_engram_embedding(layout, 0)
+    assert not built
+
+
 def test_telemetry_readable_and_logged(tables, monkeypatch):
     lines = []
     monkeypatch.setattr(

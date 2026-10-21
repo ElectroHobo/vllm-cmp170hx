@@ -12,12 +12,16 @@ safetensors shards in the directory named by the model config field
 Each TP rank owns whole hash heads, as upstream ``ParallelEngramEmbedding``
 shards them, i.e. one contiguous row range ``[vocab_start, vocab_end)``:
 
-- its scales are read once into host memory (pinned when CUDA is present);
+- its scales are read once into host memory of their exact size, past the
+  page cache;
 - its values stay in the file (placement ``ssd``) and are read on demand at
   absolute int64 byte offsets through a bounded set-associative LRU host row
   cache, pre-faulted at startup and optionally filled there by one
   sequential pass over the file (``VLLM_ENGRAM_ROW_CACHE_PRELOAD``), or are
-  copied into pinned host memory (placement ``ram``, the comparison path);
+  read whole into host memory of their exact size (placement ``ram``), past
+  the page cache, after a startup check that the host (and every memory
+  limit of the process's cgroups) can hold them, which refuses to start
+  rather than fall back;
 - with ``VLLM_ENGRAM_DIRECT_READ`` the rows the cache misses are read with
   O_DIRECT through aligned 4 KiB spans, so they leave no pages in the page
   cache; a file system that refuses O_DIRECT is refused at startup, never
@@ -25,6 +29,13 @@ shards them, i.e. one contiguous row range ``[vocab_start, vocab_end)``:
 - a lookup stages the requested rows' values and scales in pinned host
   memory, copies them to the device and dequantizes them there exactly as
   the reference (``ops/sm80_engram_dequant.py``).
+
+The resident scales and values are read only by the host gather into the
+pinned staging, so they are neither pinned nor registered with CUDA: the
+caching pinned allocator rounds a block up to a power of two (a 22.9 GiB
+value share would take 32 GiB), and registration buys nothing for host
+reads. They are anonymous mappings of their exact size, advised to use
+transparent huge pages, which the random row gathers walk with fewer misses.
 
 The host part of a lookup (owned mask, scales gather, cache probe, reads of
 the missed rows, cache insert, values gather) is one native call without the
@@ -71,6 +82,7 @@ import functools
 import json
 import mmap
 import os
+import socket
 import struct
 import time
 import weakref
@@ -97,14 +109,16 @@ READ_THREADS = 8
 CACHE_WAYS = 8
 # Host fetches queued or finished but not yet taken, per table.
 HOST_FETCH_SLOTS = 4
-# Chunk of the sequential startup reads (scales, ram placement).
-_LOAD_CHUNK_BYTES = 256 << 20
-# Chunk of the row-cache preload's sequential reads, and the offset and
-# length alignment of its direct reads.
+# Chunk of the sequential startup reads (scales, ram placement, row-cache
+# preload), and the offset and length alignment of their direct reads.
 _PRELOAD_CHUNK_BYTES = 32 << 20
 _DIRECT_ALIGN = 4096
 _MAX_HEADER_BYTES = 100 << 20
 GiB = 1 << 30
+# Host memory a worker still takes after its Engram tables are built (CUDA
+# graphs, runtime buffers): DeepSeek V4.1 Flash at TP4 grew 5.8 GiB over its
+# four workers after model construction. The ram placement keeps it free.
+RAM_PLACEMENT_MARGIN_PER_RANK = 2 * GiB
 # EngramHostFetch.counters(), in order (csrc/exl3/engram_fetch.cpp).
 NATIVE_COUNTERS = (
     "lookups",
@@ -284,10 +298,28 @@ def _host_empty(shape: tuple[int, ...], dtype: torch.dtype, pin: bool) -> torch.
     return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin)
 
 
+def _resident_empty(rows: int, width: int) -> torch.Tensor:
+    """A [rows, width] uint8 host tensor of exactly rows * width bytes: an
+    anonymous mapping advised to use transparent huge pages (best effort).
+    The tensor keeps the mapping alive."""
+    nbytes = rows * width
+    if nbytes == 0:
+        return torch.empty((rows, width), dtype=torch.uint8)
+    mapping = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    try:
+        mapping.madvise(mmap.MADV_HUGEPAGE)
+    except (AttributeError, OSError) as error:
+        logger.debug("Engram tables without transparent huge pages: %s", error)
+    table = torch.frombuffer(mapping, dtype=torch.uint8).view(rows, width)
+    if table.untyped_storage().nbytes() != nbytes:
+        raise RuntimeError("Engram host table is not of its exact size")
+    return table
+
+
 def _open_preload(path: str) -> tuple[int, bool]:
-    """A descriptor for the row-cache preload and whether its reads bypass
-    the page cache: O_DIRECT, or buffered where the file system refuses
-    O_DIRECT."""
+    """A descriptor for the sequential startup reads and whether they bypass
+    the page cache: O_DIRECT, or buffered (each chunk's pages dropped after
+    use) where the file system refuses O_DIRECT."""
     try:
         return os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECT), True
     except OSError as error:
@@ -324,12 +356,192 @@ def _read_at_least(fd: int, view: memoryview, offset: int, need: int) -> None:
         done += count
 
 
+def _stream_extent(
+    path: str,
+    offset: int,
+    nbytes: int,
+    consume: Callable[[int, torch.Tensor], bool],
+    chunk_bytes: int = _PRELOAD_CHUNK_BYTES,
+) -> tuple[int, bool]:
+    """Read bytes [offset, offset + nbytes) of ``path`` in one sequential
+    pass of ``chunk_bytes`` pieces past the page cache (``_open_preload``),
+    reading the next piece while ``consume(begin, data)`` takes the current
+    one: ``begin`` is the piece's offset from ``offset`` and ``data`` a
+    uint8 view valid only during the call. Stops early when ``consume``
+    returns True. Returns (bytes read, whether the reads were direct)."""
+    if chunk_bytes <= 0 or chunk_bytes % _DIRECT_ALIGN:
+        raise ValueError("Engram startup read chunks must be aligned blocks")
+    if nbytes <= 0:
+        return 0, True
+    # Aligned reads of a piece take at most one block more.
+    buffers = [mmap.mmap(-1, chunk_bytes + _DIRECT_ALIGN) for _ in range(2)]
+    fd, direct = _open_preload(path)
+
+    def read(buffer: mmap.mmap, begin: int) -> tuple[int, int, int, int]:
+        end = min(begin + chunk_bytes, nbytes)
+        first = offset + begin - (offset + begin) % _DIRECT_ALIGN
+        length = -(-(offset + end - first) // _DIRECT_ALIGN) * _DIRECT_ALIGN
+        _read_at_least(fd, memoryview(buffer)[:length], first, offset + end - first)
+        if not direct:
+            os.posix_fadvise(fd, first, length, os.POSIX_FADV_DONTNEED)
+        return begin, end, offset + begin - first, length
+
+    read_bytes = 0
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(read, buffers[0], 0)
+            turn = 0
+            while pending is not None:
+                begin, end, skip, length = pending.result()
+                pending = None
+                if end < nbytes:
+                    pending = pool.submit(read, buffers[1 - turn], end)
+                read_bytes += length
+                data = torch.frombuffer(
+                    buffers[turn], dtype=torch.uint8, count=end - begin, offset=skip
+                )
+                if consume(begin, data):
+                    break
+                turn = 1 - turn
+    finally:
+        os.close(fd)
+    return read_bytes, direct
+
+
+def _read_resident(path: str, offset: int, dest: torch.Tensor) -> bool:
+    """Fill ``dest`` (contiguous uint8) with the file bytes at ``offset`` in
+    one sequential pass past the page cache; return whether it was direct."""
+    flat = dest.view(-1)
+
+    def store(begin: int, data: torch.Tensor) -> bool:
+        flat[begin : begin + data.numel()].copy_(data)
+        return False
+
+    return _stream_extent(path, offset, flat.numel(), store)[1]
+
+
+@dataclass(frozen=True)
+class HostHeadroom:
+    """What this process can still commit, and what limits it."""
+
+    bytes: int
+    # The binding limit: "MemAvailable" or the cgroup path with memory.max.
+    limit: str
+    # Host MemTotal and that cgroup's memory.max (0 for MemAvailable).
+    host_total: int
+    limit_bytes: int
+
+    def describe(self) -> str:
+        if not self.limit_bytes:
+            return (
+                f"{self.bytes / GiB:.2f} GiB available (host MemAvailable of "
+                f"{self.host_total / GiB:.2f} GiB total)"
+            )
+        return (
+            f"{self.bytes / GiB:.2f} GiB available under the memory.max of "
+            f"{self.limit_bytes / GiB:.2f} GiB of cgroup {self.limit}, which "
+            f"holds back {(self.host_total - self.limit_bytes) / GiB:.2f} GiB of "
+            f"the host's {self.host_total / GiB:.2f} GiB"
+        )
+
+
+def host_memory_headroom(
+    proc: str = "/proc", cgroup_root: str = "/sys/fs/cgroup"
+) -> HostHeadroom:
+    """What this process can still commit: the least of the host's
+    MemAvailable and, for its cgroup (v2) and each ancestor with a
+    memory.max, that limit less the group's use other than file pages
+    (memory.current - file)."""
+    with open(os.path.join(proc, "meminfo")) as file:
+        fields = dict(line.split(":", 1) for line in file if ":" in line)
+    total = int(fields["MemTotal"].split()[0]) * 1024
+    best = HostHeadroom(
+        int(fields["MemAvailable"].split()[0]) * 1024, "MemAvailable", total, 0
+    )
+    try:
+        with open(os.path.join(proc, "self", "cgroup")) as file:
+            unified = [
+                line for line in file.read().splitlines() if line.startswith("0::")
+            ]
+    except OSError:
+        unified = []
+    if not unified:
+        return best
+    group = Path(cgroup_root) / unified[0][3:].lstrip("/")
+    root = Path(cgroup_root)
+    while True:
+        try:
+            limit = (group / "memory.max").read_text().strip()
+            if limit != "max":
+                current = int((group / "memory.current").read_text())
+                stat = dict(
+                    line.split()
+                    for line in (group / "memory.stat").read_text().splitlines()
+                )
+                left = int(limit) - (current - int(stat.get("file", 0)))
+                if left < best.bytes:
+                    name = "/" + str(group.relative_to(root)).lstrip(".")
+                    best = HostHeadroom(left, name, total, int(limit))
+        except (OSError, ValueError):
+            pass
+        if group == root or root not in group.parents:
+            break
+        group = group.parent
+    return best
+
+
+def check_ram_placement_fits(
+    need_bytes: int, gather: Callable[[object], list] | None = None
+) -> None:
+    """Refuse to start when the hosts cannot hold one more ram-placement
+    table of every rank. Each rank gives its ``need_bytes`` and its host
+    memory headroom, measured before any rank allocates; ``gather`` collects
+    them from the ranks building the table together (default: this process
+    only). On each host the needs plus RAM_PLACEMENT_MARGIN_PER_RANK per rank
+    must fit the smallest headroom its ranks measured. Every rank reaches
+    the same verdict; the refusal names the shortfall and the binding limit."""
+    mine = (socket.gethostname(), need_bytes, host_memory_headroom())
+    entries = gather(mine) if gather is not None else [mine]
+    hosts: dict[str, tuple[int, HostHeadroom, int]] = {}
+    for host, need, headroom in entries:
+        total, smallest, ranks = hosts.get(host, (0, headroom, 0))
+        if headroom.bytes < smallest.bytes:
+            smallest = headroom
+        hosts[host] = (total + need, smallest, ranks + 1)
+    for host, (total, smallest, ranks) in sorted(hosts.items()):
+        margin = ranks * RAM_PLACEMENT_MARGIN_PER_RANK
+        short = total + margin - smallest.bytes
+        if short > 0:
+            raise ValueError(
+                f"VLLM_ENGRAM_PLACEMENT=ram: host {host} is {short / GiB:.2f} GiB "
+                f"short for the Engram table: its {ranks} rank(s) need "
+                f"{total / GiB:.2f} GiB plus {margin / GiB:.0f} GiB margin, and "
+                f"{smallest.describe()}. Free host memory, raise that limit "
+                "(hold back less) or use placement ssd"
+            )
+
+
+def _gather_over_tp(obj: object) -> list:
+    """``obj`` of every rank of this rank's TP group (CPU group)."""
+    import torch.distributed as dist
+
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group()
+    if group.world_size == 1:
+        return [obj]
+    out: list = [None] * group.world_size
+    dist.all_gather_object(out, obj, group=group.cpu_group)
+    return out
+
+
 class EngramRowStore:
     """One rank's rows of one Engram table on the host, fetched by the
     native ``EngramHostFetch`` into this store's staging.
 
     Scales are always resident. Values come from the file through the row
-    cache (``ssd``) or from a resident copy (``ram``). A fetch fills the
+    cache (``ssd``) or from a resident copy (``ram``); resident data is of
+    its exact size and read past the page cache. A fetch fills the
     staging for global row ids: unowned ids get zero values and the scale
     byte of 1.0, which dequantize to +0 as the reference's mask does; rows
     that cannot be read are poisoned. With ``direct_read`` (``ssd`` only)
@@ -352,7 +564,6 @@ class EngramRowStore:
         from vllm.models.qwen4_exp.nvidia.exl3_ple import (
             _read_error,
             page_cache_residency,
-            pread_exact_into,
         )
         from vllm.sm80.kernels.exl3.ops import engram_host_fetch
 
@@ -388,22 +599,17 @@ class EngramRowStore:
             os.posix_fadvise(
                 self.fd, self.extent_offset, self.extent_bytes, os.POSIX_FADV_RANDOM
             )
-            self.scales = _host_empty((rows, self.scale_bytes), torch.uint8, pin)
-            scale_fd = os.open(files.scales_path, os.O_RDONLY | os.O_CLOEXEC)
-            try:
-                self._read_extent(
-                    pread_exact_into,
-                    scale_fd,
-                    files.scales_offset + owner_lo * self.scale_bytes,
-                    self.scales,
-                )
-            finally:
-                os.close(scale_fd)
+            self.scales = _resident_empty(rows, self.scale_bytes)
+            self.direct_load = _read_resident(
+                files.scales_path,
+                files.scales_offset + owner_lo * self.scale_bytes,
+                self.scales,
+            )
             self.table: torch.Tensor | None = None
             if placement == "ram":
-                self.table = _host_empty((rows, self.row_bytes), torch.uint8, pin)
-                self._read_extent(
-                    pread_exact_into, self.fd, self.extent_offset, self.table
+                self.table = _resident_empty(rows, self.row_bytes)
+                self.direct_load &= _read_resident(
+                    self.path, self.extent_offset, self.table
                 )
             self.ids = _host_empty((capacity,), torch.int64, pin)
             self.values = _host_empty((capacity, self.row_bytes), torch.uint8, pin)
@@ -439,13 +645,6 @@ class EngramRowStore:
         except BaseException:
             self.close()
             raise
-
-    @staticmethod
-    def _read_extent(read, fd: int, offset: int, dest: torch.Tensor) -> None:
-        view = memoryview(dest.numpy()).cast("B")
-        for begin in range(0, len(view), _LOAD_CHUNK_BYTES):
-            end = min(begin + _LOAD_CHUNK_BYTES, len(view))
-            read(fd, view[begin:end], offset + begin)
 
     @property
     def extent_offset(self) -> int:
@@ -515,45 +714,16 @@ class EngramRowStore:
             or chunk_bytes % self.row_bytes
         ):
             raise ValueError("Engram preload chunks hold whole rows and aligned blocks")
-        chunk_rows = chunk_bytes // self.row_bytes
-        # Aligned reads of a chunk's rows take at most one block more.
-        buffers = [mmap.mmap(-1, chunk_bytes + _DIRECT_ALIGN) for _ in range(2)]
-        fd, direct = _open_preload(self.path)
+        stored = 0
 
-        def read(buffer: mmap.mmap, lo: int) -> tuple[int, int, int, int]:
-            hi = min(lo + chunk_rows, rows)
-            start = self.extent_offset + lo * self.row_bytes
-            end = start + (hi - lo) * self.row_bytes
-            first = start - start % _DIRECT_ALIGN
-            length = -(-(end - first) // _DIRECT_ALIGN) * _DIRECT_ALIGN
-            _read_at_least(fd, memoryview(buffer)[:length], first, end - first)
-            if not direct:
-                os.posix_fadvise(fd, first, length, os.POSIX_FADV_DONTNEED)
-            return lo, hi, start - first, length
+        def insert(begin: int, data: torch.Tensor) -> bool:
+            nonlocal stored
+            stored += self.fetcher.preload(data, begin // self.row_bytes)
+            return stored == capacity
 
-        stored = read_bytes = 0
-        try:
-            with ThreadPoolExecutor(1) as pool:
-                pending = pool.submit(read, buffers[0], 0)
-                turn = 0
-                while pending is not None:
-                    lo, hi, skip, length = pending.result()
-                    pending = None
-                    if hi < rows:
-                        pending = pool.submit(read, buffers[1 - turn], hi)
-                    read_bytes += length
-                    chunk = torch.frombuffer(
-                        buffers[turn],
-                        dtype=torch.uint8,
-                        count=(hi - lo) * self.row_bytes,
-                        offset=skip,
-                    )
-                    stored += self.fetcher.preload(chunk, lo)
-                    turn = 1 - turn
-                    if stored == capacity:
-                        break
-        finally:
-            os.close(fd)
+        read_bytes, direct = _stream_extent(
+            self.path, self.extent_offset, self.extent_bytes, insert, chunk_bytes
+        )
         return stored, read_bytes, direct
 
     def fetch(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1045,13 +1215,25 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
     if log_every < 0:
         raise ValueError("VLLM_ENGRAM_TELEMETRY_STEPS must be nonnegative")
     graph_capture = captures_full_graphs(vllm_config.compilation_config.cudagraph_mode)
+    head_sizes = tuple(
+        size for order in layout.primes[layer_hash_index] for size in order
+    )
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    if placement == "ram":
+        # Every rank measures its host before any allocates this table.
+        _, _, lo, hi = engram_owner_range(head_sizes, tp_rank, tp_size)
+        check_ram_placement_fits(
+            (hi - lo) * (layout.head_dim + layout.head_dim // ENGRAM_QUANT_BLOCK),
+            _gather_over_tp,
+        )
     table = Sm80EngramEmbedding(
         rows,
         layout.head_dim,
-        tuple(size for order in layout.primes[layer_hash_index] for size in order),
+        head_sizes,
         files,
-        tp_rank=get_tensor_model_parallel_rank(),
-        tp_size=get_tensor_model_parallel_world_size(),
+        tp_rank=tp_rank,
+        tp_size=tp_size,
         max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
         placement=placement,
         cache_bytes=int(cache_gib * GiB) // len(layout.layer_ids),
@@ -1071,7 +1253,10 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         preloaded = preload_row_cache(table.store)
     resident, total = table.page_cache_residency()
     if placement == "ram":
-        values = f"resident {table.store.table.nbytes / GiB:.2f} GiB"
+        values = (
+            f"resident {table.store.table.nbytes / GiB:.2f} GiB, read "
+            f"{'direct' if table.store.direct_load else 'buffered'}"
+        )
     else:
         values = (
             f"row cache {table.store.cache_bytes / GiB:.2f} GiB, pre-faulted "
@@ -1080,7 +1265,7 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         )
     logger.info(
         "sm_80 Engram layer %d (%s): placement=%s rows [%d, %d) heads [%d, %d); "
-        "host %.2f GiB (scales %.2f GiB pinned, values %s); device staging "
+        "host %.2f GiB (scales %.2f GiB, values %s); device staging "
         "%.1f MiB (fixed graph staging %s); page cache %d/%d value pages "
         "resident",
         layer_id,

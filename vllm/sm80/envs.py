@@ -1114,8 +1114,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Where the sm_80 Engram storage keeps the E4M3 values of its owned table
     # rows (vllm/models/deepseek_v41/nvidia/sm80_engram.py): "ssd" reads them
     # on demand from the base-checkpoint shards through a bounded host row
-    # cache; "ram" copies them into pinned host memory at startup (the
-    # comparison path). Scales are resident host memory either way.
+    # cache; "ram" reads them whole at startup, past the page cache, into
+    # host memory of their exact size (~45.8 GiB per rank of DeepSeek V4.1
+    # Flash at TP4) and refuses to start when the host or a cgroup memory
+    # limit cannot hold them. Scales are resident host memory either way.
     "VLLM_ENGRAM_PLACEMENT": lambda: _env_with_choices(
         "VLLM_ENGRAM_PLACEMENT", "ssd", ["ssd", "ram"]
     )(),
