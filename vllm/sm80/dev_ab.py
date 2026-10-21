@@ -526,8 +526,18 @@ def _moepf_apply(runner, on: bool) -> None:
         experts.prefill_v2_bits_x2 = bits if on else 0
 
 
+def _moe_v2_target_experts(runner) -> list:
+    """Experts moe_out_v2 can serve, except the DSpark drafter's
+    (VLLM_EXL3_MOE_V2_DRAFT has its own switch)."""
+    return [
+        e
+        for e in _moepf_experts(runner)
+        if hasattr(e, "moe_v2_rows") and not getattr(e, "moe_v2_draft", False)
+    ]
+
+
 def _moe_v2_unavailable(runner) -> str | None:
-    experts = [e for e in _moepf_experts(runner) if hasattr(e, "moe_v2_rows")]
+    experts = _moe_v2_target_experts(runner)
     if not any(e.moe_v2_rows for e in experts):
         return ("boot with VLLM_EXL3_MOE_V2=1: "
                 "eligible experts need their load-time workspace and warmup")
@@ -536,7 +546,7 @@ def _moe_v2_unavailable(runner) -> str | None:
 
 
 def _moe_v2_current(runner) -> bool:
-    return any(getattr(e, "moe_v2_rows", 0) for e in _moepf_experts(runner))
+    return any(e.moe_v2_rows for e in _moe_v2_target_experts(runner))
 
 
 def _moe_v2_apply(runner, on: bool) -> None:
@@ -545,8 +555,35 @@ def _moe_v2_apply(runner, on: bool) -> None:
         experts.moe_v2_rows = rows if on else 0
 
 
+def _moe_v2_draft_experts(runner) -> list:
+    return [e for e in _moepf_experts(runner) if getattr(e, "moe_v2_draft", False)]
+
+
+def _moe_v2_draft_unavailable(runner) -> str | None:
+    experts = _moe_v2_draft_experts(runner)
+    if not any(e.moe_v2_rows for e in experts):
+        return ("boot with VLLM_EXL3_MOE_V2_DRAFT=1: the drafter's experts "
+                "need their load-time workspace and warmup")
+    _STATE.saved["exl3_moe_v2_draft"] = [(e, e.moe_v2_rows) for e in experts]
+    return None
+
+
+def _moe_v2_draft_current(runner) -> bool:
+    return any(e.moe_v2_rows for e in _moe_v2_draft_experts(runner))
+
+
+def _moe_v2_draft_apply(runner, on: bool) -> None:
+    _set_env("VLLM_EXL3_MOE_V2_DRAFT", on)
+    for experts, rows in _STATE.saved["exl3_moe_v2_draft"]:
+        experts.moe_v2_rows = rows if on else 0
+
+
 def _moe_v2_fold_experts(runner) -> list:
-    return [e for e in _moepf_experts(runner) if getattr(e, "moe_v2_rows", 0)]
+    return [
+        e
+        for e in _moepf_experts(runner)
+        if getattr(e, "moe_v2_rows", 0) and not getattr(e, "moe_v2_draft", False)
+    ]
 
 
 def _moe_v2_fold_unavailable(runner) -> str | None:
@@ -987,6 +1024,10 @@ SWITCHES: dict[str, Switch] = {
         Switch(
             "exl3_moe_v2", "VLLM_EXL3_MOE_V2", True, False,
             _moe_v2_unavailable, _moe_v2_current, _moe_v2_apply,
+        ),
+        Switch(
+            "exl3_moe_v2_draft", "VLLM_EXL3_MOE_V2_DRAFT", True, False,
+            _moe_v2_draft_unavailable, _moe_v2_draft_current, _moe_v2_draft_apply,
         ),
         Switch(
             "exl3_moe_v2_fold", "VLLM_EXL3_MOE_V2_FOLD", True, True,

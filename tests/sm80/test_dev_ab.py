@@ -170,6 +170,7 @@ def test_allowlist():
     assert set(dev_ab.SWITCHES) == {
         "exl3_dense_splitk",
         "exl3_moe_v2",
+        "exl3_moe_v2_draft",
         "exl3_moe_v2_fold",
         "exl3_dense_prefill_tc",
         "dsv41_fused_mhc",

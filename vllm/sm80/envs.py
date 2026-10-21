@@ -138,6 +138,8 @@ if TYPE_CHECKING:
     VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_V2_FOLD: bool = False
+    VLLM_EXL3_MOE_V2_DRAFT: bool = False
+    VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS: int = 0
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
     VLLM_EXL3_EXPERT_PLACEMENT: str = ""
@@ -1249,6 +1251,28 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vllm/sm80/kernels/exl3/quant.py.
     "VLLM_EXL3_MOE_V2_FOLD": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_V2_FOLD", "0"))
+    ),
+    # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu,
+    # DraftTiling) for calls of at most 64 rows of the configuration
+    # ops.MOE_V2_DRAFT_CONFIGS names: the DSpark drafter's experts of
+    # DeepSeek-V4.1-Flash (hidden 5120, intermediate 2304, top-3, 32 of 128
+    # experts local, every local expert matrix bits_x2 8 with codebook 2), on
+    # sm_80; independent of VLLM_EXL3_MOE_V2, which keeps the other
+    # configurations, and never folded (VLLM_EXL3_MOE_V2_FOLD does not apply).
+    # Results differ from moe_out in the last bits. Needs an EXL3 extension
+    # built from this tree. Default OFF: unset, those calls take moe_out. Read
+    # in vllm/sm80/kernels/exl3/quant.py.
+    "VLLM_EXL3_MOE_V2_DRAFT": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_V2_DRAFT", "0"))
+    ),
+    # Diagnostic for VLLM_EXL3_MOE_V2_DRAFT: 0 (off), 8 or 16. Every drafter
+    # row tile takes at least the lane kernel of a tile of that many rows
+    # (moe_v2.cu DraftLanes; by default a tile of 1..4 rows sums the low part
+    # of its activations outside the MMA, a larger one inside), so a row's
+    # result does not depend on how many rows of the call share its expert.
+    # Set once per process (before the warm-up and graph capture). Default 0.
+    "VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS": lambda: int(
+        os.getenv("VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS", "0")
     ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_prefill.cu) for
     # calls of 65..3460 rows in prefill steps (some request scheduled more

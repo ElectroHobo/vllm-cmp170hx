@@ -456,3 +456,32 @@ def test_moe_v2_requires_construction_and_restores_only_eligible_rows(monkeypatc
         assert eligible.workspace_elements == 1234 and closed.workspace_elements == 5678
     eligible.moe_v2_rows = 0
     assert "boot with" in switch.unavailable(runner)
+
+
+def test_moe_v2_draft_switch_toggles_only_the_drafter_experts(monkeypatch, state):
+    target = NS(prefill_v2_bits_x2=6, moe_v2_rows=64, moe_v2_bits_x2=6, moe_v2_draft=False)
+    drafter = NS(prefill_v2_bits_x2=0, moe_v2_rows=40, moe_v2_bits_x2=8, moe_v2_draft=True)
+    def layer(experts):
+        return NS(quant_method=NS(moe_kernel=NS(fused_experts=experts)))
+    runner = NS(model=NS(modules=lambda: [layer(target), layer(drafter)]))
+    monkeypatch.setenv("VLLM_EXL3_MOE_V2", "1")
+    monkeypatch.setenv("VLLM_EXL3_MOE_V2_DRAFT", "1")
+    draft = ab.SWITCHES["exl3_moe_v2_draft"]
+    v2 = ab.SWITCHES["exl3_moe_v2"]
+    assert draft.graph_bound and not draft.output_identical
+    assert draft.unavailable(runner) is None and v2.unavailable(runner) is None
+    for on in (False, True):
+        draft.apply(runner, on)
+        assert draft.current(runner) is on
+        assert drafter.moe_v2_rows == (40 if on else 0) and target.moe_v2_rows == 64
+    for on in (False, True):
+        v2.apply(runner, on)
+        assert v2.current(runner) is on
+        assert target.moe_v2_rows == (64 if on else 0) and drafter.moe_v2_rows == 40
+    # The fold switch never folds the drafter's calls.
+    assert ab._moe_v2_fold_experts(runner) == [target]
+    drafter.moe_v2_rows = 0
+    assert "boot with VLLM_EXL3_MOE_V2_DRAFT=1" in draft.unavailable(runner)
+    target.moe_v2_rows = 0
+    drafter.moe_v2_rows = 40
+    assert "boot with VLLM_EXL3_MOE_V2=1" in v2.unavailable(runner)

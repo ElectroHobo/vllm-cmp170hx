@@ -1119,6 +1119,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             moe_v2_rows, moe_v2_bits_x2, workspace = self._moe_v2(
                 layer, gate_metadata, max_rows, workspace
             )
+        # VLLM_EXL3_MOE_V2_DRAFT: the DSpark drafter's layers, with kernels of
+        # their own (ops.MOE_V2_DRAFT_CONFIGS), never folded.
+        moe_v2_draft = False
+        if not moe_v2_rows and envs.VLLM_EXL3_MOE_V2_DRAFT:
+            moe_v2_rows, moe_v2_bits_x2, workspace = self._moe_v2(
+                layer, gate_metadata, max_rows, workspace, draft=True
+            )
+            moe_v2_draft = bool(moe_v2_rows)
         prefill_decode_len = 0
         if envs.VLLM_EXL3_MOE_PREFILL_TC:
             prefill_decode_len, workspace = self._moe_prefill(
@@ -1149,7 +1157,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             moe_out_rows=moe_out_rows,
             moe_v2_rows=moe_v2_rows,
             moe_v2_bits_x2=moe_v2_bits_x2,
-            moe_v2_fold=bool(moe_v2_rows) and envs.VLLM_EXL3_MOE_V2_FOLD,
+            moe_v2_fold=bool(moe_v2_rows)
+            and not moe_v2_draft
+            and envs.VLLM_EXL3_MOE_V2_FOLD,
+            moe_v2_draft=moe_v2_draft,
             prefill_decode_len=prefill_decode_len,
             prefill_v2_bits_x2=prefill_v2_bits_x2,
             prefill_v2_decode_len=prefill_v2_decode_len,
@@ -1158,10 +1169,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
 
-    def _moe_v2(self, layer, metadata, max_rows: int, workspace: int):
+    def _moe_v2(
+        self, layer, metadata, max_rows: int, workspace: int, draft: bool = False
+    ):
         """Rows up to which this layer's calls take moe_out_v2, the bits_x2
         of its routed matrices, and a workspace size that fits both operators
-        (0 rows: the gate is closed)."""
+        (0 rows: the gate is closed). ``draft``: the configurations
+        VLLM_EXL3_MOE_V2_DRAFT opens (the DSpark drafter's layers)."""
         from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
         device = layer.exl3_ptrs.device
@@ -1174,14 +1188,24 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.home_experts,
             layer.global_num_experts,
             metadata,
+            draft=draft,
         )
         if reason is not None:
-            logger.info_once(
-                "VLLM_EXL3_MOE_V2 is set but the gate is closed: %s; these MoE "
-                "layers keep moe_out.",
-                reason,
-            )
+            if draft:
+                logger.info_once(
+                    "VLLM_EXL3_MOE_V2_DRAFT is set but the gate is closed: %s; "
+                    "these MoE layers keep moe_out.",
+                    reason,
+                )
+            else:
+                logger.info_once(
+                    "VLLM_EXL3_MOE_V2 is set but the gate is closed: %s; these MoE "
+                    "layers keep moe_out.",
+                    reason,
+                )
             return 0, 0, workspace
+        if draft:
+            exl3_ops.moe_v2_draft_force_rows(envs.VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS)
         # One bit width for every routed matrix of the layer (the gate checked).
         bits_x2 = metadata[0][0][2]
         rows = min(max_rows, exl3_ops.MOE_V2_MAX_ROWS)
@@ -1206,14 +1230,32 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             bits_x2,
             self.swiglu_limit,
         )
-        logger.info_once(
-            "EXL3 MoE v2 kernel active (VLLM_EXL3_MOE_V2): tensor-core routed "
-            "experts (bits_x2 %d) for MoE calls of 1..%d rows; larger calls keep "
-            "moe_out.",
-            bits_x2,
-            rows,
-        )
-        if envs.VLLM_EXL3_MOE_V2_FOLD:
+        if draft:
+            logger.info_once(
+                "EXL3 MoE v2 drafter kernels active (VLLM_EXL3_MOE_V2_DRAFT): "
+                "tensor-core routed experts of the DSpark drafter (bits_x2 %d, "
+                "16-row tiles; row tile floor %d) for MoE calls of 1..%d rows; "
+                "larger calls keep moe_out.",
+                bits_x2,
+                envs.VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS,
+                rows,
+            )
+        else:
+            logger.info_once(
+                "EXL3 MoE v2 kernel active (VLLM_EXL3_MOE_V2): tensor-core routed "
+                "experts (bits_x2 %d) for MoE calls of 1..%d rows; larger calls "
+                "keep moe_out.",
+                bits_x2,
+                rows,
+            )
+        if draft:
+            if envs.VLLM_EXL3_MOE_V2_FOLD:
+                logger.info_once(
+                    "VLLM_EXL3_MOE_V2_FOLD does not apply to the DSpark drafter's "
+                    "layers (VLLM_EXL3_MOE_V2_DRAFT): their moe_out_v2 calls keep "
+                    "five launches."
+                )
+        elif envs.VLLM_EXL3_MOE_V2_FOLD:
             exl3_ops.require_moe_v2_fold()
             exl3_ops.warmup_moe_v2(
                 layer.exl3_ptrs,
@@ -1412,6 +1454,9 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
     replica_map = None
     # VLLM_EXL3_MOE_V2_FOLD: the moe_out_v2 calls take moe_out_v2_fold.
     moe_v2_fold = False
+    # VLLM_EXL3_MOE_V2_DRAFT: the moe_out_v2 calls are the DSpark drafter's
+    # (bits_x2 8 kernels of their own, never folded).
+    moe_v2_draft = False
 
     def __init__(
         self,
@@ -1425,6 +1470,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         moe_v2_rows=0,
         moe_v2_bits_x2=0,
         moe_v2_fold=False,
+        moe_v2_draft=False,
         prefill_decode_len=0,
         prefill_v2_bits_x2=0,
         prefill_v2_decode_len=0,
@@ -1444,6 +1490,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.moe_v2_rows = moe_v2_rows
         self.moe_v2_bits_x2 = moe_v2_bits_x2
         self.moe_v2_fold = moe_v2_fold
+        self.moe_v2_draft = moe_v2_draft
         # Nonzero (VLLM_EXL3_MOE_PREFILL_TC with its gate open): calls of more
         # than 64 rows in a step that schedules some request more than this
         # many tokens take moe_out_prefill.

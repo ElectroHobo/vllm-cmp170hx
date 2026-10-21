@@ -42,7 +42,21 @@ MOE_V2_CONFIGS = {
     # 512-column chunk of the 2304-column intermediate.
     (5120, 640, 6, 384, 384): (6, 4),
     (5120, 512, 6, 384, 384): (6, 4),
+    # The DSpark drafter's experts: top-3 of 128, a quarter of them local
+    # (expert parallel size 4); kernels and stages of their own (moe_v2.cu
+    # DraftTiling: 16-row tiles, the hi/lo split in the MMA's C operand).
+    (5120, 2304, 3, 32, 128): (8,),
+    # The drafter's experts split across tensor-parallel ranks like the
+    # target's: the tensor-parallel shapes' stages at bits_x2 8.
+    (5120, 640, 3, 128, 128): (8,),
+    (5120, 512, 3, 128, 128): (8,),
 }
+# The MOE_V2_CONFIGS entries only VLLM_EXL3_MOE_V2_DRAFT opens (the DSpark
+# drafter's layers); VLLM_EXL3_MOE_V2 opens the others. The drafter's calls
+# are never folded (moe_out_v2_fold refuses bits_x2 8).
+MOE_V2_DRAFT_CONFIGS = frozenset(
+    {(5120, 2304, 3, 32, 128), (5120, 640, 3, 128, 128), (5120, 512, 3, 128, 128)}
+)
 # moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the first of them only; it
 # serves calls of MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the
 # validated range: one 3460-token prefill chunk).
@@ -370,6 +384,7 @@ def moe_v2_closed_reason(
     local_experts: int,
     global_experts: int,
     metadata: list[list[list[int]]],
+    draft: bool = False,
 ) -> str | None:
     """Why moe_out_v2 must not serve this layer, or None when it may (then
     every routed matrix has bits_x2 ``metadata[0][0][2]``).
@@ -377,9 +392,15 @@ def moe_v2_closed_reason(
     Checked once per layer from host-side values (``metadata`` is the
     per-expert [padded_in, padded_out, bits_x2, codebook] list the layer's
     ``exl3_meta`` buffer is built from), never from device tensors.
+    ``draft``: the configurations of MOE_V2_DRAFT_CONFIGS
+    (VLLM_EXL3_MOE_V2_DRAFT), else the others (VLLM_EXL3_MOE_V2).
     """
     return _moe_closed_reason(
-        MOE_V2_CONFIGS,
+        {
+            shape: rates
+            for shape, rates in MOE_V2_CONFIGS.items()
+            if (shape in MOE_V2_DRAFT_CONFIGS) == draft
+        },
         capability,
         dtype,
         hidden_size,
@@ -619,6 +640,35 @@ def moe_out_v2_fold(
         workspace,
         swiglu_limit,
     )
+
+
+def require_moe_v2_draft() -> None:
+    """Refuse a library without the drafter's bits_x2 8 moe_out_v2 kernels
+    (built from a tree before them; its moe_v2_draft_force_rows marks them)."""
+    ensure_extension()
+    try:
+        torch._C._dispatch_find_schema_or_throw(
+            "_exl3_C::moe_v2_draft_force_rows", ""
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "VLLM_EXL3_MOE_V2_DRAFT needs the bits_x2 8 kernels of "
+            "_exl3_C::moe_out_v2: rebuild the EXL3 extension from this tree "
+            "(python csrc/exl3/build_standalone.py --out vllm), or unset the "
+            f"flag. Detail: {exc}"
+        ) from exc
+
+
+def moe_v2_draft_force_rows(rows: int) -> None:
+    """VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS for this process: 0 (each drafter
+    row tile takes the lane kernel of its own rows) or 8 or 16 (every tile at
+    least that tile's). Set before the warm-up and any graph capture."""
+    if rows not in (0, 8, 16):
+        raise ValueError(
+            f"VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS={rows}: not one of 0, 8, 16"
+        )
+    require_moe_v2_draft()
+    torch.ops._exl3_C.moe_v2_draft_force_rows(rows)
 
 
 # (device, hidden, intermediate, bits_x2, fold) warmed by warmup_moe_v2.

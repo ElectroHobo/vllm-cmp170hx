@@ -3,9 +3,12 @@
 // one bit width and the mul1 codebook:
 //   - hidden 2560, intermediate 640, bits_x2 10;
 //   - hidden 5120, intermediate 2304, bits_x2 6 or 4;
-//   - hidden 5120, intermediate 640 or 512, bits_x2 6 or 4: tensor-parallel
+//   - hidden 5120, intermediate 640 or 512, bits_x2 6, 4 or 8: tensor-parallel
 //     routed experts, each rank holding a 640- or 512-column chunk of every
-//     expert's 2304-column intermediate.
+//     expert's 2304-column intermediate (bits_x2 8: the DSpark drafter's
+//     experts, VLLM_EXL3_MOE_V2_DRAFT);
+//   - hidden 5120, intermediate 2304, bits_x2 8: the DSpark drafter's routed
+//     experts (VLLM_EXL3_MOE_V2_DRAFT), with stages of their own (DraftTiling).
 // The caller (vllm/sm80/kernels/exl3/quant.py) takes this operator only for
 // the configurations ops.moe_v2_closed_reason opens and at most 64 rows; every
 // other call stays on moe_out (moe.cu), which this file does not change.
@@ -13,7 +16,8 @@
 // Arithmetic differs from moe_out: the expert GEMMs run m16n8k16 FP16 MMAs on
 // exactly decoded weights and a hi/lo FP16 split of the scaled activations,
 // and the input, activation and combine stages run in FP64. Results are
-// deterministic and a row never depends on other rows.
+// deterministic and a row never depends on other rows (the drafter's stages:
+// see DraftTiling).
 //
 // moe_out_v2_fold (VLLM_EXL3_MOE_V2_FOLD) computes the same bits in three
 // launches instead of five: the activation and the combine run at the end of
@@ -34,6 +38,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <torch/library.h>
 
+#include <atomic>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -168,8 +173,10 @@ __device__ __forceinline__ void block_scan2(int a, int b, int& a_before, int& b_
 // expert and each assignment's expert, and each row tile's trellis address
 // and tile columns per projection. Order inside an expert is arbitrary: each
 // assignment's result depends only on its own row, never on its position or
-// neighbours. A matrix not stored as bits_x2 kBitsX2 / codebook 2 traps.
-template <int kBitsX2>
+// neighbours. kOrdered: increasing assignment order inside an expert (the
+// drafter's stages; the dynamic shared memory then holds one more int per
+// assignment). A matrix not stored as bits_x2 kBitsX2 / codebook 2 traps.
+template <int kBitsX2, bool kOrdered = false>
 __device__ __forceinline__ void route_block(const Routing& routing, int64_t assignments,
                                             int block_rows, int* table) {
   extern __shared__ int route_shared[];
@@ -177,12 +184,14 @@ __device__ __forceinline__ void route_block(const Routing& routing, int64_t assi
   int* cursor = route_shared;              // counts, then fill cursors
   int* row_begin = cursor + experts;
   int* tile_begin = row_begin + experts;   // experts + 1 entries
+  int* expert_of = tile_begin + experts + 1;   // kOrdered: assignments entries
   for (int e = threadIdx.x; e < experts; e += blockDim.x) cursor[e] = 0;
   __syncthreads();
   int* by_assignment = table + RouteLayout::by_assignment_offset(assignments);
   for (int64_t a = threadIdx.x; a < assignments; a += blockDim.x) {
     const int64_t e = local_expert(routing, a);
     by_assignment[a] = static_cast<int>(e);
+    if constexpr (kOrdered) expert_of[a] = static_cast<int>(e);
     if (e >= 0) atomicAdd(&cursor[e], 1);
   }
   __syncthreads();
@@ -238,11 +247,24 @@ __device__ __forceinline__ void route_block(const Routing& routing, int64_t assi
   int* sorted = table + RouteLayout::sorted_offset();
   int* sorted_experts = table + RouteLayout::experts_offset(assignments);
   for (int64_t a = threadIdx.x; a < assignments; a += blockDim.x) {
-    const int64_t e = local_expert(routing, a);
-    if (e >= 0) {
-      const int at = atomicAdd(&cursor[e], 1);
-      sorted[at] = static_cast<int>(a);
-      sorted_experts[at] = static_cast<int>(e);
+    if constexpr (kOrdered) {
+      // The rank among the expert's earlier assignments, not an atomic
+      // arrival order.
+      const int e = expert_of[a];
+      if (e >= 0) {
+        int rank = 0;
+        for (int64_t b = 0; b < a; ++b) rank += expert_of[b] == e;
+        const int at = row_begin[e] + rank;
+        sorted[at] = static_cast<int>(a);
+        sorted_experts[at] = e;
+      }
+    } else {
+      const int64_t e = local_expert(routing, a);
+      if (e >= 0) {
+        const int at = atomicAdd(&cursor[e], 1);
+        sorted[at] = static_cast<int>(a);
+        sorted_experts[at] = static_cast<int>(e);
+      }
     }
   }
 }
@@ -441,6 +463,74 @@ activate_down_row(Routing routing, const int* table, int64_t assignments, int64_
   }
 }
 
+// The drafter's activation stage: rounded once to FP32 and written as the
+// down GEMM's tensor-core operand with one 2^e per (row, down K slice). One
+// thread block per (sorted position, down K slice): warp w takes the slice's
+// w-th overlapping H128 block (a block on a slice boundary is formed by both
+// of its slices, identically), the slice peak covers the slice's own columns
+// only (warp peaks in shared memory), and each slice stores only its columns,
+// so a row's slices spread over the SMs.
+template <int kSlices, int kSliceBlocks>
+__global__ void __launch_bounds__(32 * kSliceBlocks)
+activate_down_slice(Routing routing, const int* table, int64_t assignments, int64_t intermediate,
+                    int64_t ipad, const float* gate, const float* up, int64_t slice_stride,
+                    DownHalves halves, int down_slices, float limit) {
+  __shared__ float warp_peaks[kSliceBlocks];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int64_t width = ipad / down_slices;
+  const int count = __ldg(table);
+  // Uniform trip count per thread block (barriers inside); tasks run in
+  // increasing sorted position, so the first one past the count ends the loop.
+  for (int64_t task = blockIdx.x; task < assignments * down_slices; task += gridDim.x) {
+    const int64_t pos = task / down_slices;
+    if (pos >= count) break;
+    const int slice = static_cast<int>(task % down_slices);
+    const int64_t c0 = slice * width;
+    const int64_t c1 = c0 + width;
+    const int64_t block = c0 / 128 + warp;
+    const bool active = block * 128 < c1;
+    float f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int64_t assignment = 0;
+    if (active) {
+      double v[4];
+      activation_block<kSlices>(routing, table, assignments, intermediate, ipad, gate, up,
+                                slice_stride, pos, block, lane, limit, v, assignment);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int64_t col = block * 128 + lane + 32 * i;
+        if (col >= c0 && col < c1) f[i] = __double2float_rn(v[i]);
+      }
+    }
+    const float peak = warp_peak(f);
+    if (lane == 0) warp_peaks[warp] = peak;
+    __syncthreads();
+    float slice_peak = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kSliceBlocks; ++w) slice_peak = fmaxf(slice_peak, warp_peaks[w]);
+    const int e = halves_exponent(slice_peak);
+    if (active) {
+      __half* hi = halves.halves + assignment * 2 * ipad;
+      const float scale = __uint_as_float(uint32_t(127 + e) << 23);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int64_t col = block * 128 + lane + 32 * i;
+        if (col >= c0 && col < c1) {
+          const int64_t at = lane_position(col);
+          const float y = __fmul_rn(f[i], scale);
+          const __half h = __float2half_rn(y);
+          hi[at] = h;
+          hi[ipad + at] = __float2half_rn(__fsub_rn(y, __half2float(h)));
+        }
+      }
+      if (threadIdx.x == 0) {
+        halves.unscale[assignment * down_slices + slice] = __uint_as_float(uint32_t(127 - e) << 23);
+      }
+    }
+    __syncthreads();
+  }
+}
+
 // One block per (token, 128-column block), one warp per route (blockDim =
 // 32 * min(topk, 32), at least 4 warps). Warp w handles routes w, w + warps,
 // ...: the local route's down output (the sum of kSlices K-slice partials,
@@ -536,6 +626,7 @@ combine_routes(const float* down, const float* weights, Routing routing, const i
 // and the consumer kernel sums the slices in increasing slice order (FP64).
 // Everything is fixed-order: a row's result never depends on other rows.
 constexpr int kLaneRows = 8;                    // route rows per tile
+constexpr int kDraftLaneRows = 16;              // the drafter's (DraftLanes)
 constexpr int64_t kLaneMaxAssignments = 1024;   // routed rows the workspace layout covers
 constexpr int kLaneThreads = 256;
 constexpr int kLaneAhead = 3;                   // k steps prefetched to L2
@@ -562,13 +653,26 @@ __device__ __forceinline__ void mma_f16_f32(const uint32_t (&a)[4], uint2 b, flo
       : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b.x), "r"(b.y), "f"(0.0f));
 }
+// C-accumulating form: d = a b + d (the tensor core's own, truncating, add).
+__device__ __forceinline__ void mma_f16_f32_acc(const uint32_t (&a)[4], uint2 b, float (&d)[4]) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b.x), "r"(b.y));
+}
 
 // One warp: kNT output n16 tiles x kKT k16 steps of one route tile with
 // kGroups n8 row groups (row_of: lane r holds tile row r's assignment), k
 // outer: the kNT tiles of a k step are adjacent in the trellis (immediate
 // offsets from three per-lane word pointers); the next k step's tiles and B
 // fragments are in flight while this one decodes.
-template <int kGroups, int kNT, int kKT, int kBitsX2, bool kAligned>
+// kDraft (the drafter's DraftLanes): kGroups 2 (5..8 rows) and 4 (9..16 rows)
+// split hi and lo per pair of groups: groups 2q and 2q + 1 hold the high and
+// low parts of rows 8q..8q+7; high sums in FP32 outside the MMA, low sums in
+// the MMA's C operand (lo is ~2^-11 of hi, so the truncating add is far below
+// the FP32 rounding of the result); a row gets the same arithmetic in either.
+// bits_x2 8 decodes from two ring words (WordWindow).
+template <int kGroups, int kNT, int kKT, int kBitsX2, bool kAligned, bool kDraft = false>
 __device__ __forceinline__ void lane_tiles(const LaneProblem& p, int pi, int slice, int row_of,
                                            int rows, const uint16_t* trellis, int64_t tiles_n,
                                            int n0, int lane, const LaneWindow<kBitsX2>& window,
@@ -580,42 +684,55 @@ __device__ __forceinline__ void lane_tiles(const LaneProblem& p, int pi, int sli
   const int64_t row_halves = 2 * int64_t(p.k_tiles) * 16;
   const int t = lane & 3;
   const int gq = lane >> 2;
+  constexpr bool kSplit = kDraft && (kGroups == 2 || kGroups == 4);
   // B source of this lane: column gq of each group = hi (gq < 4) or lo of
-  // row 4g + gq % 4, k values 2t, 2t + 1, 2t + 8, 2t + 9 of each k step.
+  // row 4g + gq % 4 (split: row 8 (g / 2) + gq, part g % 2), k values 2t,
+  // 2t + 1, 2t + 8, 2t + 9 of each k step.
   const uint2* bsrc[kGroups];
   bool bok[kGroups];
 #pragma unroll
   for (int g = 0; g < kGroups; ++g) {
-    const int r = 4 * g + (gq & 3);
+    const int r = kSplit ? 8 * (g / 2) + gq : 4 * g + (gq & 3);
+    const int part = kSplit ? g % 2 : (gq >> 2);
     bok[g] = r < rows;
     const int64_t assignment = __shfl_sync(0xffffffffu, row_of, bok[g] ? r : 0);
     bsrc[g] = reinterpret_cast<const uint2*>(
                   p.halves + (assignment * p.projections + pi) * row_halves +
-                  (gq >> 2) * (row_halves / 2) + kt0 * 16) + t;
+                  part * (row_halves / 2) + kt0 * 16) + t;
   }
-  // 2^-e of the rows this lane stores: 4g + 2t + c (lanes t < 2).
+  // 2^-e of the rows this lane stores: 4g + 2t + c (lanes t < 2); split:
+  // 8 (g / 2) + 2t + c (entries of odd g unused).
   float unscale[kGroups][2];
 #pragma unroll
   for (int g = 0; g < kGroups; ++g) {
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
-      const int r = 4 * g + 2 * (t & 1) + c;
+      const int r = kSplit ? 8 * (g / 2) + 2 * t + c : 4 * g + 2 * (t & 1) + c;
       const int64_t assignment = __shfl_sync(0xffffffffu, row_of, r < rows ? r : 0);
-      unscale[g][c] = __ldg(p.unscale + (assignment * p.projections + pi) * slices + slice);
+      unscale[g][c] = kSplit && g % 2 == 1
+                          ? 0.0f
+                          : __ldg(p.unscale + (assignment * p.projections + pi) * slices + slice);
     }
   }
   const uint16_t* step = trellis + (int64_t(kt0) * tiles_n + n0) * Ring::kTileHalfwords;
   const int64_t stride = tiles_n * Ring::kTileHalfwords;
-  const uint32_t* wp[Ring::kLoadWords];
+  constexpr bool kWordWindow = kDraft && WordWindow<kBitsX2>::kValue;
+  constexpr int kUsedWords = kWordWindow ? 2 : Ring::kLoadWords;
+  const uint32_t* wp[kUsedWords];
 #pragma unroll
-  for (int i = 0; i < Ring::kLoadWords; ++i) {
+  for (int i = 0; i < kUsedWords; ++i) {
     wp[i] = reinterpret_cast<const uint32_t*>(step) + window.word[i];
   }
   uint32_t words[kNT][Ring::kLoadWords];
   auto fetch = [&](int j) {
     if constexpr (kAligned) {
 #pragma unroll
-      for (int i = 0; i < Ring::kLoadWords; ++i) words[j][i] = __ldg(wp[i] + j * kTileWords);
+      for (int i = 0; i < kUsedWords; ++i) words[j][i] = __ldg(wp[i] + j * kTileWords);
+    } else if constexpr (kWordWindow) {
+#pragma unroll
+      for (int i = 0; i < kUsedWords; ++i) {
+        words[j][i] = ring_word(step + j * Ring::kTileHalfwords, window.word[i], false);
+      }
     } else {
       load_lane_words<kBitsX2>(step + j * Ring::kTileHalfwords, window, false, words[j]);
     }
@@ -653,42 +770,73 @@ __device__ __forceinline__ void lane_tiles(const LaneProblem& p, int pi, int sli
     }
     if constexpr (kAligned) {
 #pragma unroll
-      for (int i = 0; i < Ring::kLoadWords; ++i) wp[i] += stride / 2;
+      for (int i = 0; i < kUsedWords; ++i) wp[i] += stride / 2;
     } else {
       step += stride;
     }
 #pragma unroll
     for (int j = 0; j < kNT; ++j) {
       uint32_t a[4];
-      decode_lane_fragment_mul1<kBitsX2>(words[j], window.shift, a);
+      if constexpr (kWordWindow) {
+        decode_lane_fragment_mul1_w32(words[j][0], words[j][1], a);
+      } else {
+        decode_lane_fragment_mul1<kBitsX2>(words[j], window.shift, a);
+      }
       if (more) fetch(j);
 #pragma unroll
       for (int g = 0; g < kGroups; ++g) {
-        float d[4];
-        mma_f16_f32(a, b[g], d);
+        if (kSplit && g % 2 == 1) {
+          mma_f16_f32_acc(a, b[g], acc[j][g]);
+        } else {
+          float d[4];
+          mma_f16_f32(a, b[g], d);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) acc[j][g][i] = __fadd_rn(acc[j][g][i], d[i]);
+          for (int i = 0; i < 4; ++i) acc[j][g][i] = __fadd_rn(acc[j][g][i], d[i]);
+        }
       }
     }
   }
   // Lanes t < 2 hold the high sums of rows 4g + 2t + {0, 1}; lane t + 2 the
-  // low sums of the same rows and columns.
+  // low sums of the same rows and columns (split: every lane holds both sums
+  // of rows 8q + 2t + {0, 1}).
   const int64_t n_stride = int64_t(p.n_tiles) * 16;
+  if constexpr (kSplit) {
 #pragma unroll
-  for (int g = 0; g < kGroups; ++g) {
+    for (int q = 0; q < kGroups / 2; ++q) {
 #pragma unroll
-    for (int c = 0; c < 2; ++c) {
-      const int r = 4 * g + 2 * (t & 1) + c;
-      const int64_t assignment = __shfl_sync(0xffffffffu, row_of, r < rows ? r : 0);
+      for (int c = 0; c < 2; ++c) {
+        const int r = 8 * q + 2 * t + c;
+        const int64_t assignment = __shfl_sync(0xffffffffu, row_of, r < rows ? r : 0);
 #pragma unroll
-      for (int j = 0; j < kNT; ++j) {
+        for (int j = 0; j < kNT; ++j) {
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const int i = 2 * h + c;
-          const float low = __shfl_xor_sync(0xffffffffu, acc[j][g][i], 2);
-          if (t < 2 && r < rows) {
-            out[assignment * n_stride + (n0 + j) * 16 + gq + 8 * h] =
-                __fmul_rn(__fadd_rn(acc[j][g][i], low), unscale[g][c]);
+          for (int h = 0; h < 2; ++h) {
+            const int i = 2 * h + c;
+            if (r < rows) {
+              out[assignment * n_stride + (n0 + j) * 16 + gq + 8 * h] =
+                  __fmul_rn(__fadd_rn(acc[j][2 * q][i], acc[j][2 * q + 1][i]), unscale[2 * q][c]);
+            }
+          }
+        }
+      }
+    }
+  } else {
+#pragma unroll
+    for (int g = 0; g < kGroups; ++g) {
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        const int r = 4 * g + 2 * (t & 1) + c;
+        const int64_t assignment = __shfl_sync(0xffffffffu, row_of, r < rows ? r : 0);
+#pragma unroll
+        for (int j = 0; j < kNT; ++j) {
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const int i = 2 * h + c;
+            const float low = __shfl_xor_sync(0xffffffffu, acc[j][g][i], 2);
+            if (t < 2 && r < rows) {
+              out[assignment * n_stride + (n0 + j) * 16 + gq + 8 * h] =
+                  __fmul_rn(__fadd_rn(acc[j][g][i], low), unscale[g][c]);
+            }
           }
         }
       }
@@ -698,14 +846,14 @@ __device__ __forceinline__ void lane_tiles(const LaneProblem& p, int pi, int sli
 
 // The unaligned-trellis variant, out of line: inlining it beside the aligned
 // one costs the hot loops about 3 % (register allocation and code layout).
-template <int kGroups, int kNT, int kKT, int kBitsX2>
+template <int kGroups, int kNT, int kKT, int kBitsX2, bool kDraft = false>
 __device__ __noinline__ void lane_tiles_unaligned(LaneProblem p, int pi, int slice, int row_of,
                                                   int rows, const uint16_t* trellis,
                                                   int64_t tiles_n, int n0, int lane,
                                                   float* out) {
   const LaneWindow<kBitsX2> window(lane);
-  lane_tiles<kGroups, kNT, kKT, kBitsX2, false>(p, pi, slice, row_of, rows, trellis, tiles_n,
-                                                n0, lane, window, out);
+  lane_tiles<kGroups, kNT, kKT, kBitsX2, false, kDraft>(p, pi, slice, row_of, rows, trellis,
+                                                        tiles_n, n0, lane, window, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1145,25 @@ struct FoldDown {
   }
 };
 
+// The drafter's lane kernels (run_lanes with DraftShape): row tiles of up to
+// kDraftLaneRows rows, nothing after an item. A tile of 1..4 rows takes one
+// n8 row group, of 5..8 rows a hi/lo pair of groups, of 9..16 two pairs
+// (lane_tiles kDraft), the 1..4-row group with the low part summed outside
+// the MMA. kMinRows 8 or 16 (VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS) gives every
+// tile at least the kernel of that many rows, so a row's result no longer
+// depends on how many rows of the call share its expert.
+template <int kMinRows>
+struct DraftLanes {
+  template <int kNT>
+  __device__ __forceinline__ static void item_done(const LaneProblem&, const FoldArgs&, int64_t,
+                                                   int4, int, int, int, int, int) {}
+};
+// DraftLanes' kMinRows; 0 for the other lane kernels.
+template <class Fold>
+struct DraftMinRows : std::integral_constant<int, 0> {};
+template <int kMinRows>
+struct DraftMinRows<DraftLanes<kMinRows>> : std::integral_constant<int, kMinRows> {};
+
 // Warp items: (route tile, projection, K slice, column group of kNT n16
 // tiles), column groups fastest so a block's warps share B rows in L1.
 template <int kNT, int kKT, int kBitsX2, class Fold = NoFold>
@@ -1034,18 +1201,41 @@ moe_lane_kernel(LaneProblem p, FoldArgs fold) {
     const int n0 = column_group * kNT;
     const bool aligned = (reinterpret_cast<uintptr_t>(trellis) & 3) == 0;
     float* out = (pi == 0 ? p.out0 : p.out1) + slice * p.slice_stride;
+    constexpr int kDraftMin = DraftMinRows<Fold>::value;
+    constexpr bool kDraft = kDraftMin > 0;
 #define EXL3_LANE_GROUPS(G)                                                                     \
     if (aligned) {                                                                              \
-      lane_tiles<G, kNT, kKT, kBitsX2, true>(p, pi, slice, row_of, rows, trellis, tiles_n, n0,  \
-                                             lane, window, out);                                \
+      lane_tiles<G, kNT, kKT, kBitsX2, true, kDraft>(p, pi, slice, row_of, rows, trellis,       \
+                                                     tiles_n, n0, lane, window, out);           \
     } else {                                                                                    \
-      lane_tiles_unaligned<G, kNT, kKT, kBitsX2>(p, pi, slice, row_of, rows, trellis, tiles_n,  \
-                                                 n0, lane, out);                                \
+      lane_tiles_unaligned<G, kNT, kKT, kBitsX2, kDraft>(p, pi, slice, row_of, rows, trellis,   \
+                                                         tiles_n, n0, lane, out);               \
     }
-    if (rows <= 4) {
+    if constexpr (!kDraft) {
+      if (rows <= 4) {
+        EXL3_LANE_GROUPS(1);
+      } else {
+        EXL3_LANE_GROUPS(2);
+      }
+    } else if (kDraftMin <= 4 && rows <= 4) {
       EXL3_LANE_GROUPS(1);
-    } else {
+    } else if (kDraftMin <= 8 && rows <= 8) {
       EXL3_LANE_GROUPS(2);
+    } else {
+      // 9..16 rows: four row groups (two hi/lo pairs) decoded once, half a
+      // column group at a time (the accumulators of a kGroups 2 call).
+      constexpr int kHalf = kNT / 2;
+      if (aligned) {
+        lane_tiles<4, kHalf, kKT, kBitsX2, true, true>(p, pi, slice, row_of, rows, trellis,
+                                                       tiles_n, n0, lane, window, out);
+        lane_tiles<4, kNT - kHalf, kKT, kBitsX2, true, true>(
+            p, pi, slice, row_of, rows, trellis, tiles_n, n0 + kHalf, lane, window, out);
+      } else {
+        lane_tiles_unaligned<4, kHalf, kKT, kBitsX2, true>(p, pi, slice, row_of, rows, trellis,
+                                                           tiles_n, n0, lane, out);
+        lane_tiles_unaligned<4, kNT - kHalf, kKT, kBitsX2, true>(
+            p, pi, slice, row_of, rows, trellis, tiles_n, n0 + kHalf, lane, out);
+      }
     }
 #undef EXL3_LANE_GROUPS
     Fold::template item_done<kNT>(p, fold, tile_index, tile, n0, row_of, rows, slices, lane);
@@ -1219,6 +1409,91 @@ route_and_gate_up_input(Routing routing, int64_t assignments, int block_rows, in
   }
 }
 
+// The drafter's route + gate/up operand launch: block 0 routes in increasing
+// assignment order inside an expert (route_block kOrdered) while the other
+// blocks form the gate/up tensor-core B operand straight from topk_ids. One
+// thread block per (assignment, kScaleK-column scale group), one warp per
+// H128 block of the group, both projections: x * suh and H128 in FP64,
+// rounded once to FP32; the 2^e of a (projection, group) comes from the peak
+// over the group's H128 blocks (shared memory), then the halves are stored by
+// store_scaled_halves. A group spans kSplit GEMM K slices, each given its own
+// copy of 2^-e. A row's groups spread over the SMs.
+template <int kBitsX2, int kScaleK, int kSplit>
+__global__ void __launch_bounds__(32 * (kScaleK / 128))
+route_and_gate_up_group_input(Routing routing, int64_t assignments, int block_rows, int* table,
+                              const __nv_bfloat16* x, int64_t hidden, int64_t hpad,
+                              __half* halves, float* unscale) {
+  if (blockIdx.x == 0) {
+    route_block<kBitsX2, true>(routing, assignments, block_rows, table);
+    return;
+  }
+  constexpr int kBlocks = kScaleK / 128;
+  static_assert(kBlocks <= 32 && kSplit <= 32, "one warp per H128 block of a scale group");
+  __shared__ float warp_peaks[2][kBlocks];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int64_t groups = hpad / kScaleK;
+  const int64_t slices = groups * kSplit;
+  // Uniform trip count per thread block (barriers inside).
+  for (int64_t task = blockIdx.x - 1; task < assignments * groups; task += gridDim.x - 1) {
+    const int64_t assignment = task / groups;
+    const int64_t group = task - assignment * groups;
+    const int64_t first = group * kScaleK + int64_t(warp) * 128;
+    const __nv_bfloat16* row = x + (assignment / routing.topk) * hidden;
+    float xs[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int64_t col = first + lane + 32 * i;
+      xs[i] = col < hidden ? __bfloat162float(row[col]) : 0.0f;
+    }
+    const int64_t expert = local_expert(routing, assignment);
+    float v[2][4] = {};
+    if (expert >= 0) {
+      const half* suh[2] = {expert_suh(routing, expert, 0), expert_suh(routing, expert, 1)};
+      float scale[2][4];
+#pragma unroll
+      for (int q = 0; q < 2; ++q) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int64_t col = first + lane + 32 * i;
+          scale[q][i] = col < hidden ? __half2float(suh[q][col]) : 0.0f;
+        }
+      }
+#pragma unroll
+      for (int q = 0; q < 2; ++q) {
+        double block[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) block[i] = __dmul_rn(xs[i], scale[q][i]);
+        hadamard128_warp_f64(block, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[q][i] = __double2float_rn(block[i]);
+      }
+    }
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      const float peak = warp_peak(v[q]);
+      if (lane == 0) warp_peaks[q][warp] = peak;
+    }
+    __syncthreads();
+    if (expert >= 0) {
+#pragma unroll
+      for (int q = 0; q < 2; ++q) {
+        float group_peak = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kBlocks; ++w) group_peak = fmaxf(group_peak, warp_peaks[q][w]);
+        const int e = halves_exponent(group_peak);
+        __half* hi = halves + (assignment * 2 + q) * 2 * hpad + group * kScaleK;
+        store_scaled_halves(v[q], lane, warp * 128, e, hi, hi + hpad);
+        if (warp == 0 && lane < kSplit) {
+          unscale[(assignment * 2 + q) * slices + group * kSplit + lane] =
+              __uint_as_float(uint32_t(127 - e) << 23);
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
 // The served shapes, by padded hidden and intermediate size. Items cover
 // kColumnTiles n16 tiles. Gate/up: calls below kLongSliceAssignments routed
 // assignments give each (row, projection) one 2^e over the whole K and split
@@ -1270,10 +1545,12 @@ struct LaneTiling<5120, 2304> {
 // Hidden 5120, intermediate 640 (tensor-parallel routed experts: every expert
 // local, this rank's 640-column chunk of the 2304 intermediate): gate/up as
 // for intermediate 2304 (16 slices of 20 steps), down 2 slices of 20. One
-// slice layout for every call of up to 64 rows.
+// slice layout for every call of up to 64 rows. bits_x2 8: the DSpark
+// drafter's experts split the same way (VLLM_EXL3_MOE_V2_DRAFT; these
+// stages, not DraftTiling's).
 template <>
 struct LaneTiling<5120, 640> {
-  using Bits = std::integer_sequence<int, 6, 4>;
+  using Bits = std::integer_sequence<int, 6, 4, 8>;
   static constexpr int kColumnTiles = 4;
   static constexpr int kGateUpShortScaleK = 5120;
   static constexpr int kGateUpShortSliceTiles = 20;
@@ -1287,10 +1564,10 @@ struct LaneTiling<5120, 640> {
 
 // Hidden 5120, intermediate 512 (tensor-parallel routed experts, this rank's
 // 512-column chunk): gate/up 16 slices of 20 steps, down 2 slices of 16. One
-// slice layout for every call of up to 64 rows.
+// slice layout for every call of up to 64 rows. bits_x2 8: as for 640.
 template <>
 struct LaneTiling<5120, 512> {
-  using Bits = std::integer_sequence<int, 6, 4>;
+  using Bits = std::integer_sequence<int, 6, 4, 8>;
   static constexpr int kColumnTiles = 4;
   static constexpr int kGateUpShortScaleK = 5120;
   static constexpr int kGateUpShortSliceTiles = 20;
@@ -1302,9 +1579,33 @@ struct LaneTiling<5120, 512> {
   static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
 };
 
-template <int64_t kH, int64_t kI>
-struct LaneShape : LaneTiling<kH, kI> {
-  using Tiling = LaneTiling<kH, kI>;
+// The DSpark drafter's routed experts (hidden 5120, intermediate 2304, bits_x2
+// 8; VLLM_EXL3_MOE_V2_DRAFT): the hidden-5120 K slices (one layout for every
+// call of up to 64 rows) with stages of their own: one gate/up 2^e per 640
+// columns, five H128 blocks (route_and_gate_up_group_input: one thread block
+// per (row, group)); one down 2^e per (row, K slice) (activate_down_slice);
+// row tiles of up to 16 rows, the low part of 5..16-row tiles summed in the
+// MMA's C operand (DraftLanes). A row's result depends on whether its tile
+// holds 1..4 rows or more (how many rows of the call share its expert) unless
+// VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS pins the tile kernel.
+struct DraftTiling {
+  using Bits = std::integer_sequence<int, 8>;
+  static constexpr int kColumnTiles = 4;
+  static constexpr int kGateUpShortScaleK = 640;
+  static constexpr int kGateUpShortSliceTiles = 20;
+  static constexpr int kGateUpLongScaleK = kGateUpShortScaleK;
+  static constexpr int kGateUpLongSliceTiles = kGateUpShortSliceTiles;
+  static constexpr int kDownShortSliceTiles = 18;
+  static constexpr int kDownLongSliceTiles = kDownShortSliceTiles;
+  static constexpr int64_t kLongSliceAssignments = std::numeric_limits<int64_t>::max();
+  static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
+};
+
+template <int64_t kH, int64_t kI, class kTiling = LaneTiling<kH, kI>>
+struct LaneShape : kTiling {
+  using Tiling = kTiling;
+  // The drafter's stages (run_lanes).
+  static constexpr bool kDraft = std::is_same_v<Tiling, DraftTiling>;
   static constexpr int64_t kHidden = kH;
   static constexpr int64_t kIntermediate = kI;
   static constexpr int kGateUpShortSlices = int(kH / (16 * Tiling::kGateUpShortSliceTiles));
@@ -1317,6 +1618,11 @@ struct LaneShape : LaneTiling<kH, kI> {
   // H128 blocks of a row per input warp, and the activation stage's warps.
   static constexpr int kInputBlocksPerWarp = int(kH / 128) / (kRouteInputThreads / 32);
   static constexpr int kRowBlocks = int(kI / 128);
+  // The drafter's activation warps per down K slice: the H128 blocks a slice
+  // of either width can overlap.
+  static constexpr int kSliceBlocks =
+      int((16 * std::max(Tiling::kDownShortSliceTiles, Tiling::kDownLongSliceTiles) + 127) /
+          128) + 1;
   static_assert(kH % (16 * Tiling::kGateUpShortSliceTiles) == 0 &&
                     kH % (16 * Tiling::kGateUpLongSliceTiles) == 0 &&
                     kGateUpShortSlices >= kGateUpLongSlices &&
@@ -1334,7 +1640,23 @@ struct LaneShape : LaneTiling<kH, kI> {
                     kRowBlocks * 32 <= 1024,
                 "the input warps cover whole H128 blocks of a row; one activation warp "
                 "per H128 block of the intermediate");
+  static_assert(!kDraft || (Tiling::kGateUpShortScaleK % 128 == 0 &&
+                            Tiling::kGateUpShortScaleK / 128 <= 32 &&
+                            Tiling::kGateUpLongScaleK == Tiling::kGateUpShortScaleK &&
+                            kSliceBlocks * 32 <= 1024),
+                "the drafter's input: one warp per H128 block of a gate/up scale group; one "
+                "activation warp per H128 block of a down K slice");
 };
+
+using DraftShape = LaneShape<5120, 2304, DraftTiling>;
+// Apart from its tiling the drafter's shape is the hidden-5120 one: its calls
+// use that workspace (moe_workspace_size_v2; the route table holds fewer row
+// tiles, of 16 rows, in the same layout) and row geometry.
+static_assert(DraftShape::kGateUpSlices == LaneShape<5120, 2304>::kGateUpSlices &&
+                  DraftShape::kDownSlices == LaneShape<5120, 2304>::kDownSlices &&
+                  DraftShape::kInputBlocksPerWarp == LaneShape<5120, 2304>::kInputBlocksPerWarp &&
+                  DraftShape::kRowBlocks == LaneShape<5120, 2304>::kRowBlocks,
+              "the drafter's workspace layout and row geometry must be the hidden-5120 ones");
 
 constexpr const char* kShapeMessage =
     "EXL3 MoE v2 supports padded hidden 2560 with intermediate 640 and padded hidden 5120 "
@@ -1424,6 +1746,7 @@ struct LaneCall {
   int64_t assignments;
   float limit;
   bool fold;                 // moe_out_v2_fold: three launches (FoldArgs)
+  int draft_min_rows;        // DraftShape: DraftLanes' kMinRows (4, 8 or 16)
   cudaStream_t stream;
 };
 
@@ -1458,38 +1781,70 @@ void run_lanes(const LaneCall& c) {
     // Down operand with one 2^e per row; long or short K slices.
     const bool long_down = assignments >= S::kLongDownAssignments;
     const int down_used = long_down ? S::kDownLongSlices : S::kDownShortSlices;
-    if (c.fold) {
-      static_assert(S::kDownSlices * S::kHidden >= S::kIntermediate + 2 * S::kRowBlocks + 5,
-                    "the folded gate/up stage keeps its counters, values and peaks in the "
-                    "down partials' region");
-      int* tile_counters = reinterpret_cast<int*>(down);
-      const int64_t tile_counter_ints = assignments * (S::kRowBlocks + 1);
-      float* values = down + (tile_counter_ints + 3) / 4 * 4;
-      int* token_counters = table + RouteLayout::ints(assignments);
-      const int64_t token_counter_ints = c.rows * (hpad / 128);
-      fold = FoldArgs{routing, tile_counters, tile_counter_ints, values,
-                      values + assignments * ipad, token_counters, token_counter_ints,
-                      token_counters + token_counter_ints,
-                      DownHalves{down_halves, down_unscale}, down_used, c.intermediate,
-                      c.limit, c.topk_weights, c.out, c.rows, c.hidden};
+    // The drafter's calls (bits_x2 8, run_moe_out_v2 refuses the fold) build
+    // no folded kernels.
+    constexpr bool kFoldable = !S::kDraft && kBitsX2 != 8;
+    if constexpr (kFoldable) {
+      if (c.fold) {
+        static_assert(S::kDownSlices * S::kHidden >= S::kIntermediate + 2 * S::kRowBlocks + 5,
+                      "the folded gate/up stage keeps its counters, values and peaks in the "
+                      "down partials' region");
+        int* tile_counters = reinterpret_cast<int*>(down);
+        const int64_t tile_counter_ints = assignments * (S::kRowBlocks + 1);
+        float* values = down + (tile_counter_ints + 3) / 4 * 4;
+        int* token_counters = table + RouteLayout::ints(assignments);
+        const int64_t token_counter_ints = c.rows * (hpad / 128);
+        fold = FoldArgs{routing, tile_counters, tile_counter_ints, values,
+                        values + assignments * ipad, token_counters, token_counter_ints,
+                        token_counters + token_counter_ints,
+                        DownHalves{down_halves, down_unscale}, down_used, c.intermediate,
+                        c.limit, c.topk_weights, c.out, c.rows, c.hidden};
+      }
     }
+    // The drafter's lane kernels: DraftLanes<c.draft_min_rows>.
+    const auto draft_lane = [&](auto slice_tiles, const LaneProblem& problem,
+                                int64_t tiles) {
+      constexpr int kSliceTiles = decltype(slice_tiles)::value;
+      if (c.draft_min_rows == 16) {
+        launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2, DraftLanes<16>>(problem, fold, tiles,
+                                                                          c.stream);
+      } else if (c.draft_min_rows == 8) {
+        launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2, DraftLanes<8>>(problem, fold, tiles,
+                                                                         c.stream);
+      } else {
+        launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2, DraftLanes<4>>(problem, fold, tiles,
+                                                                         c.stream);
+      }
+    };
     // Routing (block 0) and the gate/up B operand (other blocks) in one launch,
     // then the gate/up GEMM and the activation, with short or long K slices.
     const auto gate_up = [&](auto scale_k, auto slice_tiles) {
       constexpr int kScaleK = decltype(scale_k)::value;
       constexpr int kSplit = kScaleK / (16 * decltype(slice_tiles)::value);
-      const auto launch = [&](auto folded) {
-        route_and_gate_up_input<kBitsX2, S::kInputBlocksPerWarp, kScaleK, kSplit,
-                                decltype(folded)::value>
-            <<<launch_blocks(1 + assignments),
-               kRouteInputThreads, (3 * c.experts + 1) * sizeof(int), c.stream>>>(
-                routing, assignments, kLaneRows, table, c.x, c.hidden, hpad, gate_up_halves,
-                gate_up_unscale, fold);
-      };
-      if (c.fold) {
-        launch(std::true_type{});
+      if constexpr (S::kDraft) {
+        route_and_gate_up_group_input<kBitsX2, kScaleK, kSplit>
+            <<<launch_blocks(1 + assignments * (hpad / kScaleK)), 32 * (kScaleK / 128),
+               (3 * c.experts + 1 + assignments) * sizeof(int), c.stream>>>(
+                routing, assignments, kDraftLaneRows, table, c.x, c.hidden, hpad,
+                gate_up_halves, gate_up_unscale);
       } else {
-        launch(std::false_type{});
+        const auto launch = [&](auto folded) {
+          route_and_gate_up_input<kBitsX2, S::kInputBlocksPerWarp, kScaleK, kSplit,
+                                  decltype(folded)::value>
+              <<<launch_blocks(1 + assignments),
+                 kRouteInputThreads, (3 * c.experts + 1) * sizeof(int), c.stream>>>(
+                  routing, assignments, kLaneRows, table, c.x, c.hidden, hpad, gate_up_halves,
+                  gate_up_unscale, fold);
+        };
+        if constexpr (kFoldable) {
+          if (c.fold) {
+            launch(std::true_type{});
+          } else {
+            launch(std::false_type{});
+          }
+        } else {
+          launch(std::false_type{});
+        }
       }
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
@@ -1501,9 +1856,10 @@ void run_lanes(const LaneCall& c) {
       gate_up(std::integral_constant<int, S::kGateUpShortScaleK>{},
               std::integral_constant<int, S::kGateUpShortSliceTiles>{});
     }
-    // Row tiles: sum over experts of ceil(rows_e / kLaneRows).
+    // Row tiles: sum over experts of ceil(rows_e / tile rows).
+    constexpr int64_t kTileRows = S::kDraft ? kDraftLaneRows : kLaneRows;
     const int64_t max_tiles = std::min<int64_t>(
-        assignments, assignments / kLaneRows + std::min<int64_t>(c.experts, assignments) + 1);
+        assignments, assignments / kTileRows + std::min<int64_t>(c.experts, assignments) + 1);
     LaneProblem p{};
     p.table = table;
     p.assignments = assignments;
@@ -1517,22 +1873,36 @@ void run_lanes(const LaneCall& c) {
     p.halves = gate_up_halves;
     p.unscale = gate_up_unscale;
     const auto activate = [&](auto slices) {
-      activate_down_row<decltype(slices)::value, S::kRowBlocks>
-          <<<launch_blocks(assignments), 32 * S::kRowBlocks, 0, c.stream>>>(
-              routing, table, assignments, c.intermediate, ipad, gate, up, gate_up_stride,
-              DownHalves{down_halves, down_unscale}, down_used, c.limit);
+      if constexpr (S::kDraft) {
+        activate_down_slice<decltype(slices)::value, S::kSliceBlocks>
+            <<<launch_blocks(assignments * down_used), 32 * S::kSliceBlocks, 0, c.stream>>>(
+                routing, table, assignments, c.intermediate, ipad, gate, up, gate_up_stride,
+                DownHalves{down_halves, down_unscale}, down_used, c.limit);
+      } else {
+        activate_down_row<decltype(slices)::value, S::kRowBlocks>
+            <<<launch_blocks(assignments), 32 * S::kRowBlocks, 0, c.stream>>>(
+                routing, table, assignments, c.intermediate, ipad, gate, up, gate_up_stride,
+                DownHalves{down_halves, down_unscale}, down_used, c.limit);
+      }
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
     // Folded: the activation at the end of the gate/up launch.
     const auto gate_up_lane = [&](auto slice_tiles, auto slices) {
       constexpr int kSliceTiles = decltype(slice_tiles)::value;
       constexpr int kSlices = decltype(slices)::value;
-      if (c.fold) {
-        launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2, FoldGateUp<kSlices, S::kRowBlocks>>(
-            p, fold, max_tiles, c.stream);
+      if constexpr (S::kDraft) {
+        draft_lane(std::integral_constant<int, kSliceTiles>{}, p, max_tiles);
+        activate(std::integral_constant<int, kSlices>{});
       } else {
+        if constexpr (kFoldable) {
+          if (c.fold) {
+            launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2,
+                        FoldGateUp<kSlices, S::kRowBlocks>>(p, fold, max_tiles, c.stream);
+            return;
+          }
+        }
         launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2>(p, fold, max_tiles, c.stream);
-        activate(slices);
+        activate(std::integral_constant<int, kSlices>{});
       }
     };
     if (long_slices) {
@@ -1554,10 +1924,16 @@ void run_lanes(const LaneCall& c) {
     // Folded: the combine at the end of the down launch.
     const auto down_lane = [&](auto slice_tiles, auto slices) {
       constexpr int kSliceTiles = decltype(slice_tiles)::value;
-      if (c.fold) {
-        launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2,
-                    FoldDown<decltype(slices)::value>>(p, fold, max_tiles, c.stream);
+      if constexpr (S::kDraft) {
+        draft_lane(std::integral_constant<int, kSliceTiles>{}, p, max_tiles);
       } else {
+        if constexpr (kFoldable) {
+          if (c.fold) {
+            launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2,
+                        FoldDown<decltype(slices)::value>>(p, fold, max_tiles, c.stream);
+            return;
+          }
+        }
         launch_lane<S::kColumnTiles, kSliceTiles, kBitsX2>(p, fold, max_tiles, c.stream);
       }
     };
@@ -1617,6 +1993,12 @@ int64_t moe_workspace_size_v2(int64_t max_rows, int64_t hidden_size,
 
 namespace {
 
+// The drafter's DraftLanes<kMinRows> (moe_v2_draft_force_rows,
+// VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS): 4 picks each tile's kernel by its rows;
+// 8 or 16 gives every tile at least that tile's kernel. Set before the
+// warm-up and graph capture.
+std::atomic<int> draft_min_rows{4};
+
 // moe_out_v2 (fold false) and moe_out_v2_fold: the same checks and stages;
 // folded, the activation and combine run inside the lane launches.
 void run_moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
@@ -1653,15 +2035,25 @@ void run_moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
   TORCH_CHECK(experts <= kMaxRouteExperts, "EXL3 MoE has too many local experts");
   const int64_t assignments = checked_mul(rows, topk);
   bool built = false;
+  // The drafter's experts (DraftShape) take their own stages, never folded.
+  const bool draft = hpad == DraftShape::kHidden && ipad == DraftShape::kIntermediate &&
+                     with_bits(DraftShape::Bits{}, bits_x2, [](auto) {});
   TORCH_CHECK(with_shape(hpad, ipad,
                          [&](auto shape) {
                            check_assignments(assignments);
-                           built = with_bits(typename decltype(shape)::Bits{}, bits_x2,
-                                             [](auto) {});
+                           built = draft || with_bits(typename decltype(shape)::Bits{},
+                                                      bits_x2, [](auto) {});
                          }),
               kShapeMessage);
   TORCH_CHECK(built, "EXL3 MoE v2 has no bits_x2 ", bits_x2, " kernels for padded hidden ",
               hpad, " and intermediate ", ipad);
+  TORCH_CHECK(!(fold && bits_x2 == 8),
+              "EXL3 MoE v2 has no folded bits_x2 8 kernels (the DSpark drafter's experts)");
+  // The drafter's ordered routing keeps one more int per assignment in the
+  // route block's dynamic shared memory.
+  TORCH_CHECK(!draft || (3 * experts + 1 + assignments) * int64_t(sizeof(int)) <= 48 * 1024,
+              "EXL3 MoE v2 bits_x2 8: too many local experts and assignments for the route "
+              "block's shared memory");
   const int64_t required =
       moe_workspace_size_v2(rows, hidden, intermediate_size, topk, experts);
   TORCH_CHECK(workspace.numel() >= required, "EXL3 MoE workspace is too small");
@@ -1689,12 +2081,19 @@ void run_moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
       assignments,
       limit,
       fold,
+      draft_min_rows.load(),
       stream};
-  with_shape(hpad, ipad, [&](auto shape) {
-    with_bits(typename decltype(shape)::Bits{}, bits_x2, [&](auto bits) {
-      run_lanes<decltype(shape), decltype(bits)::value>(call);
+  if (draft) {
+    with_bits(DraftShape::Bits{}, bits_x2, [&](auto bits) {
+      run_lanes<DraftShape, decltype(bits)::value>(call);
     });
-  });
+  } else {
+    with_shape(hpad, ipad, [&](auto shape) {
+      with_bits(typename decltype(shape)::Bits{}, bits_x2, [&](auto bits) {
+        run_lanes<decltype(shape), decltype(bits)::value>(call);
+      });
+    });
+  }
 }
 
 }  // namespace
@@ -1721,6 +2120,12 @@ void moe_out_v2_fold(const torch::Tensor& x, const torch::Tensor& topk_ids,
                  intermediate_size, bits_x2, out, workspace, swiglu_limit, true);
 }
 
+void moe_v2_draft_force_rows(int64_t rows) {
+  TORCH_CHECK(rows == 0 || rows == 8 || rows == 16,
+              "EXL3 MoE v2 drafter tile rows to force must be 0 (none), 8 or 16, not ", rows);
+  draft_min_rows.store(rows == 0 ? 4 : static_cast<int>(rows));
+}
+
 }  // namespace exl3
 
 // moe_out_v2_fold: moe_out_v2's schema and output bits in three launches.
@@ -1729,6 +2134,8 @@ TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
         "int intermediate_size, int bits_x2, Tensor(a!) out, "
         "Tensor(b!) workspace, float swiglu_limit=0.0) -> ()");
+  // The drafter's (bits_x2 8) row tile kernel floor; 0: by each tile's rows.
+  m.def("moe_v2_draft_force_rows(int rows) -> ()", &exl3::moe_v2_draft_force_rows);
 }
 
 TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
