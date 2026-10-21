@@ -15,7 +15,10 @@ and the buffer views are the same buffers; the batched step launches one
 kernel for the window part instead of the per-group ``torch.ge``, fill,
 index and gather-length launches. A builder whose inputs changed since the
 step that learned them, and DSpark's non-causal draft metadata, build per
-group. The GPU half is ``test_sm80_swa_meta_batch_gpu.py``.
+group, and so does a group whose block table is a kernel-block table (filled
+in the group's own build). A discarded layout (builders, block tables, slot
+mappings) is freed once learned and launched for. The GPU half is
+``test_sm80_swa_meta_batch_gpu.py``.
 
     pytest -q tests/models/deepseek_v41/sm80/test_sm80_swa_meta_batch.py
 """

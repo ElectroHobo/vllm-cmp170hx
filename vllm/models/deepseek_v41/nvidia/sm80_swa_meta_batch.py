@@ -11,23 +11,33 @@ group draws its own blocks, so ``build_attn_metadata``
 group, from that group's block table and slot mapping, with three launches
 each (decode-only steps) or five (with prefill rows). The runner keeps those
 inputs in persistent buffers (``BlockTables.input_block_tables`` and the
-stacked ``BlockTables.slot_mappings``, ``vllm/v1/worker/gpu/block_table.py``),
-so their addresses do not change between steps.
+stacked ``BlockTables.slot_mappings``, ``vllm/v1/worker/gpu/block_table.py``)
+and fills them for every group before the builds, so their addresses do not
+change between steps.
 
 :func:`build` (called by ``Sm80SWAMetadataBuilder.build`` with the switch on)
 learns, from one step's builds, which builders build together in one
 ``build_attn_metadata`` call and the addresses of their inputs. On a later
-step the first of them launches ``ops/sm80_swa_meta.swa_meta_batch`` for all
-of them, writing each group's buffers as its own build would; each builder
-then returns the metadata its own build returns, over the same buffers. A
-builder takes the batched result only if its inputs are the learned ones and
-the batch-level inputs are the first builder's; anything else (another step
-shape, a changed buffer, DSpark's non-causal draft metadata, image spans,
-CUDA graph capture and drafting builds) takes the per-group build. No host
-synchronization: the learned tables are uploaded once per change of the
-learned inputs, from pinned memory.
+step the first build of the call launches ``ops/sm80_swa_meta.swa_meta_batch``
+for the learned members, writing each member's buffers as its own build
+would; each member then returns the metadata its own build returns, over the
+same buffers. A builder takes the batched result only if its inputs are the
+learned ones and the batch-level inputs are the first build's; anything else
+(another step shape, a changed buffer, DSpark's non-causal draft metadata,
+image spans, CUDA graph capture and drafting builds) takes the per-group
+build. A group whose block table is not one of the runner's 2-D input tables
+(a kernel-block table, which ``AttentionGroup`` fills in the group's own
+build, after the launch) is never a member. No host synchronization: the
+learned tables are uploaded once per change of the learned inputs, from
+pinned memory.
+
+The learned state holds builders and input buffers only weakly, so builders
+and buffers the runner discards (profiling, decoder-replay copies, a KV cache
+reinitialisation) are freed; a family with any member gone is dropped before
+it can launch.
 """
 
+import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,44 +64,77 @@ def _end(t: torch.Tensor) -> int:
     return storage.data_ptr() + storage.nbytes()
 
 
+def _root(t: torch.Tensor) -> torch.Tensor:
+    """The tensor ``t`` is a view of (``t`` itself if none)."""
+    return t if t._base is None else t._base
+
+
 @dataclass
 class _Member:
-    builder: Any
-    block_table: torch.Tensor
-    slot_mapping: torch.Tensor
+    """One build of a call: weak references to the builder and to the
+    tensors its inputs are views of, and those inputs' addresses."""
 
-    def key(self) -> tuple:
-        return (
-            id(self.builder),
-            self.block_table.data_ptr(),
-            self.block_table.stride(0),
-            self.slot_mapping.data_ptr(),
+    builder: weakref.ref
+    block_table: weakref.ref
+    slot_mapping: weakref.ref
+    key: tuple
+    # Filled by the runner before the builds: a view of a 2-D input table.
+    # A group's kernel-block table (3-D, one per microbatch) is filled in the
+    # group's own build instead.
+    runner_table: bool
+    max_slots: int
+    max_rows: int
+
+    @classmethod
+    def of(cls, builder: Any, cam: CommonAttentionMetadata) -> "_Member":
+        bt, slots = cam.block_table_tensor, cam.slot_mapping
+        bt_root, slots_root = _root(bt), _root(slots)
+        return cls(
+            builder=weakref.ref(builder),
+            block_table=weakref.ref(bt_root),
+            slot_mapping=weakref.ref(slots_root),
+            key=_key(builder, cam),
+            runner_table=bt_root.dim() == 2,
+            max_slots=(_end(slots) - slots.data_ptr()) // 8,
+            max_rows=(_end(bt) - bt.data_ptr()) // (4 * max(bt.stride(0), 1)),
         )
+
+    def alive(self) -> bool:
+        return (
+            self.builder() is not None
+            and self.block_table() is not None
+            and self.slot_mapping() is not None
+        )
+
+
+def _key(builder: Any, cam: CommonAttentionMetadata) -> tuple:
+    bt = cam.block_table_tensor
+    return (id(builder), bt.data_ptr(), bt.stride(0), cam.slot_mapping.data_ptr())
+
+
+def _shape(b: Any) -> tuple:
+    return (
+        b.window_size,
+        b.block_size,
+        b.prefill_index_width,
+        b.decode_threshold,
+        b.max_image_tokens,
+        b.device,
+        tuple(b.decode_swa_indices.shape),
+        tuple(b.prefill_swa_indices.shape),
+        b.decode_swa_lens.shape[0],
+        b.prefill_swa_lens.shape[0],
+        b.is_valid_token.shape[0],
+    )
 
 
 def _uniform(builders: list[Any]) -> bool:
     """Whether one launch serves every builder: one shape, no image spans."""
-
-    def shape(b) -> tuple:
-        return (
-            b.window_size,
-            b.block_size,
-            b.prefill_index_width,
-            b.decode_threshold,
-            b.max_image_tokens,
-            b.device,
-            tuple(b.decode_swa_indices.shape),
-            tuple(b.prefill_swa_indices.shape),
-            b.decode_swa_lens.shape[0],
-            b.prefill_swa_lens.shape[0],
-            b.is_valid_token.shape[0],
-        )
-
-    first = shape(builders[0])
+    first = _shape(builders[0])
     return (
         first[4] == 0
         and first[2] == first[0]
-        and all(shape(b) == first for b in builders[1:])
+        and all(_shape(b) == first for b in builders[1:])
         and all(
             b.decode_swa_indices.is_contiguous()
             and b.prefill_swa_indices.is_contiguous()
@@ -102,28 +145,27 @@ def _uniform(builders: list[Any]) -> bool:
 
 
 class _Family:
-    """Builders that build together, with their learned inputs and the
-    device tables of one launch."""
+    """The members of a call's builds, with the device tables of one launch.
+    Holds no builder and no input buffer."""
 
-    def __init__(self, members: list[_Member]) -> None:
+    def __init__(self, members: list[_Member], builders: list[Any]) -> None:
         self.members = members
-        self.keys = [m.key() for m in members]
-        self.position = {id(m.builder): i for i, m in enumerate(members)}
-        builders = [m.builder for m in members]
-        device = builders[0].device
-        # Rows readable from each learned input: the batch must fit them all.
-        self.max_slots = min(
-            (_end(m.slot_mapping) - m.slot_mapping.data_ptr()) // 8 for m in members
-        )
-        self.max_rows = min(
-            (_end(m.block_table) - m.block_table.data_ptr())
-            // (4 * max(m.block_table.stride(0), 1))
-            for m in members
-        )
+        self.keys = {m.key[0]: m.key for m in members}
+        self.max_slots = min(m.max_slots for m in members)
+        self.max_rows = min(m.max_rows for m in members)
+        first = builders[0]
+        device = first.device
+        self.window_size = first.window_size
+        self.block_size = first.block_size
+        self.decode_threshold = first.decode_threshold
+        self.decode_width = first.decode_swa_indices.shape[-1]
+        self.prefill_width = first.prefill_index_width
+        self.lens_capacity = first.decode_swa_lens.shape[0]
+        self.no_replay_start = first.no_replay_start
         values = [
-            [m.slot_mapping.data_ptr() for m in members],
-            [m.block_table.data_ptr() for m in members],
-            [m.block_table.stride(0) for m in members],
+            [m.key[3] for m in members],
+            [m.key[1] for m in members],
+            [m.key[2] for m in members],
             *([getattr(b, row).data_ptr() for b in builders] for row in OUT_ROWS),
         ]
         host = torch.tensor(values, dtype=torch.int64)
@@ -136,10 +178,22 @@ class _Family:
         self.block_table_ptrs = tables[1]
         self.block_table_strides = tables[2]
         self.out_ptrs = tables[3:]
-        first = builders[0]
         self.gather_lens = torch.zeros(
             first.no_replay_start.shape[0], dtype=torch.int32, device=device
         )
+
+    def alive(self) -> bool:
+        return all(m.alive() for m in self.members)
+
+
+@dataclass
+class _Learned:
+    """What a call starting with ``first`` taught: its builds' keys and the
+    family of its members (None when no launch serves them)."""
+
+    first: weakref.ref
+    keys: list[tuple]
+    family: _Family | None
 
 
 @dataclass
@@ -150,24 +204,24 @@ class _Step:
     common: tuple
     observed: list[_Member] = field(default_factory=list)
     family: _Family | None = None
-    # Of the launch: (split, token_to_req_indices, replay_start, num_slots).
+    # Of the launch: (split, scalars, replay key).
     launch: tuple | None = None
 
 
 @dataclass
 class _State:
     step: _Step | None = None
-    # Learned families by their first builder.
-    families: dict[int, _Family | None] = field(default_factory=dict)
+    # Learned calls by the id of their first builder.
+    learned: dict[int, _Learned] = field(default_factory=dict)
 
 
 _STATE = _State()
 
 
 def reset() -> None:
-    """Forget every learned family (tests)."""
+    """Forget every learned call."""
     _STATE.step = None
-    _STATE.families.clear()
+    _STATE.learned.clear()
 
 
 def _common(cam: CommonAttentionMetadata) -> tuple:
@@ -194,23 +248,34 @@ def _scalars(cam: CommonAttentionMetadata) -> tuple:
 
 
 def _finish(step: _Step) -> None:
-    """Learn the family of a finished call, keeping its tables if unchanged."""
+    """Learn a finished call (keeping its tables if unchanged) and forget
+    calls whose first builder is gone."""
+    for first_id in [k for k, v in _STATE.learned.items() if v.first() is None]:
+        del _STATE.learned[first_id]
     if not step.observed:
         return
-    first = id(step.observed[0].builder)
-    old = _STATE.families.get(first)
-    keys = [m.key() for m in step.observed]
-    if old is not None and old.keys == keys:
+    first = step.observed[0]
+    keys = [m.key for m in step.observed]
+    old = _STATE.learned.get(first.key[0])
+    if (
+        old is not None
+        and old.first() is first.builder()
+        and old.keys == keys
+        and (old.family is None or old.family.alive())
+    ):
         return
-    builders = [m.builder for m in step.observed]
+    # Inputs freed since the call (a per-step copy) cannot be launched on.
+    members = [m for m in step.observed if m.runner_table and m.alive()]
+    builders = [m.builder() for m in members]
     family = None
     if (
-        len(builders) > 1
+        len(members) > 1
+        and all(b is not None for b in builders)
         and len({id(b) for b in builders}) == len(builders)
         and _uniform(builders)
     ):
-        family = _Family(step.observed)
-    _STATE.families[first] = family
+        family = _Family(members, builders)
+    _STATE.learned[first.key[0]] = _Learned(first.builder, keys, family)
 
 
 def _launch(
@@ -219,7 +284,7 @@ def _launch(
     cam: CommonAttentionMetadata,
     replay_start: torch.Tensor | None,
 ) -> tuple | None:
-    split = split_decodes_and_prefills(cam, decode_threshold=builder.decode_threshold)
+    split = split_decodes_and_prefills(cam, decode_threshold=family.decode_threshold)
     num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split
     num_slots = cam.slot_mapping.shape[0]
     if (
@@ -233,7 +298,7 @@ def _launch(
     ):
         return None
     token_to_req = cam.token_to_req_indices(builder.token_to_req_indices)
-    rs = builder.no_replay_start if replay_start is None else replay_start
+    rs = family.no_replay_start if replay_start is None else replay_start
     swa_meta_batch(
         family.slot_ptrs,
         family.block_table_ptrs,
@@ -249,11 +314,11 @@ def _launch(
         num_prefill_tokens=num_prefill_tokens,
         num_decodes=num_decodes,
         num_prefills=num_prefills,
-        lens_capacity=builder.decode_swa_lens.shape[0],
-        window_size=builder.window_size,
-        decode_width=builder.decode_swa_indices.shape[-1],
-        prefill_width=builder.prefill_index_width,
-        block_size=builder.block_size,
+        lens_capacity=family.lens_capacity,
+        window_size=family.window_size,
+        decode_width=family.decode_width,
+        prefill_width=family.prefill_width,
+        block_size=family.block_size,
     )
     return split, _scalars(cam), _replay_key(replay_start)
 
@@ -351,25 +416,25 @@ def build(
             _finish(step)
         step = _Step(common)
         _STATE.step = step
-        family = _STATE.families.get(id(builder))
+        learned = _STATE.learned.get(id(builder))
         if (
-            family is not None
-            and family.keys[0] == _Member(builder, cam.block_table_tensor, cam.slot_mapping).key()
+            learned is not None
+            and learned.first() is builder
+            and learned.family is not None
+            # Every member and input alive: no address of the tables is stale.
+            and learned.family.alive()
             and cam.causal is True
         ):
-            step.launch = _launch(family, builder, cam, replay_start)
+            step.launch = _launch(learned.family, builder, cam, replay_start)
             if step.launch is not None:
-                step.family = family
-    member = _Member(builder, cam.block_table_tensor, cam.slot_mapping)
-    position = len(step.observed)
-    step.observed.append(member)
+                step.family = learned.family
+    step.observed.append(_Member.of(builder, cam))
 
     family = step.family
     if (
         family is not None
         and step.launch is not None
-        and position < len(family.keys)
-        and family.keys[position] == member.key()
+        and family.keys.get(id(builder)) == _key(builder, cam)
         and cam.causal is True
     ):
         split, scalars, replay_key = step.launch

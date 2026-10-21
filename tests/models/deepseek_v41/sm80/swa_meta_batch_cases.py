@@ -10,16 +10,20 @@ ids) and one other group after them, built by the runner's
 block tables and the stacked slot mappings held in persistent buffers as
 ``BlockTables`` holds them. Every scenario runs per group (switch off), then
 twice with the switch on (the first call of the run learns the groups),
-each on builder buffers filled with the same poison first. :func:`run_all`
-returns, per scenario and run, the groups whose metadata or buffers differ
-from the per-group run, and the launches; :func:`check` asserts on them.
+each on builder buffers filled with the same poison first. The same runs
+with groups whose block tables are kernel-block tables (16-token kernel
+blocks: ``AttentionGroup`` fills them in the group's own build), and a run
+that discards a learned layout and checks that nothing keeps it alive.
+:func:`run_all` returns what :func:`check` asserts on.
 
     TRITON_INTERPRET=1 python -m tests.models.deepseek_v41.sm80.swa_meta_batch_cases
 """
 
 import dataclasses
+import gc
 import json
 import os
+import weakref
 from collections import Counter
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -30,6 +34,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 NUM_SWA = 43
 WINDOW = 128
 BLOCK = 32
+KERNEL_BLOCK = 16
 SPEC_K = 5
 MAX_TOKENS = 256
 MAX_SEQS = 8
@@ -54,6 +59,9 @@ SCENARIOS = {
     "noncausal_draft": ([0], [6], 0, None, "noncausal"),
 }
 CHANGED_GROUP = 5
+# Layouts with kernel-block groups: every window group, or one.
+KERNEL_LAYOUTS = {"all_kernel_blocks": tuple(range(NUM_SWA)), "one_kernel_block": (7,)}
+KERNEL_SCENARIOS = ("c1_verify_6", "c8_32")
 SWA = "_compute_swa_indices_and_lens_kernel"
 PREFILL = "kernel"  # ComputePrefillMetadataKernel.kernel
 BATCH = "_swa_meta_batch_kernel"
@@ -99,7 +107,10 @@ class _OtherBuilder:
         return "other"
 
 
-def layout(device: torch.device):
+def layout(device: torch.device, kernel_block_groups=()):
+    """The groups, as ``AttentionGroup.create_metadata_builders`` makes them
+    (the groups in ``kernel_block_groups`` with 16-token kernel blocks), and
+    the runner's persistent inputs."""
     from vllm.models.deepseek_v41.nvidia.sm80_attention import (
         Sm80SWABackend,
         Sm80SWAMetadataBuilder,
@@ -120,11 +131,22 @@ def layout(device: torch.device):
             model_version="deepseek_v4",
         )
         name = f"layers.{i}.swa_cache"
-        builder = Sm80SWAMetadataBuilder(spec, [name], config, device)
+        group = AttentionGroup(Sm80SWABackend, [name], spec, i)
+        builder_spec = spec
+        if i in kernel_block_groups:
+            per_block = BLOCK // KERNEL_BLOCK
+            builder_spec = spec.copy_with_new_block_size(KERNEL_BLOCK)
+            group.kernel_block_size = KERNEL_BLOCK
+            group.kernel_block_table = torch.zeros(
+                1, MAX_SEQS, MAX_BLOCKS * per_block, dtype=torch.int32, device=device
+            )
+            group.kernel_block_offsets = torch.arange(
+                per_block, dtype=torch.int32, device=device
+            )
+        builder = Sm80SWAMetadataBuilder(builder_spec, [name], config, device)
+        group.metadata_builders = [builder]
         builders.append(builder)
-        groups.append(
-            [AttentionGroup(Sm80SWABackend, [name], spec, i, metadata_builders=[builder])]
-        )
+        groups.append([group])
     other = AttentionGroup(
         Sm80SWABackend, ["layers.0.attn"], None, NUM_SWA,
         metadata_builders=[_OtherBuilder()],
@@ -220,7 +242,10 @@ def build(groups, kv_cache_config, call: dict):
     )
 
 
-def poison(builders):
+def poison(builders, groups):
+    """The same stale bytes in every buffer a build writes, before each run
+    (kernel-block tables included: a launch that read one before its group's
+    build refreshed it reads these)."""
     for b in builders:
         for name in BUFFERS:
             buf = getattr(b, name)
@@ -228,6 +253,9 @@ def poison(builders):
         b.token_to_req_indices.fill_(-7)
         if b.decode_swa_indices_noncausal is not None:
             b.decode_swa_indices_noncausal.fill_(-7)
+    for (group,) in groups[:NUM_SWA]:
+        if group.kernel_block_table is not None:
+            group.kernel_block_table.fill_(-7)
 
 
 def _bytes(t: torch.Tensor) -> str:
@@ -329,22 +357,35 @@ def _differ(run, ref) -> tuple[list[int], list[str]]:
     return groups, names
 
 
-def run_all(device: torch.device) -> dict:
+@contextmanager
+def _switch():
     from vllm.models.deepseek_v41.nvidia import sm80_swa_meta_batch
 
+    saved = os.environ.get(SWITCH)
+    sm80_swa_meta_batch.reset()
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(SWITCH, None)
+        else:
+            os.environ[SWITCH] = saved
+        sm80_swa_meta_batch.reset()
+
+
+def _scenarios(device: torch.device, names, kernel_block_groups=()) -> dict:
+    """Each scenario per group, then twice batched, on one layout."""
     groups, builders, kv_cache_config, sources, block_tables, slot_mappings = layout(
-        device
+        device, kernel_block_groups
     )
     result = {}
-    sm80_swa_meta_batch.reset()
-    saved = os.environ.get(SWITCH)
-    try:
-        for scenario in SCENARIOS:
+    with _switch():
+        for scenario in names:
             inp = step_inputs(scenario, sources, block_tables, slot_mappings)
             runs = {}
             for arm in ("off", "learn", "on"):
                 os.environ[SWITCH] = "0" if arm == "off" else "1"
-                poison(builders)
+                poison(builders, groups)
                 call = call_inputs(inp, block_tables, slot_mappings)
                 with launches(device) as counts:
                     md = build(groups, kv_cache_config, call)
@@ -352,29 +393,57 @@ def run_all(device: torch.device) -> dict:
             ref = runs["off"][0]
             result[scenario] = {}
             for arm, (snap, counts, other) in runs.items():
-                differ, names = _differ(snap, ref)
+                differ, fields = _differ(snap, ref)
                 result[scenario][arm] = {
                     "differ": differ,
-                    "differ_fields": names,
+                    "differ_fields": fields,
                     "launches": counts,
                     "other": other,
                 }
             # Each window group's metadata is its own: its indices differ.
             decode = {ref[i][0]["decode_swa_indices"][2] for i in range(NUM_SWA)}
             result[scenario]["distinct_decode_indices"] = len(decode)
-    finally:
-        if saved is None:
-            os.environ.pop(SWITCH, None)
-        else:
-            os.environ[SWITCH] = saved
-        sm80_swa_meta_batch.reset()
     return result
 
 
-def check(result: dict) -> None:
-    """The batched metadata is the per-group build's, in one launch."""
-    assert list(result) == list(SCENARIOS)
-    for scenario, case in result.items():
+def _released(device: torch.device) -> dict:
+    """Learn a layout and launch for it, then discard it as the runner
+    discards builders and buffers (profiling, decoder-replay copies, a KV
+    cache reinitialisation): nothing may keep them alive."""
+    groups, builders, kv_cache_config, sources, block_tables, slot_mappings = layout(
+        device
+    )
+    refs = [weakref.ref(b) for b in builders]
+    refs += [weakref.ref(t) for t in block_tables] + [weakref.ref(slot_mappings)]
+    with _switch():
+        os.environ[SWITCH] = "1"
+        inp = step_inputs("c1_verify_6", sources, block_tables, slot_mappings)
+        total = Counter()
+        for _ in range(2):
+            with launches(device) as counts:
+                md = build(
+                    groups, kv_cache_config, call_inputs(inp, block_tables, slot_mappings)
+                )
+            total.update(counts)
+        del md, groups, builders, kv_cache_config, sources, block_tables, slot_mappings
+        gc.collect()
+        alive = sum(r() is not None for r in refs)
+    return {"launched": total.get(BATCH, 0), "alive": alive, "checked": len(refs)}
+
+
+def run_all(device: torch.device) -> dict:
+    return {
+        "scenarios": _scenarios(device, list(SCENARIOS)),
+        "kernel_blocks": {
+            name: _scenarios(device, KERNEL_SCENARIOS, groups)
+            for name, groups in KERNEL_LAYOUTS.items()
+        },
+        "released": _released(device),
+    }
+
+
+def _check_identical(scenarios: dict) -> None:
+    for scenario, case in scenarios.items():
         # Why one result cannot serve every layer: each group's indices are
         # slots of its own blocks.
         assert case["distinct_decode_indices"] == NUM_SWA, scenario
@@ -382,9 +451,21 @@ def check(result: dict) -> None:
             assert case[arm]["differ"] == [], (scenario, arm, case[arm]["differ_fields"])
             assert case[arm]["other"] == "other"
         off, on = case["off"]["launches"], case["on"]["launches"]
-        # The token-to-request map stays one launch per step either way.
-        assert on.get(T2R) == off.get(T2R) == 1, scenario
+        # The token-to-request map launches as often as per group (once a
+        # step; kernel-block groups build it again on their own copy of the
+        # common metadata).
+        assert on.get(T2R) == off.get(T2R), scenario
         assert off.get(BATCH, 0) == 0, scenario
+
+
+def check(result: dict) -> None:
+    """The batched metadata is the per-group build's, in one launch."""
+    scenarios = result["scenarios"]
+    assert list(scenarios) == list(SCENARIOS)
+    _check_identical(scenarios)
+    for scenario, case in scenarios.items():
+        off, on = case["off"]["launches"], case["on"]["launches"]
+        assert on.get(T2R) == 1, scenario
         if scenario == "noncausal_draft":
             assert on.get(BATCH, 0) == 0 and on.get(GE) == NUM_SWA
             continue
@@ -402,8 +483,24 @@ def check(result: dict) -> None:
         assert on.get(SWA, 0) == fallback, scenario
         assert on.get(PREFILL, 0) == 0, scenario
     # The first call with the switch on learns the groups: per group.
-    learn = result[next(iter(SCENARIOS))]["learn"]["launches"]
+    learn = scenarios[next(iter(SCENARIOS))]["learn"]["launches"]
     assert learn.get(BATCH, 0) == 0 and learn.get(SWA) == NUM_SWA
+
+    # Kernel-block tables are filled in their group's own build: such a group
+    # builds per group; the others still take the batch.
+    kernel = result["kernel_blocks"]
+    for name, mapped in KERNEL_LAYOUTS.items():
+        _check_identical(kernel[name])
+        for scenario, case in kernel[name].items():
+            on = case["on"]["launches"]
+            batched = NUM_SWA - len(mapped)
+            assert on.get(BATCH, 0) == (1 if batched > 1 else 0), (name, scenario)
+            assert on.get(GE, 0) == len(mapped), (name, scenario)
+            assert on.get(SWA, 0) == len(mapped), (name, scenario)
+
+    released = result["released"]
+    assert released["launched"] == 1
+    assert released["alive"] == 0, released
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 327 |
 | `vllm/models/deepseek_v41/nvidia/sm80_pipeline_capture.py` | 184 |
 | `vllm/models/deepseek_v41/nvidia/sm80_split_reduce.py` | 242 |
-| `vllm/models/deepseek_v41/nvidia/sm80_swa_meta_batch.py` | 378 |
+| `vllm/models/deepseek_v41/nvidia/sm80_swa_meta_batch.py` | 443 |
 | `vllm/models/glm5next/nvidia/model_state.py` | 113 |
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
 | `vllm/models/glm5next/nvidia/sm80_mla.py` | 123 |
@@ -63,7 +63,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **18 files** | **6,763** |
+| **18 files** | **6,828** |
 
 ### `vllm/sm80/kernels/`
 
@@ -374,7 +374,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/hybrid_fixture.py` | 189 |
 | `tests/models/deepseek_v41/sm80/hybrid_linear_cases.py` | 224 |
 | `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,508 |
-| `tests/models/deepseek_v41/sm80/swa_meta_batch_cases.py` | 411 |
+| `tests/models/deepseek_v41/sm80/swa_meta_batch_cases.py` | 508 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
 | `tests/models/deepseek_v41/sm80/test_boot_warmup.py` | 337 |
@@ -414,7 +414,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_route_fused.py` | 297 |
 | `tests/models/deepseek_v41/sm80/test_sm80_route_fused_gpu.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_sm80_split_reduce.py` | 453 |
-| `tests/models/deepseek_v41/sm80/test_sm80_swa_meta_batch.py` | 65 |
+| `tests/models/deepseek_v41/sm80/test_sm80_swa_meta_batch.py` | 68 |
 | `tests/models/deepseek_v41/sm80/test_sm80_swa_meta_batch_gpu.py` | 19 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
 | `tests/models/deepseek_v41/sm80/test_wo_a_strided.py` | 261 |
@@ -450,7 +450,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/plugins_tests/conftest.py` | 17 |
 | `tests/sm80/round_once_allreduce_bits.py` | 207 |
 | `tests/sm80/round_once_unchecked.py` | 46 |
-| `tests/sm80/seams.yaml` | 1,505 |
+| `tests/sm80/seams.yaml` | 1,519 |
 | `tests/sm80/test_ce_ring_all_reduce.py` | 289 |
 | `tests/sm80/test_dev_ab.py` | 595 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
@@ -513,7 +513,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **231 files** | **102,540** |
+| **231 files** | **102,654** |
 
 #### `tools/`
 
@@ -816,11 +816,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 179 |
-| Fork-added product lines | 58,032 |
+| Fork-added product lines | 58,097 |
 | Patched upstream files | 102 |
 | Patched upstream lines | +4,886 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 61,656 |
+| Product lines added (new files and patches) | 61,721 |
 | Fork environment variables (flags) | 134 |
 | Unreferenced fork definitions | 5 (42 lines) |

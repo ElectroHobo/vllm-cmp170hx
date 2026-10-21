@@ -1503,3 +1503,17 @@ seams:
   why: the recovering V4.1 parser returns None here for a recovered call, which arrives whole at commit, so its arguments go out once from _flush_arg_converter at its end; that flush must send the whole final JSON when nothing was streamed
   sha256: 29054a0967013171745ba341a885f28c21762ac1466e0671d14dca000276647b
   signature: '(self, idx: ''int'', raw_delta: ''str'') -> ''str | None'''
+
+- id: dsv41-swa-kernel-block-table
+  kind: method
+  target: vllm.v1.worker.utils:AttentionGroup.map_to_kernel_block_table
+  why: a group's kernel-block table is a view of its 3-D kernel_block_table, filled in the group's own build; sm80_swa_meta_batch never batches a group whose block table is not a view of a 2-D runner input table
+  sha256: 1718bff4b602351df9108422a01572b2ebaa609959f0038b04a72f527d56d002
+  signature: '(self, block_table: torch.Tensor, ubatch_idx: int = 0) -> torch.Tensor'
+
+- id: dsv41-swa-kernel-block-builders
+  kind: method
+  target: vllm.v1.worker.utils:AttentionGroup.create_metadata_builders
+  why: kernel_block_table is allocated 3-D (one per microbatch builder), which is how sm80_swa_meta_batch tells it from the runner's 2-D input block tables
+  sha256: 90a29ab48fde025f624d5bbc41ffb5ec5327088ebe512156c055086b2fcea7a3
+  signature: '(self, vllm_config, device, kernel_block_size: int | None = None, num_metadata_builders: int = 1)'
