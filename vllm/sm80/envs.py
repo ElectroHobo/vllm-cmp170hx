@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
+    VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
     VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
     VLLM_DEEPSEEK_V41_SWA_META_BATCH: bool = False
@@ -1033,6 +1034,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS", "48")
+    ),
+    # DeepSeek-V4.1 on sm_80, the attention pipeline's exact index selection:
+    # a call of at most 48 rows as one Triton launch (one program per
+    # 8192-column part of a row, the last part to finish merging the parts'
+    # candidates) in place of fifteen, with the same output bytes. Default
+    # OFF. Read in vllm/models/deepseek_v41/nvidia/ops/sm80_index_topk.py.
+    "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH", "0"))
     ),
     # DeepSeek-V4.1 on sm_80, the DSpark drafter's greedy Markov sampling:
     # each TP rank takes the argmax of its own vocabulary shard of the draft

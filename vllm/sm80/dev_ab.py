@@ -457,6 +457,21 @@ def _pipeline_apply(runner, on: bool) -> None:
         module._sm80_attn_pipeline_enabled = active if on == boot else on and eligible
 
 
+_SELECT_ENV = "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH"
+
+
+def _select_unavailable(runner) -> str | None:
+    if not any(m._sm80_attn_pipeline_eligible for m in _pipeline_layers(runner)):
+        return "no loaded DeepSeek attention pipeline implementation is eligible"
+    return None
+
+
+def _select_apply(runner, on: bool) -> None:
+    # select() reads the switch per call: an arm's graphs capture its launches,
+    # and its eager warmup call compiles the one-launch kernel.
+    _set_env(_SELECT_ENV, on)
+
+
 def _moepf_experts(runner):
     seen = set()
     for module in _model_modules(runner):
@@ -789,6 +804,10 @@ SWITCHES: dict[str, Switch] = {
         Switch(
             "dsv41_attn_pipeline", "VLLM_DEEPSEEK_V41_ATTN_PIPELINE", True, False,
             _pipeline_unavailable, _pipeline_current, _pipeline_apply,
+        ),
+        Switch(
+            "dsv41_select_one_launch", _SELECT_ENV, True, True,
+            _select_unavailable, lambda runner: _env_flag(_SELECT_ENV), _select_apply,
         ),
         Switch(
             "dsv41_fused_attn_decode", "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", True, False,

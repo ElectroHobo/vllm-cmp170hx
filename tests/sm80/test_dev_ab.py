@@ -180,6 +180,7 @@ def test_allowlist():
         "dsv41_swa_meta_batch",
         "dsv41_fused_attn_decode",
         "dsv41_attn_pipeline",
+        "dsv41_select_one_launch",
         "dsv41_moe_prefill_tc",
         "qsa_topk_canonical",
         "marlin_decode_v2",
