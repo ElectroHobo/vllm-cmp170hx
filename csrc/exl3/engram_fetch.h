@@ -10,7 +10,11 @@
 // scale_bytes] uint8 table; table is the resident [owner rows, row_bytes]
 // value table, or empty to read values from fd (row r at base + r *
 // row_bytes) through a set-associative LRU host row cache of at most
-// cache_bytes. A fetch of ids[0:count) (global row ids) fills
+// cache_bytes. With fd opened O_DIRECT the rows are read directly, each
+// through its aligned 4 KiB span (no page-cache probe, no pages left in the
+// page cache), and the constructor refuses when a direct read of the first
+// owned row fails; otherwise reads are buffered after a non-blocking
+// page-cache probe. A fetch of ids[0:count) (global row ids) fills
 // values[0:count) and scales_out[0:count): owned rows with their bytes,
 // other ids with zero values and the scale byte 127; a row that still
 // fails after `retries` read retries gets an E4M3 NaN first value and

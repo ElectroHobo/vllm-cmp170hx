@@ -18,6 +18,10 @@ shards them, i.e. one contiguous row range ``[vocab_start, vocab_end)``:
   cache, pre-faulted at startup and optionally filled there by one
   sequential pass over the file (``VLLM_ENGRAM_ROW_CACHE_PRELOAD``), or are
   copied into pinned host memory (placement ``ram``, the comparison path);
+- with ``VLLM_ENGRAM_DIRECT_READ`` the rows the cache misses are read with
+  O_DIRECT through aligned 4 KiB spans, so they leave no pages in the page
+  cache; a file system that refuses O_DIRECT is refused at startup, never
+  read buffered instead;
 - a lookup stages the requested rows' values and scales in pinned host
   memory, copies them to the device and dequantizes them there exactly as
   the reference (``ops/sm80_engram_dequant.py``).
@@ -292,6 +296,23 @@ def _open_preload(path: str) -> tuple[int, bool]:
     return os.open(path, os.O_RDONLY | os.O_CLOEXEC), False
 
 
+def _open_direct(path: str) -> int:
+    """A descriptor for the direct reads of missed rows (the native fetch
+    reads aligned spans through it). A file system that refuses O_DIRECT is
+    refused: these reads never fall back to the page cache."""
+    try:
+        return os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECT)
+    except OSError as error:
+        if error.errno not in (errno.EINVAL, errno.EOPNOTSUPP):
+            raise
+        raise ValueError(
+            f"VLLM_ENGRAM_DIRECT_READ=1: the file system of {path} refuses "
+            f"O_DIRECT ({os.strerror(error.errno)}); move the Engram tables to "
+            "one that supports it or unset VLLM_ENGRAM_DIRECT_READ for "
+            "buffered reads"
+        ) from error
+
+
 def _read_at_least(fd: int, view: memoryview, offset: int, need: int) -> None:
     """Read from ``offset`` into ``view`` until at least ``need`` bytes are
     in; a direct read ends short only at the end of the file."""
@@ -311,7 +332,9 @@ class EngramRowStore:
     cache (``ssd``) or from a resident copy (``ram``). A fetch fills the
     staging for global row ids: unowned ids get zero values and the scale
     byte of 1.0, which dequantize to +0 as the reference's mask does; rows
-    that cannot be read are poisoned.
+    that cannot be read are poisoned. With ``direct_read`` (``ssd`` only)
+    the native fetch reads missed rows with O_DIRECT; startup refuses a
+    file system where that fails.
     """
 
     def __init__(
@@ -324,6 +347,7 @@ class EngramRowStore:
         cache_bytes: int,
         capacity: int,
         pin: bool = False,
+        direct_read: bool = False,
     ):
         from vllm.models.qwen4_exp.nvidia.exl3_ple import (
             _read_error,
@@ -334,6 +358,8 @@ class EngramRowStore:
 
         if placement not in ("ssd", "ram"):
             raise ValueError(f"Engram placement must be ssd or ram, not {placement!r}")
+        if direct_read and placement != "ssd":
+            raise ValueError("Engram direct reads apply to placement ssd only")
         if not 0 <= owner_lo <= owner_hi <= files.rows:
             raise ValueError("Engram owner range exceeds the table rows")
         if files.dim % ENGRAM_QUANT_BLOCK:
@@ -343,6 +369,7 @@ class EngramRowStore:
         self.placement = placement
         self.path = files.values_path
         self.base = files.values_offset
+        self.direct_read = direct_read
         self.owner_lo, self.owner_hi = owner_lo, owner_hi
         self.row_bytes = files.dim
         self.scale_bytes = files.dim // ENGRAM_QUANT_BLOCK
@@ -383,25 +410,32 @@ class EngramRowStore:
             self.scales_out = _host_empty(
                 (capacity, self.scale_bytes), torch.uint8, pin
             )
-            self.fetcher = engram_host_fetch(
-                self.fd,
-                self.base,
-                self.row_bytes,
-                owner_lo,
-                owner_hi,
-                self.scales,
-                self.table
-                if self.table is not None
-                else torch.empty(0, dtype=torch.uint8, device="cpu"),
-                self.ids,
-                self.values,
-                self.scales_out,
-                cache_bytes if placement == "ssd" else 0,
-                CACHE_WAYS,
-                READ_RETRIES,
-                READ_THREADS,
-                HOST_FETCH_SLOTS,
-            )
+            # The fetch keeps its own duplicate; an O_DIRECT descriptor
+            # makes its reads direct.
+            fetch_fd = _open_direct(self.path) if direct_read else self.fd
+            try:
+                self.fetcher = engram_host_fetch(
+                    fetch_fd,
+                    self.base,
+                    self.row_bytes,
+                    owner_lo,
+                    owner_hi,
+                    self.scales,
+                    self.table
+                    if self.table is not None
+                    else torch.empty(0, dtype=torch.uint8, device="cpu"),
+                    self.ids,
+                    self.values,
+                    self.scales_out,
+                    cache_bytes if placement == "ssd" else 0,
+                    CACHE_WAYS,
+                    READ_RETRIES,
+                    READ_THREADS,
+                    HOST_FETCH_SLOTS,
+                )
+            finally:
+                if fetch_fd != self.fd:
+                    os.close(fetch_fd)
         except BaseException:
             self.close()
             raise
@@ -646,6 +680,7 @@ class Sm80EngramEmbedding(nn.Module):
         max_tokens: int,
         placement: str,
         cache_bytes: int,
+        direct_read: bool = False,
         device: torch.device | str = "cpu",
         block_size: int = ENGRAM_QUANT_BLOCK,
         label: str = "engram",
@@ -691,6 +726,7 @@ class Sm80EngramEmbedding(nn.Module):
             cache_bytes=cache_bytes,
             capacity=self.capacity_rows,
             pin=cuda,
+            direct_read=direct_read,
         )
         # Tokens of the last forward whose rows failed, on any rank.
         self._failed_tokens = torch.zeros(
@@ -1019,6 +1055,7 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
         placement=placement,
         cache_bytes=int(cache_gib * GiB) // len(layout.layer_ids),
+        direct_read=placement == "ssd" and envs.VLLM_ENGRAM_DIRECT_READ,
         device=torch.device("cuda", torch.cuda.current_device()),
         label=f"layer {layer_id}",
         log_every=log_every,
@@ -1038,7 +1075,8 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
     else:
         values = (
             f"row cache {table.store.cache_bytes / GiB:.2f} GiB, pre-faulted "
-            f"in {prefault_ns / 1e9:.2f} s{preloaded}"
+            f"in {prefault_ns / 1e9:.2f} s{preloaded}, missed rows read "
+            f"{'direct' if table.store.direct_read else 'buffered'}"
         )
     logger.info(
         "sm_80 Engram layer %d (%s): placement=%s rows [%d, %d) heads [%d, %d); "

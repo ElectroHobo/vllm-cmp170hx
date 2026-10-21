@@ -164,7 +164,7 @@ struct FetchState {
         max_threads(max_threads),
         slots(slots),
         cache(this->table.numel() ? 0 : cache_bytes, row_bytes, ways),
-        scratch(capacity, max_threads),
+        scratch(capacity, max_threads, direct_span(fd, row_bytes)),
         jobs(new FetchJob[slots]),
         positions(capacity),
         keys(capacity),
@@ -179,13 +179,22 @@ struct FetchState {
         rows(capacity * row_bytes),
         missed(capacity * row_bytes) {
     region = Table{fd, base, row_bytes, owner_lo, owner_hi,
-                   &head_offset, &head_end, 1, retries};
+                   &head_offset, &head_end, 1, retries, scratch.span_bytes > 0};
     head_offset = owner_lo;
     head_end = owner_hi;
     for (int64_t i = 0; i < slots; ++i) jobs[i].state = this;
     for (auto& counter : counters) counter.store(0);
   }
   ~FetchState() { ::close(fd); }
+
+  // The span of one row's direct read when fd was opened with O_DIRECT,
+  // else 0 (buffered reads).
+  static int64_t direct_span(int fd, int64_t row_bytes) {
+    const int flags = fcntl(fd, F_GETFL);
+    return flags >= 0 && (flags & O_DIRECT)
+               ? exl3_rows::direct_span_bytes(row_bytes)
+               : 0;
+  }
 
   // The fetch of ids[0:count); returns (failed rows, first failure).
   int64_t fetch(int64_t count, const int64_t* id, uint8_t* out_values,
@@ -544,6 +553,19 @@ class EngramHostFetch : public torch::CustomClassHolder {
     } catch (...) {
       ::close(own);
       throw;
+    }
+    FetchState& s = *state_;
+    if (s.region.direct && owner_hi > owner_lo) {
+      // A file system can accept O_DIRECT at open and refuse the reads:
+      // refuse here instead of failing every request's rows.
+      std::vector<uint8_t> row(row_bytes);
+      Table probe = s.region;
+      probe.retries = 0;
+      Failure failure{0, 0, 0};
+      TORCH_CHECK(
+          read_row(probe, row.data(), owner_lo, s.scratch.span(0), &failure),
+          "Direct reads of the Engram table fail at byte ", failure.offset,
+          ": ", failure.error ? std::strerror(failure.error) : "end of file");
     }
   }
 

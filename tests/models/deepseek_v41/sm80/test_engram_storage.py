@@ -6,6 +6,7 @@ telemetry, dequantization against the reference formula, the real shards
 (VLLM_ENGRAM_TEST_TABLE_DIR) and CUDA graph replay with changing ids (GPU
 only)."""
 
+import errno
 import json
 import os
 import struct
@@ -604,6 +605,227 @@ def test_page_cache_classification(tables):
         assert counts["read_ns"] > 0 and counts["fetch_ns"] >= counts["read_ns"]
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Direct (O_DIRECT) reads of missed rows
+# ---------------------------------------------------------------------------
+
+ALIGN = 4096
+# Values start 128 bytes before a 4 KiB boundary, so row 0 and every 16th
+# row after it straddle two blocks; they are the file's last bytes and end
+# off a block boundary, so the last rows' spans run past the end of the file.
+DIRECT_ROWS = 300
+DIRECT_VALUES_PHASE = ALIGN - 128
+
+
+def _direct_table(directory, layer=5):
+    """A shard with the scales first and the values last, the values at
+    DIRECT_VALUES_PHASE within a block; every row written."""
+    rows = DIRECT_ROWS
+    scales_end = rows * SCALE_DIM
+    values_end = scales_end + rows * DIM
+    header = {
+        f"layers.{layer}.engram.embed.scale": {
+            "dtype": "F8_E8M0",
+            "shape": [rows, SCALE_DIM],
+            "data_offsets": [0, scales_end],
+        },
+        f"layers.{layer}.engram.embed.weight": {
+            "dtype": "F8_E4M3",
+            "shape": [rows, DIM],
+            "data_offsets": [scales_end, values_end],
+        },
+    }
+    raw = json.dumps(header).encode()
+    raw += b" " * ((DIRECT_VALUES_PHASE - 8 - len(raw) - scales_end) % ALIGN)
+    start = 8 + len(raw)
+    ids = np.arange(rows)
+    path = directory / "direct.safetensors"
+    with open(path, "wb") as file:
+        file.write(struct.pack("<Q", len(raw)))
+        file.write(raw)
+        file.write(_row_bytes(ids, SCALE_DIM, 2).tobytes())
+        file.write(_row_bytes(ids, DIM, 1).tobytes())
+    assert os.path.getsize(path) == start + values_end
+    index = {"metadata": {}, "weight_map": {name: path.name for name in header}}
+    (directory / "model.safetensors.index.json").write_text(json.dumps(index))
+    files = locate_engram_table(directory, layer, rows, DIM)
+    assert files.values_offset % ALIGN == DIRECT_VALUES_PHASE
+    assert os.path.getsize(path) % ALIGN
+    return files
+
+
+def _direct_expected(ids, lo, hi):
+    ids = np.asarray(ids, dtype=np.int64)
+    values = np.zeros((len(ids), DIM), dtype=np.uint8)
+    scales = np.full((len(ids), SCALE_DIM), 127, dtype=np.uint8)
+    owned = (ids >= lo) & (ids < hi)
+    values[owned] = _row_bytes(ids[owned], DIM, 1)
+    scales[owned] = _row_bytes(ids[owned], SCALE_DIM, 2)
+    return values, scales
+
+
+def _straddling_rows(files):
+    offsets = files.values_offset + np.arange(files.rows) * DIM
+    return np.flatnonzero(offsets // ALIGN != (offsets + DIM - 1) // ALIGN)
+
+
+def _direct_store(files, lo, hi, cache_bytes=0, capacity=4096):
+    return EngramRowStore(
+        files,
+        lo,
+        hi,
+        placement="ssd",
+        cache_bytes=cache_bytes,
+        capacity=capacity,
+        direct_read=True,
+    )
+
+
+@pytest.mark.parametrize("cache_bytes", [0, 1 << 16])
+@pytest.mark.parametrize("owner", [(0, DIRECT_ROWS), (5, DIRECT_ROWS - 3)])
+def test_direct_reads_match_buffered_reads(tmp_path, owner, cache_bytes):
+    """Rows straddling a 4 KiB block, the owner range's first and last rows
+    and the file's last rows (spans past the end of the file) come back
+    byte for byte as the buffered reads give them."""
+    files = _direct_table(tmp_path)
+    lo, hi = owner
+    straddling = _straddling_rows(files)
+    assert straddling[0] == 0 and len(straddling) == -(-DIRECT_ROWS // 16)
+    rng = np.random.default_rng(7)
+    ids = np.concatenate(
+        [
+            straddling,
+            [lo, hi - 1, DIRECT_ROWS - 2, DIRECT_ROWS - 1, -1, DIRECT_ROWS],
+            rng.integers(-3, DIRECT_ROWS + 3, 500),
+        ]
+    )
+    buffered = _store(files, lo, hi, cache_bytes=cache_bytes)
+    direct = _direct_store(files, lo, hi, cache_bytes=cache_bytes)
+    try:
+        want = _direct_expected(ids, lo, hi)
+        for _ in range(2):  # cold, then through the cache when there is one
+            got = _fetch(direct, ids)
+            for a, b, c in zip(got, _fetch(buffered, ids), want):
+                np.testing.assert_array_equal(a, c)
+                np.testing.assert_array_equal(a, b)
+        counts = direct.counters()
+        assert counts["rows_failed"] == 0
+        assert counts["page_cache_rows"] == 0
+        assert counts["storage_rows"] == counts["cache_misses"] > 0
+    finally:
+        buffered.close()
+        direct.close()
+
+
+def test_direct_reads_on_every_read_thread(tmp_path):
+    """A fetch large enough for every read thread: each thread reads through
+    its own span."""
+    files = _direct_table(tmp_path)
+    store = _direct_store(files, 0, DIRECT_ROWS)
+    try:
+        ids = np.random.default_rng(11).permutation(DIRECT_ROWS)
+        assert len(ids) >= 4 * sm80_engram.READ_THREADS
+        got = _fetch(store, ids)
+        for a, b in zip(got, _direct_expected(ids, 0, DIRECT_ROWS)):
+            np.testing.assert_array_equal(a, b)
+        assert store.counters()["storage_rows"] == DIRECT_ROWS
+    finally:
+        store.close()
+
+
+def test_direct_reads_leave_the_page_cache_alone(tmp_path):
+    files = _direct_table(tmp_path)
+    fd = os.open(files.values_path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    ids = np.arange(0, DIRECT_ROWS, 7)
+    direct = _direct_store(files, 0, DIRECT_ROWS)
+    try:
+        before, total = direct.page_cache_residency()
+        assert before < total
+        _fetch(direct, ids)
+        assert direct.page_cache_residency()[0] == before
+    finally:
+        direct.close()
+    buffered = _store(files, 0, DIRECT_ROWS, cache_bytes=0)
+    try:
+        _fetch(buffered, ids)
+        assert buffered.page_cache_residency()[0] > before
+    finally:
+        buffered.close()
+
+
+def test_direct_reads_refuse_instead_of_falling_back(tmp_path, monkeypatch):
+    files = _direct_table(tmp_path)
+    with pytest.raises(ValueError, match="placement ssd only"):
+        EngramRowStore(
+            files,
+            0,
+            DIRECT_ROWS,
+            placement="ram",
+            cache_bytes=0,
+            capacity=16,
+            direct_read=True,
+        )
+    # A file whose first owned row lies past its end: the startup read fails.
+    past_end = sm80_engram.EngramTableFiles(
+        values_path=files.values_path,
+        values_offset=os.path.getsize(files.values_path),
+        scales_path=files.scales_path,
+        scales_offset=files.scales_offset,
+        rows=DIRECT_ROWS,
+        dim=DIM,
+    )
+    with pytest.raises(RuntimeError, match="Direct reads of the Engram table fail"):
+        _direct_store(past_end, 0, DIRECT_ROWS)
+    # A file system that refuses O_DIRECT at open.
+    real_open = os.open
+
+    def no_direct(path, flags, *args, **kwargs):
+        if flags & os.O_DIRECT:
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL), path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", no_direct)
+    with pytest.raises(ValueError, match="refuses O_DIRECT"):
+        _direct_store(files, 0, DIRECT_ROWS)
+
+
+def test_direct_read_flag(tmp_path, monkeypatch):
+    from vllm import envs
+
+    monkeypatch.delenv("VLLM_ENGRAM_DIRECT_READ", raising=False)
+    assert envs.VLLM_ENGRAM_DIRECT_READ is False
+    monkeypatch.setenv("VLLM_ENGRAM_DIRECT_READ", "1")
+    assert envs.VLLM_ENGRAM_DIRECT_READ is True
+    files = _direct_table(tmp_path)
+    table = Sm80EngramEmbedding(
+        DIRECT_ROWS,
+        DIM,
+        (DIRECT_ROWS // 4,) * 4,
+        files,
+        tp_rank=2,
+        tp_size=TP,
+        max_tokens=8,
+        placement="ssd",
+        cache_bytes=0,
+        direct_read=True,
+    )
+    try:
+        assert table.store.direct_read
+        ids = np.array([table.vocab_start_idx, table.vocab_end_idx - 1])
+        for a, b in zip(
+            _fetch(table.store, ids),
+            _direct_expected(ids, table.vocab_start_idx, table.vocab_end_idx),
+        ):
+            np.testing.assert_array_equal(a, b)
+    finally:
+        table.close()
 
 
 def test_telemetry_readable_and_logged(tables, monkeypatch):

@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     VLLM_ENGRAM_PLACEMENT: str = "ssd"
     VLLM_ENGRAM_ROW_CACHE_GIB: float = 1.0
     VLLM_ENGRAM_ROW_CACHE_PRELOAD: bool = False
+    VLLM_ENGRAM_DIRECT_READ: bool = False
     VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
@@ -1133,6 +1134,15 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # stored rows. Unused by "ram" and by a zero cache. Off by default.
     "VLLM_ENGRAM_ROW_CACHE_PRELOAD": lambda: bool(
         int(os.getenv("VLLM_ENGRAM_ROW_CACHE_PRELOAD", "0"))
+    ),
+    # Read the rows the sm_80 Engram row cache misses with O_DIRECT through
+    # aligned 4 KiB spans instead of buffered 256 B reads, so the misses
+    # leave no pages in the page cache (about 4 KiB of page cache per missed
+    # row otherwise). A file system that refuses O_DIRECT is refused at
+    # startup; there is no buffered fallback. Unused by "ram". Off by
+    # default.
+    "VLLM_ENGRAM_DIRECT_READ": lambda: bool(
+        int(os.getenv("VLLM_ENGRAM_DIRECT_READ", "0"))
     ),
     # Diagnostic: log the counters of each sm_80 Engram table (rows, cache
     # hits and misses, page-cache and storage bytes, host read and wait
