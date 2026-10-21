@@ -188,7 +188,9 @@ def _rank_main(rank: int, tp: int, init_file: str, result_file: str,
         sa.BLOCK = block
     ta.tensor_model_parallel_all_reduce = all_reduce
     pad = tp * width - vocab
-    assert 0 < pad
+    # The served DeepSeek-V4.1 head has no padding (129280 = 4 x 32320); the
+    # small CPU vocabularies pad, with NaN and +inf in the padding columns.
+    assert 0 <= pad
     calls: list[str] = []
 
     def target(full: torch.Tensor) -> DeepseekV41ForCausalLM:
