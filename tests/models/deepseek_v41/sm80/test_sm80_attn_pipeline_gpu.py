@@ -119,6 +119,60 @@ def test_full_pipeline_rounding_state_and_selection(rows, ratio, role):
             _within_v2(F.Call(getattr(caches, name), getattr(refcache, name), ideal[name], True))
 
 
+def _row_local(weights, matrices):
+    """Projections computed one row at a time, so a row's value does not
+    depend on the row count (served Marlin GEMMs tile by it)."""
+    def per_row(name):
+        return lambda x: torch.cat([torch.nn.functional.linear(x[i:i + 1], matrices[name])
+                                    for i in range(x.shape[0])]) if x.shape[0] else x @ matrices[name].t()
+    return dataclasses.replace(weights, wq_b=per_row('wq_b'), index_wq_b=per_row('index_wq_b'),
+                               wk=per_row('wk'))
+
+
+def _alone(caches, batch, r, s, e):
+    def rows(v):
+        return None if v is None else v[s:e]
+    def table(v):
+        return None if v is None else v[r:r + 1]
+    alone = dataclasses.replace(batch, positions=batch.positions[s:e],
+        token_to_req=torch.zeros(e - s, dtype=batch.token_to_req.dtype, device=batch.positions.device),
+        query_start_loc=torch.tensor([0, e - s], dtype=batch.query_start_loc.dtype, device=batch.positions.device),
+        swa_slots=rows(batch.swa_slots), swa_indices=rows(batch.swa_indices), comp_slots=rows(batch.comp_slots),
+        comp_block_table=table(batch.comp_block_table), idxk_slots=rows(batch.idxk_slots),
+        idxk_block_table=table(batch.idxk_block_table), ring_slots=rows(batch.ring_slots))
+    own = clone(caches)
+    own = dataclasses.replace(own, topk=own.topk[s:e].clone(), candidates=own.candidates[s:e].clone())
+    return own, alone
+
+
+@pytest.mark.parametrize('rows', [18, 40])
+@pytest.mark.parametrize('ratio,role', [(0, 'shared'), (1, 'source'), (2, 'source'), (2, 'consumer'), (2, 'shared')])
+def test_a_request_alone_matches_its_rows_of_the_batch(rows, ratio, role):
+    """The pipeline's own kernels read only a row's own request: with
+    row-local projections, each request replayed alone is bit-equal to its
+    rows of the batch. (Captured 18-48-row calls differ alone only through
+    the Marlin projections' row-count tiling, as the exp12 path does.)"""
+    cfg, weights, caches, batch, matrices, x, raw, iw = inputs(rows, ratio, role)
+    weights = _row_local(weights, matrices)
+    pre = clone(caches)
+    ws = pipe.PipelineWorkspace(rows, 512, 128, 'cuda')
+    out = torch.empty((rows, 16, 512), dtype=BF16, device='cuda')
+    q = core.prepare_layer(cfg, weights, caches, batch, x, raw, iw, pipeline=True, workspace=ws)
+    core.attend_layer(cfg, weights, caches, batch, q, out, pipeline=True, workspace=ws)
+    qsl = batch.query_start_loc.tolist()
+    for r in range(len(qsl) - 1):
+        s, e = qsl[r], qsl[r + 1]
+        own, alone = _alone(pre, batch, r, s, e)
+        ws1 = pipe.PipelineWorkspace(e - s, 512, 128, 'cuda')
+        out1 = torch.empty((e - s, 16, 512), dtype=BF16, device='cuda')
+        q1 = core.prepare_layer(cfg, weights, own, alone, x[s:e], None if raw is None else raw[s:e],
+                                None if iw is None else iw[s:e], pipeline=True, workspace=ws1)
+        core.attend_layer(cfg, weights, own, alone, q1, out1, pipeline=True, workspace=ws1)
+        assert F.bits_equal(out1, out[s:e])
+        assert F.bits_equal(own.topk, caches.topk[s:e])
+        assert F.bits_equal(own.candidates, caches.candidates[s:e])
+
+
 def capture_dummy_inputs(rows, ratio, role, slots_mode, device='cuda'):
     """``inputs`` with what the runner's graph-capture warm-up passes: every
     position 0 (input_batch zeros them), all-zero block tables at the
