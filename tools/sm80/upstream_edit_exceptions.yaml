@@ -199,3 +199,15 @@ exceptions:
     (276b0ee249b6) Remove when upstream exposes one KV-allocation context observer retaining the profiling-versus-serving distinction.
     (20c6cc21da36) Move the recorder to an upstream memory-profiler observer with the same stage boundaries and allocation accounting.
     (ba753e35fcca) Remove when upstream exposes per-output failed-token metadata through the runner output constructor without adding another per-step lookup.
+
+- file: vllm/tokenizers/deepseek_v41_encoding.py
+  hunks: [0b665958e7ac, 5331783e1d57]
+  reason: >-
+    Upstream's own fix (#62199, after the base): find_last_user_index skips a
+    user message that holds only tool results, as the 1017 reference encoder
+    does. The function is called inside upstream's encoder; carrying upstream's
+    exact lines makes the hunks vanish when the base includes that commit.
+  owner: DeepSeek V4.1 prompt encoding
+  removal: >-
+    Drops out at the first base that contains upstream ddefe40e16 (#62199);
+    delete this entry and the modification notice then.
