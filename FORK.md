@@ -133,7 +133,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/attention/__init__.py` | 2 |
 | `vllm/sm80/attention/triton_mla_sparse.py` | 386 |
 | `vllm/sm80/capture.py` | 565 |
-| `vllm/sm80/deepseek_v41_recovery.py` | 276 |
+| `vllm/sm80/deepseek_v41_recovery.py` | 326 |
 | `vllm/sm80/dev_ab.py` | 1,333 |
 | `vllm/sm80/dev_ab_batch.py` | 367 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
@@ -160,7 +160,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/layers/moe/runner.py` | 177 |
 | `vllm/sm80/layers/moe/shared_experts.py` | 134 |
 | `vllm/sm80/model_registry.py` | 78 |
-| `vllm/sm80/parser_recovery.py` | 222 |
+| `vllm/sm80/parser_recovery.py` | 243 |
 | `vllm/sm80/platform.py` | 155 |
 | `vllm/sm80/plugin.py` | 324 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
@@ -179,7 +179,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **50 files** | **13,953** |
+| **50 files** | **14,024** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -436,7 +436,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/plugins_tests/conftest.py` | 17 |
 | `tests/sm80/round_once_allreduce_bits.py` | 207 |
 | `tests/sm80/round_once_unchecked.py` | 46 |
-| `tests/sm80/seams.yaml` | 1,456 |
+| `tests/sm80/seams.yaml` | 1,463 |
 | `tests/sm80/test_dev_ab.py` | 565 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
 | `tests/sm80/test_dev_ab_batch.py` | 330 |
@@ -498,7 +498,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **221 files** | **99,548** |
+| **221 files** | **99,555** |
 
 #### `tools/`
 
@@ -615,7 +615,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `docs/features/quantization/README.md` | modified | 64 | 0 | 2 |
 | `docs/features/speculative_decoding/README.md` | modified | 3 | 0 | 2 |
 | `tests/models/kimi_k3/test_kda_metadata.py` | modified | 4 | 2 | 2 |
-| `tests/parser/engine/test_deepseek_v41.py` | modified | 446 | 1 | 4 |
+| `tests/parser/engine/test_deepseek_v41.py` | modified | 608 | 1 | 4 |
 | `tests/test_envs.py` | modified | 62 | 0 | 3 |
 | `tests/tokenizers_/test_deepseek_v41.py` | modified | 57 | 0 | 1 |
 | `tests/v1/core/test_kv_cache_utils.py` | modified | 2 | 0 | 2 |
@@ -625,16 +625,17 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_input_batch_v2.py` | modified | 28 | 0 | 2 |
 | `tests/v1/worker/test_gpu_model_runner_v2.py` | modified | 4 | 1 | 4 |
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 9 | 1 | 5 |
+| `tests/v1/worker/test_grammar_invalid_drafts.py` | modified | 6 | 0 | 2 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **24 files** | | **1,075** | **551** | **83** |
+| **25 files** | | **1,243** | **551** | **85** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
 | Product code | 77 | 3,624 | 253 | 516 |
-| Tests, docs and .github | 24 | 1,075 | 551 | 83 |
-| All | 101 | 4,699 | 804 | 599 |
+| Tests, docs and .github | 25 | 1,243 | 551 | 85 |
+| All | 102 | 4,867 | 804 | 601 |
 
 ## 3. Fork environment variables
 
@@ -790,11 +791,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 174 |
-| Fork-added product lines | 55,356 |
-| Patched upstream files | 101 |
-| Patched upstream lines | +4,699 / -804 |
+| Fork-added product lines | 55,427 |
+| Patched upstream files | 102 |
+| Patched upstream lines | +4,867 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 58,980 |
+| Product lines added (new files and patches) | 59,051 |
 | Fork environment variables (flags) | 126 |
 | Unreferenced fork definitions | 3 (27 lines) |

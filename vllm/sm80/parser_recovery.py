@@ -9,13 +9,19 @@ every event of such a candidate until it can decide:
 - the name must pass the parser's validator when the name ends, or, for a
   headless opener (the opener is really the first parameter), some declared
   tool must cover the parameters;
+- while its arguments arrive, the parser's shape check must keep accepting
+  the held text, so prose that only starts like a call is restored as soon
+  as it stops looking like one, not at the end of the output;
 - the call must reach a commit transition (its invoke closer). Any other
   transition out of the candidate, an unexpected terminal, or the end of the
   output restores the candidate as the text it was, in the state it came from.
 
-Special tokens the engine drops never enter the held text. In
-``skip_tool_parsing`` mode (the reasoning pass of a delegating parser) no
-candidate is held: tool parsing belongs to the tool pass.
+A ``held_only`` transition (a closer only a recovered call may use) is plain
+text when no candidate is held. Special tokens the engine drops never enter
+the held text. The engine records the tool index of every committed
+candidate in ``recovered_tool_indexes``. In ``skip_tool_parsing`` mode (the
+reasoning pass of a delegating parser) no candidate is held: tool parsing
+belongs to the tool pass.
 """
 
 from __future__ import annotations
@@ -41,6 +47,8 @@ class RecoveryTransition(Transition):
     headless: bool = False
     # Commits a held candidate.
     commit: bool = False
+    # Applies only while a candidate is held; plain text otherwise.
+    held_only: bool = False
 
 
 # Validates a held candidate's name.
@@ -48,6 +56,9 @@ NameValidator = Callable[[str], bool]
 # Returns the declared tools whose parameters cover a headless candidate's
 # raw text so far.
 HeadlessCandidates = Callable[[str], Sequence[str]]
+# Makes the shape check of one held candidate. The check gets the held text
+# each time it grows while the arguments arrive; False restores the candidate.
+ShapeCheckFactory = Callable[[], Callable[[str], bool]]
 
 
 class RecoveringParserEngine(StreamingParserEngine):
@@ -56,6 +67,8 @@ class RecoveringParserEngine(StreamingParserEngine):
     name_validator: NameValidator
     headless_candidates: HeadlessCandidates | None
     args_terminals: frozenset[str]
+    shape_check: ShapeCheckFactory | None
+    recovered_tool_indexes: set[int]
 
     @classmethod
     def adopt(
@@ -64,6 +77,7 @@ class RecoveringParserEngine(StreamingParserEngine):
         name_validator: NameValidator,
         headless_candidates: HeadlessCandidates | None = None,
         args_terminals: Collection[str] = (),
+        shape_check: ShapeCheckFactory | None = None,
     ) -> RecoveringParserEngine:
         """Turn an engine its parser built into a recovering engine.
 
@@ -76,11 +90,14 @@ class RecoveringParserEngine(StreamingParserEngine):
         engine.name_validator = name_validator
         engine.headless_candidates = headless_candidates
         engine.args_terminals = frozenset(args_terminals)
+        engine.shape_check = shape_check
+        engine.recovered_tool_indexes = set()
         engine._clear_hold()
         return engine
 
     def reset(self, initial_state: ParserState | None = None) -> None:
         super().reset(initial_state)
+        self.recovered_tool_indexes = set()
         self._clear_hold()
 
     def finish(self) -> list[SemanticEvent]:
@@ -100,12 +117,11 @@ class RecoveringParserEngine(StreamingParserEngine):
         if self._held:
             return self._on_held_terminal(terminal, value, token_count)
         transition = self.config.transitions.get((self.state, terminal))
-        if (
-            isinstance(transition, RecoveryTransition)
-            and transition.provisional
-            and not self.skip_tool_parsing
-        ):
-            return self._begin_hold(transition, value, token_count)
+        if isinstance(transition, RecoveryTransition):
+            if transition.held_only:
+                return self._emit_for_state(value, token_count)
+            if transition.provisional and not self.skip_tool_parsing:
+                return self._begin_hold(transition, value, token_count)
         return super()._on_terminal(terminal, value, token_count)
 
     def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
@@ -117,6 +133,8 @@ class RecoveringParserEngine(StreamingParserEngine):
             self._hold_name += text
             if len(self._hold_name) > _NAME_LIMIT or "\n" in self._hold_name:
                 return self._abort_hold()
+        elif self._hold_shape is not None and not self._hold_shape(self._hold_raw):
+            return self._abort_hold()
         self._hold_events.extend(super()._emit_for_state(text, token_count))
         return []
 
@@ -126,6 +144,7 @@ class RecoveringParserEngine(StreamingParserEngine):
         self._held = False
         self._hold_headless_opener = False
         self._hold_headless = False
+        self._hold_shape: Callable[[str], bool] | None = None
         self._hold_events: list[SemanticEvent] = []
         self._hold_raw = ""
         self._hold_token_count = 0
@@ -144,6 +163,7 @@ class RecoveringParserEngine(StreamingParserEngine):
         self._held = True
         self._hold_headless_opener = transition.headless
         self._hold_headless = False
+        self._hold_shape = self.shape_check() if self.shape_check else None
         self._hold_events = events
         self._hold_raw = value
         self._hold_token_count = token_count
@@ -185,6 +205,7 @@ class RecoveringParserEngine(StreamingParserEngine):
         ):
             events = self._hold_events
             events.extend(self._apply_transition(transition, value, token_count))
+            self.recovered_tool_indexes.add(self.tool_index)
             self._clear_hold()
             return events
         return self._abort_hold()

@@ -1496,3 +1496,10 @@ seams:
   why: deepseek_v41_recovery extends this config by terminal name (TOOL_START, TOOL_END, INVOKE_NAME_END, INVOKE_END, PARAM_START, PARAM_CLOSE) and reuses its (TOOL_ARGS, INVOKE_END) transition
   sha256: 3ad93c31920e9dec85f158a43781ea693e193feff9859cbcdc05922f3a1f638a
   signature: '(thinking: bool = False) -> vllm.parser.engine.parser_engine_config.ParserEngineConfig'
+
+- id: dsv41-recovery-parser-arg-delta
+  kind: method
+  target: vllm.parser.engine.parser_engine:ParserEngine._compute_arg_delta
+  why: the recovering V4.1 parser returns None here for a recovered call, which arrives whole at commit, so its arguments go out once from _flush_arg_converter at its end; that flush must send the whole final JSON when nothing was streamed
+  sha256: 29054a0967013171745ba341a885f28c21762ac1466e0671d14dca000276647b
+  signature: '(self, idx: ''int'', raw_delta: ''str'') -> ''str | None'''

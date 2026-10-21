@@ -18,10 +18,13 @@ lose the call or leak its markup into the reply:
 The damaged forms are held as provisional candidates (vllm.sm80.
 parser_recovery): a candidate becomes a tool call only once its invoke
 closer arrives; an XML-idiom candidate also needs a declared tool name, and a
-headless one exactly one covering declared tool. Anything else, including an
-ambiguous headless block, is restored as text. Well-formed DSML takes the
-exact upstream path, and text inside the thinking block stays reasoning, as
-upstream keeps it.
+headless one exactly one covering declared tool. Outside its parameter
+values a candidate may hold only whitespace and call markup. Anything else,
+including an ambiguous headless block, is restored as text. Only a recovered
+call is parsed from the mixed tags, and only it may end at a plain
+``</invoke>``; a call opened with DSML takes the exact upstream path. Text
+inside the thinking block stays reasoning, and under tool_choice "none" no
+candidate is recovered.
 """
 
 from __future__ import annotations
@@ -45,7 +48,6 @@ TOOL_END_NEAR_MISS = ("</｜DSML｜calls>", "</｜DSML｜_calls>")
 XML_INVOKE_PREFIX = '<invoke name="'
 XML_PARAM_PREFIX = '<parameter name="'
 XML_INVOKE_END = "</invoke>"
-XML_TOOL_END = ("</calls>", "</function_calls>")
 
 # Parameter markup that stays inside a held candidate's arguments (the
 # parameter tags close with the invoke's '">').
@@ -62,8 +64,56 @@ _PARAM_OPEN = re.compile(
 )
 _PARAM_CLOSE = re.compile(r"</(?:｜DSML｜ )?parameter>")
 _CALL_CLOSE = re.compile(r"</(?:｜DSML｜ )?(?:invoke|calls|function_calls)>")
-# A plain (non-DSML) parameter or invoke opener marks the XML idiom.
-_PLAIN_OPEN = re.compile(r'<(?!｜DSML｜ )(?:parameter|invoke)\s+name="')
+# Where a parameter value ends: its closer or the next parameter opener.
+_VALUE_END = re.compile(
+    rf"(?P<close>{_PARAM_CLOSE.pattern})|(?P<open>{_PARAM_OPEN.pattern})"
+)
+# Call markup that may stand between parameter values.
+_MARKUP = re.compile(
+    rf"(?P<open>{_PARAM_OPEN.pattern})|{_PARAM_CLOSE.pattern}"
+    r'|<(?:｜DSML｜ )?invoke\s+name="[^"<>]*"\s*>'
+    rf"|{_CALL_CLOSE.pattern}"
+)
+# A tag still arriving is waited for up to this length.
+_TAG_LIMIT = 320
+
+
+class _CallShape:
+    """Shape check of one held candidate.
+
+    Outside parameter values only whitespace and call markup may appear; the
+    first other character ends the candidate. Each call scans only the text
+    added since the previous one (and a tag that may still be arriving).
+    """
+
+    def __init__(self) -> None:
+        self._pos = 0
+        self._in_value = False
+
+    def __call__(self, raw: str) -> bool:
+        pos = self._pos
+        while pos < len(raw):
+            if self._in_value:
+                m = _VALUE_END.search(raw, pos)
+                if m is None:
+                    lt = raw.rfind("<", max(pos, len(raw) - _TAG_LIMIT))
+                    pos = lt if lt >= 0 else len(raw)
+                    break
+                self._in_value = m.group("open") is not None
+                pos = m.end()
+            elif raw[pos].isspace():
+                pos += 1
+            elif raw[pos] != "<":
+                return False
+            elif m := _MARKUP.match(raw, pos):
+                self._in_value = m.group("open") is not None
+                pos = m.end()
+            elif raw.find(">", pos) < 0 and len(raw) - pos <= _TAG_LIMIT:
+                break
+            else:
+                return False
+        self._pos = pos
+        return True
 
 
 @functools.cache
@@ -76,11 +126,7 @@ def _recovery_config(
         *_spellings(terminals["TOOL_START"]),
         *TOOL_START_NEAR_MISS,
     )
-    terminals["TOOL_END"] = (
-        *_spellings(terminals["TOOL_END"]),
-        *TOOL_END_NEAR_MISS,
-        *XML_TOOL_END,
-    )
+    terminals["TOOL_END"] = (*_spellings(terminals["TOOL_END"]), *TOOL_END_NEAR_MISS)
     terminals["INVOKE_PREFIX_XML"] = XML_INVOKE_PREFIX
     terminals["INVOKE_PREFIX_PARAM"] = XML_PARAM_PREFIX
     terminals["INVOKE_END_XML"] = XML_INVOKE_END
@@ -106,7 +152,9 @@ def _recovery_config(
         end.next_state, end.events, end.skip_in_token_id_mode, commit=True
     )
     transitions[(ParserState.TOOL_ARGS, "INVOKE_END")] = commit
-    transitions[(ParserState.TOOL_ARGS, "INVOKE_END_XML")] = commit
+    transitions[(ParserState.TOOL_ARGS, "INVOKE_END_XML")] = replace(
+        commit, held_only=True
+    )
     return replace(config, terminals=terminals, transitions=transitions)
 
 
@@ -132,20 +180,6 @@ def _tool_schemas(tools: Sequence[Any]) -> Iterator[tuple[str, dict, list]]:
                     params.get("properties") or {},
                     list(params.get("required") or []),
                 )
-
-
-def _needs_heal(raw_args: str) -> bool:
-    """Whether arguments carry the XML idiom; well-formed DSML never does."""
-    if _PLAIN_OPEN.search(raw_args):
-        return True
-    # A value before the first parameter opener is a fused invoke's value.
-    first_close = _PARAM_CLOSE.search(raw_args)
-    if first_close is None:
-        return False
-    first_open = _PARAM_OPEN.search(raw_args)
-    return (
-        first_open is None or first_close.start() < first_open.start()
-    ) and bool(raw_args[: first_close.start()].strip())
 
 
 def _primary_param(props: dict, required: list) -> str | None:
@@ -214,18 +248,25 @@ def recovering_parser(parser_cls: type[DeepSeekV4Parser]) -> type[DeepSeekV4Pars
         def __init__(self, tokenizer, tools=None, **kwargs) -> None:
             super().__init__(tokenizer, tools, **kwargs)
             self._declared_tools: list = list(tools or [])
-            RecoveringParserEngine.adopt(
+            self._recovery_engine = RecoveringParserEngine.adopt(
                 self._engine,
                 name_validator=self._accept_recovered_name,
                 headless_candidates=self._covering_tools,
                 args_terminals=_ARGS_TERMINALS,
+                shape_check=_CallShape,
             )
 
         def _check_skip_tool_parsing(self, request) -> None:
             super()._check_skip_tool_parsing(request)
-            # The tools of this request only: a request without tools never
-            # recovers a call by an earlier request's tool names.
-            self._declared_tools = list(getattr(request, "tools", None) or [])
+            # The tools of this request only, so a request without tools never
+            # recovers a call by an earlier request's tool names; and none
+            # under tool_choice "none", where a call cannot be returned and
+            # its text must stay content.
+            self._declared_tools = (
+                []
+                if self._suppress_tool_calls
+                else list(getattr(request, "tools", None) or [])
+            )
 
         def _accept_recovered_name(self, name: str) -> bool:
             return any(
@@ -247,18 +288,27 @@ def recovering_parser(parser_cls: type[DeepSeekV4Parser]) -> type[DeepSeekV4Pars
             covering = self._covering_tools(raw_args)
             return covering[0] if len(covering) == 1 else None
 
+        def _recovered(self, idx: int) -> bool:
+            return idx in self._recovery_engine.recovered_tool_indexes
+
         def _try_extract_name(self, idx: int) -> str | None:
-            return super()._try_extract_name(idx) or self._headless_tool(
-                self._tool_slots[idx].args
-            )
+            name = super()._try_extract_name(idx)
+            if name or not self._recovered(idx):
+                return name
+            return self._headless_tool(self._tool_slots[idx].args)
+
+        def _compute_arg_delta(self, idx: int, raw_delta: str) -> str | None:
+            # A recovered call arrives whole when it commits: its arguments
+            # go out once, complete, when it ends.
+            if self._recovered(idx):
+                return None
+            return super()._compute_arg_delta(idx, raw_delta)
 
         def _convert_args(self, raw_args: str, partial: bool) -> str:
-            if not _needs_heal(raw_args):
+            slots = [i for i, s in enumerate(self._tool_slots) if s.args == raw_args]
+            if not slots or not all(self._recovered(i) for i in slots):
                 return super()._convert_args(raw_args, partial)
-            name = next(
-                (s.name for s in self._tool_slots if s.args == raw_args and s.name),
-                None,
-            ) or self._headless_tool(raw_args)
+            name = self._tool_slots[slots[0]].name or self._headless_tool(raw_args)
             props: dict = {}
             required: list = []
             for tool_name, tool_props, tool_required in _tool_schemas(

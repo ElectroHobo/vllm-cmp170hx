@@ -591,3 +591,165 @@ def test_special_token_never_enters_a_held_candidate():
     events = parser._engine.feed(eos, [1])
     events.extend(parser._engine.finish())
     assert "".join(event.value for event in events if event.value) == text
+
+
+_WRITE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "write",
+            "parameters": {
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+        },
+    }
+]
+
+
+def _dsml_write(content):
+    return (
+        '<｜DSML｜ calls>\n<｜DSML｜ invoke name="write">\n'
+        '<｜DSML｜ parameter name="path" string="true">a.xml</｜DSML｜ parameter>\n'
+        f'<｜DSML｜ parameter name="content" string="true">{content}'
+        "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    )
+
+
+def _stream_calls(text, tools, chunk_size, tool_choice=None):
+    tokenizer, tokens = tokenizer_for(text, False)
+    parser = parser_for(tokenizer, {"thinking": False})
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "test"}],
+        tools=tools,
+        tool_choice=tool_choice,
+    )
+    starts = range(0, len(tokens), chunk_size)
+    results = [
+        parser.parse_delta(
+            "".join(piece for _, piece in tokens[start : start + chunk_size]),
+            [tid for tid, _ in tokens[start : start + chunk_size]],
+            request,
+            prompt_token_ids=[51] if start == 0 else None,
+            finished=start == starts[-1],
+        )
+        for start in starts
+    ]
+    return results, collect_output(results)
+
+
+# Markup in the value of a call opened with DSML is text of that value: plain
+# closers end only a recovered call, and only a recovered call is healed.
+@pytest.mark.parametrize(
+    "value",
+    [
+        "<x>\n</invoke>\nend",
+        "see </function_calls> here",
+        "a </calls> b",
+        '<parameter name="a">b</parameter> tail',
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_markup_in_a_dsml_value_is_kept(value, chunk_size):
+    text = _dsml_write(value)
+    if chunk_size is None:
+        reasoning, content, calls = _parse(text, {"thinking": False}, _WRITE_TOOLS)
+        calls = [(call.name, call.arguments) for call in calls]
+    else:
+        _, output = _stream_calls(text, _WRITE_TOOLS, chunk_size)
+        content = output.content
+        calls = [(call["name"], call["arguments"]) for call in output.tool_calls]
+    assert not (content or "").strip()
+    assert [(name, json.loads(args)) for name, args in calls] == [
+        ("write", {"path": "a.xml", "content": value})
+    ]
+
+
+_BASH_CALL = (
+    'Run:\n<invoke name="bash">\n<parameter name="command">ls > out.txt</parameter>\n'
+    '<parameter name="i">listing</parameter>\n</invoke>'
+)
+
+
+@pytest.mark.parametrize("chunk_size", range(1, 40))
+def test_recovered_call_arguments_stream_as_valid_json(chunk_size):
+    _, output = _stream_calls(_BASH_CALL, _BASH_TOOL, chunk_size)
+    assert [call["name"] for call in output.tool_calls] == ["bash"]
+    assert json.loads(output.tool_calls[0]["arguments"]) == {
+        "command": "ls > out.txt",
+        "i": "listing",
+    }
+
+
+_XML_WEATHER = (
+    'Checking.\n<invoke name="get_weather">\n'
+    '<parameter name="city">Seoul</parameter>\n</invoke>'
+)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_tool_choice_none_keeps_recoverable_call_as_text(chunk_size):
+    if chunk_size is None:
+        _, content, calls = _parse(
+            _XML_WEATHER, {"thinking": False}, tool_choice="none"
+        )
+    else:
+        _, output = _stream_calls(_XML_WEATHER, _WEATHER_TOOLS, chunk_size, "none")
+        content, calls = output.content, output.tool_calls
+    assert not calls
+    assert content == _XML_WEATHER
+
+
+def test_prose_that_only_starts_like_a_call_is_released_at_once():
+    head = 'To call it, write <parameter name="city">Paris</parameter> in'
+    text = head + " the prompt. " + "More prose. " * 50
+    results, output = _stream_calls(text, _WEATHER_TOOLS, 1)
+    assert not output.tool_calls
+    assert output.content == text
+    streamed = ""
+    for index, delta in enumerate(results):
+        streamed += (delta.content or "") if delta else ""
+        if "<parameter" in streamed:
+            break
+    # Released by the first character after the closer that a call cannot
+    # hold, not at the end of the output.
+    assert index < len(head) + 2
+
+
+def test_unclosed_invoke_followed_by_prose_is_released_at_once():
+    head = 'x <invoke name="get_weather">\nword'
+    text = head + " word" * 2000
+    results, output = _stream_calls(text, _WEATHER_TOOLS, 1)
+    assert not output.tool_calls
+    assert output.content == text
+    streamed = ""
+    for index, delta in enumerate(results):
+        streamed += (delta.content or "") if delta else ""
+        if "<invoke" in streamed:
+            break
+    assert index < len(head) + 2
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 64])
+def test_long_recovered_call_still_parses(chunk_size):
+    body = "".join(f"line {n}\n\n<tag>{n}</tag>\n" for n in range(2000))
+    text = (
+        'Writing.\n<invoke name="write">\n<parameter name="path">a.txt</parameter>\n'
+        f'<parameter name="content">{body}</parameter>\n</invoke>'
+    )
+    if chunk_size is None:
+        _, content, calls = _parse(text, {"thinking": False}, _WRITE_TOOLS)
+        calls = [(call.name, call.arguments) for call in calls]
+    else:
+        _, output = _stream_calls(text, _WRITE_TOOLS, chunk_size)
+        content = output.content
+        calls = [(call["name"], call["arguments"]) for call in output.tool_calls]
+    assert content.strip() == "Writing."
+    assert [(name, json.loads(args)) for name, args in calls] == [
+        ("write", {"path": "a.txt", "content": body})
+    ]
