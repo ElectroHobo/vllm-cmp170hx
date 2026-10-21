@@ -136,14 +136,14 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/dev_ab.py` | 1,333 |
 | `vllm/sm80/dev_ab_batch.py` | 367 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
-| `vllm/sm80/distributed/ce_ring_all_reduce.py` | 267 |
+| `vllm/sm80/distributed/ce_ring_all_reduce.py` | 305 |
 | `vllm/sm80/distributed/communicator.py` | 356 |
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
-| `vllm/sm80/distributed/step_errors.py` | 155 |
+| `vllm/sm80/distributed/step_errors.py` | 166 |
 | `vllm/sm80/envs.py` | 1,400 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
@@ -178,7 +178,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **49 files** | **13,731** |
+| **49 files** | **13,780** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -207,8 +207,8 @@ Files added elsewhere, grouped by top-level directory.
 | `CITATION.cff` | 7 |
 | `COMMUNITY_RECIPES.md` | 68 |
 | `NOTICE` | 9 |
-| `REVIEW.md` | 58 |
-| **4 files** | **142** |
+| `REVIEW.md` | 80 |
+| **4 files** | **164** |
 
 #### `.github/`
 
@@ -437,7 +437,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/round_once_allreduce_bits.py` | 207 |
 | `tests/sm80/round_once_unchecked.py` | 46 |
 | `tests/sm80/seams.yaml` | 1,386 |
-| `tests/sm80/test_ce_ring_all_reduce.py` | 174 |
+| `tests/sm80/test_ce_ring_all_reduce.py` | 219 |
 | `tests/sm80/test_dev_ab.py` | 565 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
 | `tests/sm80/test_dev_ab_batch.py` | 330 |
@@ -499,7 +499,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **223 files** | **99,569** |
+| **223 files** | **99,614** |
 
 #### `tools/`
 
@@ -788,11 +788,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 173 |
-| Fork-added product lines | 55,176 |
+| Fork-added product lines | 55,225 |
 | Patched upstream files | 97 |
 | Patched upstream lines | +4,183 / -803 |
 | Patched upstream product files | 75 |
 | Patched upstream product lines | +3,611 / -253 |
-| Product lines added (new files and patches) | 58,787 |
+| Product lines added (new files and patches) | 58,836 |
 | Fork environment variables (flags) | 127 |
 | Unreferenced fork definitions | 3 (27 lines) |

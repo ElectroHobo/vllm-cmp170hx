@@ -172,3 +172,48 @@ def test_takes_refuses_host_tensors() -> None:
     ring = object.__new__(ce.CeRingAllReduce)
     ring.world, ring.capacity_bytes = 4, 1 << 20
     assert not ring.takes(torch.zeros(1024))
+
+
+def _ptx(kernel, signature, constexprs=None):
+    """The kernel compiled for sm_80 on the host (no GPU needed)."""
+    import triton
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    src = ASTSource(fn=kernel, signature=signature, constexprs=constexprs or {})
+    return triton.compile(src, target=GPUTarget("cuda", 80, 32)).asm["ptx"]
+
+
+WAIT_SIGNATURE = {"flag_ptr": "*i32", "value": "i32", "err_ptr": "*i32", "timeout_ns": "i64", "code": "i32"}
+
+
+def test_flag_kernels_use_system_scope_release_acquire() -> None:
+    """The flag store a peer reads over PCIe is a system-scope release (ordered after the copy-engine
+    writes it announces); the wait reads with system-scope acquire."""
+    set_flag, wait_flag, _ = ce._kernels()
+    assert "st.release.sys.global.u32" in _ptx(set_flag, {"flag_ptr": "*i32", "value": "i32"})
+    assert "ld.acquire.sys.global.u32" in _ptx(wait_flag, WAIT_SIGNATURE)
+
+
+def test_flag_wait_is_bounded_and_reports_on_the_error_word() -> None:
+    """The wait reads the global timer, leaves its loop on the bound, and ORs its code into the
+    stream's sticky error word: it never spins forever and never traps."""
+    _, wait_flag, _ = ce._kernels()
+    ptx = _ptx(wait_flag, WAIT_SIGNATURE)
+    assert "%globaltimer" in ptx
+    assert "atom" in ptx and ".or" in ptx
+    assert "trap" not in ptx
+    assert 0 < ce.WAIT_TIMEOUT_NS <= 120_000_000_000
+
+
+def test_step_error_word_names_the_ring_timeout() -> None:
+    from vllm.sm80.distributed import step_errors
+
+    assert step_errors.CE_RING_TIMEOUT & step_errors.ROUND_ONCE_SPAN == 0
+    for word, text in ((step_errors.CE_RING_TIMEOUT, "copy-engine ring"),
+                       (step_errors.ROUND_ONCE_SPAN, "finite exponent span"),
+                       (3, "copy-engine ring")):
+        check = step_errors.ErrorCheck([torch.tensor(word, dtype=torch.int32)])
+        with pytest.raises(ValueError, match=text):
+            check.raise_if_failed()
+    step_errors.ErrorCheck([torch.tensor(0, dtype=torch.int32)]).raise_if_failed()

@@ -15,10 +15,14 @@ Files:
 - `vllm/sm80/distributed/ce_ring_all_reduce.py` (new): `ring_steps`,
   `emulate` (the host's bits of the ring), `ring_ops` (one call's copies,
   flag stores, flag waits and adds on a backend), the device backend (Triton
-  flag store, volatile-load flag wait, elementwise add; `cudaMemcpyAsync`
-  through the loaded CUDA runtime), `CeRingAllReduce` (IPC scratch: one slot
-  per ring step for a `max_num_batched_tokens` x hidden FP32 message, plus a
-  flag block; collective construction), `init_ce_ring` / `ce_ring`.
+  system-scope release flag store, system-scope acquire flag wait bounded by
+  `WAIT_TIMEOUT_NS`, elementwise add; `cudaMemcpyAsync` through the loaded
+  CUDA runtime), `CeRingAllReduce` (IPC scratch: one slot per ring step for a
+  `max_num_batched_tokens` x hidden FP32 message, plus a flag block;
+  collective construction), `init_ce_ring` / `ce_ring`.
+- `vllm/sm80/distributed/step_errors.py`: the sticky error word is
+  bit-coded (1 round-once span, 2 copy-engine ring wait timeout); the raised
+  message names every set bit.
 - `sm80_attention.py`: `prefill_all_reduce` (the ring when it takes the
   message and neither the host-staged nor the custom all-reduce does, else
   `tensor_model_parallel_all_reduce`); the FP32 `wo_b` sum goes through it.
@@ -32,7 +36,12 @@ epoch into the previous rank's ready flag, wait for this rank's; then per ring
 step copy the send shard into the next rank's slot, store its step flag, wait
 for this rank's step flag, add (reduce-scatter: `out = input + slot`) or copy
 (all-gather). Flags are monotonic, slots are per step, the ready flag keeps a
-rank from writing a slot its neighbour may still read.
+rank from writing a slot its neighbour may still read. Flag stores are
+`st.release.sys` (a peer reads them over PCIe after the slot's copy-engine
+writes); waits load with `ld.acquire.sys`. A wait that exceeds 60 s ORs bit 2
+into the producing stream's sticky error word and returns, so ranks whose
+collectives fall out of step fail that step at its output copy instead of
+hanging; it never traps.
 
 Bits: each element is summed in its owner's ring order in the message dtype
 (FP32 for `wo_b`, BF16 per add for the MoE, as NCCL's BF16 ring); every rank
@@ -43,17 +52,30 @@ Tests (CPU): `tests/sm80/test_ce_ring_all_reduce.py`: schedule properties
 (world 2/3/4/8), emulation against the FP64 sum, `ring_ops` for every rank on
 a host memory model over three back-to-back calls (world 2 and 4, FP32 and
 BF16): emulated bits on every rank and every copy's bytes checked where they
-land; ready-before-write ordering; host tensors refused. Dispatch:
+land; ready-before-write ordering; host tensors refused; the flag kernels
+compiled for sm_80 on the host: system-scope release store, system-scope
+acquire load, a %globaltimer-bounded wait that ORs into the error word and
+has no trap (these three fail on the previous head); the error word's
+messages. Dispatch:
 `tests/models/deepseek_v41/sm80/test_sm80_ce_allreduce_dispatch.py`. With
-`tests/models/deepseek_v41/sm80` and `tests/sm80/test_seams.py`: 695 passed,
-403 skipped (GPU-only). The ring test file fails to collect on the base (no
-module).
+`tests/models/deepseek_v41/sm80`, `tests/sm80/test_seams.py`, the step-error
+and round-once tests: 717 passed, 403 skipped (GPU-only).
+
+Four-card evidence so far (check r1, 10-21): 88 calls bit-exact on all ranks
+against `emulate` (FP32 and BF16, 16-2048 rows, default and side stream,
+soak), FP32 41.9 MB 9.89 ms vs NCCL 10.91 ms, a BF16 GEMM slowed 0.84x
+beside the ring vs 1.86x beside NCCL. The run then hung in the Marlin phase:
+its harness computed the number of back-to-back ring calls per rank from that
+rank's own timings, so ranks issued different call counts and a flag wait
+never saw its epoch. The harness now agrees counts across ranks and has a
+per-phase watchdog; the engine-side bound above turns any such desync into a
+reported step failure.
 
 Known limits: one stream, one piece per step (no copy/add pipelining); the
-flag wait spins one block while a peer copy is in flight (the four-card
-check measures Marlin beside it); 63 MiB of device memory per rank at TP4
-with 2048-row steps; decode sums are unaffected by construction (custom
-all-reduce sizes, graphs). Four-card bits and timing are outside pytest.
+flag wait spins one block while a peer copy is in flight (Marlin beside it is
+still unmeasured); 63 MiB of device memory per rank at TP4 with 2048-row
+steps; decode sums are unaffected by construction (custom all-reduce sizes,
+graphs). Four-card bits and timing are outside pytest.
 
 Removes: nothing.
 

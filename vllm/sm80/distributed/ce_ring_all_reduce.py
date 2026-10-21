@@ -129,20 +129,52 @@ class _Ptr:
         return self._ptr
 
 
+# A flag wait gives up after this long and marks the step failed (bit
+# CE_RING_TIMEOUT of the stream's sticky error word, step_errors.py) instead of
+# spinning forever: a peer that never arrives fails the step at its output
+# copy, it does not hang the server. Prefill sums take tens of milliseconds and
+# ranks skew by at most a layer's expert imbalance, so a minute only trips on a
+# real desynchronisation.
+WAIT_TIMEOUT_NS = 60_000_000_000
+
+
 def _kernels():
     import triton
     import triton.language as tl
 
     @triton.jit
-    def set_flag(flag_ptr, value):
-        # Queued after the copy on the same stream: the copy has completed.
-        tl.store(flag_ptr, value)
+    def _store_release_sys(ptr, value):
+        # System scope: the peer reads the flag over PCIe and must see the
+        # earlier copy-engine writes of the slot first.
+        tl.inline_asm_elementwise("st.release.sys.global.u32 [$1], $2; mov.u32 $0, 0;", "=r,l,r",
+                                  [ptr, value], dtype=tl.int32, is_pure=False, pack=1)
 
     @triton.jit
-    def wait_flag(flag_ptr, value):
-        cur = tl.load(flag_ptr, volatile=True)
-        while cur < value:
-            cur = tl.load(flag_ptr, volatile=True)
+    def _load_acquire_sys(ptr):
+        return tl.inline_asm_elementwise("ld.acquire.sys.global.u32 $0, [$1];", "=r,l",
+                                         [ptr], dtype=tl.int32, is_pure=False, pack=1)
+
+    @triton.jit
+    def _now_ns(ptr):
+        # %globaltimer; the pointer only gives the asm an operand.
+        return tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l,l",
+                                         [ptr], dtype=tl.int64, is_pure=False, pack=1)
+
+    @triton.jit
+    def set_flag(flag_ptr, value):
+        # Queued after the copy on the same stream: the copy has completed.
+        _store_release_sys(flag_ptr, value)
+
+    @triton.jit
+    def wait_flag(flag_ptr, value, err_ptr, timeout_ns, code):
+        start = _now_ns(flag_ptr)
+        cur = _load_acquire_sys(flag_ptr)
+        late = _now_ns(flag_ptr) - start > timeout_ns
+        while (cur < value) & (late == 0):
+            cur = _load_acquire_sys(flag_ptr)
+            late = _now_ns(flag_ptr) - start > timeout_ns
+        if cur < value:
+            tl.atomic_or(err_ptr, code, sem="relaxed")
 
     @triton.jit
     def add(dst_ptr, a_ptr, b_ptr, n, BLOCK: tl.constexpr):
@@ -160,9 +192,11 @@ class DeviceBackend:
 
     ADD_BLOCK = 2048
 
-    def __init__(self, memcpy_async: Callable[[int, int, int, int], None], kernels):
+    def __init__(self, memcpy_async: Callable[[int, int, int, int], None], kernels,
+                 error: torch.Tensor, timeout_ns: int = WAIT_TIMEOUT_NS):
         self._memcpy, (self._set, self._wait, self._add) = memcpy_async, kernels
         self.stream = torch.cuda.current_stream().cuda_stream
+        self._error, self._timeout_ns = error, timeout_ns
 
     def copy(self, dst: int, src: int, nbytes: int) -> None:
         self._memcpy(dst, src, nbytes, self.stream)
@@ -171,7 +205,9 @@ class DeviceBackend:
         self._set[(1,)](_Ptr(ptr, torch.int32), value)
 
     def wait_flag(self, ptr: int, value: int) -> Iterator[None]:
-        self._wait[(1,)](_Ptr(ptr, torch.int32), value)
+        from vllm.sm80.distributed.step_errors import CE_RING_TIMEOUT
+
+        self._wait[(1,)](_Ptr(ptr, torch.int32), value, self._error, self._timeout_ns, CE_RING_TIMEOUT)
         return iter(())
 
     def add(self, dst: int, a: int, b: int, n: int, dtype: torch.dtype) -> None:
@@ -244,7 +280,9 @@ class CeRingAllReduce:
         out = torch.empty_like(t)
         self.epoch += 1
         shard_numel = t.numel() // self.world
-        backend = DeviceBackend(self._memcpy, self._kernels)
+        from vllm.sm80.distributed.step_errors import error_buffer
+
+        backend = DeviceBackend(self._memcpy, self._kernels, error_buffer(t.device))
         for _ in ring_ops(backend, self.world, self.rank, self.epoch, t.data_ptr(), out.data_ptr(),
                           shard_numel * t.element_size(), shard_numel, t.dtype,
                           self.scratch, self.flags, self.slot_bytes):
