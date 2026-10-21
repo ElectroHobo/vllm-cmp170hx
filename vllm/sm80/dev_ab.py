@@ -750,8 +750,14 @@ def _wo_a_methods(runner):
 
 
 def _wo_a_unavailable(runner) -> str | None:
-    if not any(True for _ in _wo_a_methods(runner)):
+    methods = list(_wo_a_methods(runner))
+    if not methods:
         return "the served target/drafter has no grouped DeepSeek-V4.1 wo_a"
+    if any(getattr(m, "gemm", False) for m in methods):
+        # Strided rows change only the per-group Marlin GEMMs, which the
+        # grouped GEMM replaces: the switch would arm and change nothing.
+        return ("a grouped wo_a runs the grouped GEMM "
+                "(VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM=1); strided rows do not apply")
     return None
 
 

@@ -21,7 +21,9 @@ Files:
   hybrid capture boot (the capture records `GroupedLinearMethod.apply_grouped`).
 - `vllm/sm80/envs.py` (flag), `vllm/sm80/dev_ab.py` (switch
   `dsv41_wo_a_grouped_gemm`, not output-identical; boot with
-  `VLLM_DEV_AB_SWITCH` naming it, which keeps both forms of the weight).
+  `VLLM_DEV_AB_SWITCH` naming it, which keeps both forms of the weight);
+  `dsv41_wo_a_strided` refuses a server whose `wo_a` runs the grouped GEMM
+  (strided rows apply to the per-group Marlin GEMMs only).
 GLM and Qwen do not adopt `GroupedLinearMethod`; the shared class is
 unchanged.
 
@@ -37,7 +39,7 @@ order of the FP32 sums (V2/V6). A row's bytes do not depend on the call's
 other rows (each 16-row MMA tile sums K in the same order).
 
 Tests (CPU, `tests/models/deepseek_v41/sm80/test_sm80_wo_a_grouped.py`,
-30 cases, all failing on the previous head): the decode PTX block run by an
+31 cases, all failing on the previous head): the decode PTX block run by an
 emulator of its own instructions over every finite code in every lane,
 exact against the FP64 E4M3/UE8M0 definitions (mutations of a selector,
 shift or bias fail it); the kernel compiled for sm_80 at every row tile
@@ -46,7 +48,8 @@ tiles, one rounding at the store, no ftz, no spills); the launch (one,
 strides of a padded or strided attention output read in place, the output
 the only allocation); the method (codes kept without a copy, no Marlin
 repack, both arms under the dev switch, refusals); the switch default and
-the dev A/B switch. `test_hybrid_checkpoint.py`: the flag and the dev
+the dev A/B switches (the strided one refused beside the grouped GEMM).
+`test_hybrid_checkpoint.py`: the flag and the dev
 switch reach every target and drafter `wo_a` at TP4. GPU,
 `test_sm80_wo_a_grouped_gpu.py` (unrun): against Marlin and FP64 for rows
 1-48, 64 and prefill rows (65-8193), 2 and 4 groups (mean error <= 1.10x,

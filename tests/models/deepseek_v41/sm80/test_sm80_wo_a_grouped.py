@@ -526,3 +526,24 @@ def test_dev_ab_switch_sets_every_grouped_gemm_wo_a(monkeypatch):
         speculator=None,
     )
     assert switch.unavailable(plain)
+
+
+def test_strided_switch_refuses_a_grouped_gemm_wo_a():
+    """The strided-rows switch changes only the per-group Marlin path: with
+    the grouped GEMM serving any wo_a it would arm and change nothing."""
+    from vllm.sm80 import dev_ab
+
+    strided = dev_ab.SWITCHES["dsv41_wo_a_strided"]
+
+    def runner(*methods):
+        return SimpleNamespace(
+            model=nn.ModuleList([_attention(m) for m in methods]), speculator=None
+        )
+
+    marlin = GroupedLinearMethod(object(), 2)
+    both_off = wg.WoAGroupedGemmMethod(object(), 2, gemm=False, keep_groups=True)
+    gemm = wg.WoAGroupedGemmMethod(object(), 2)
+    assert strided.unavailable(runner(marlin)) is None
+    assert strided.unavailable(runner(both_off)) is None
+    for served in (runner(gemm), runner(marlin, gemm)):
+        assert "VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM" in strided.unavailable(served)
