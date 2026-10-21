@@ -53,6 +53,7 @@ def _route_kernel(
     token_ptr,
     weights_ptr,
     ids_ptr,
+    row_live_ptr,
     part_ptr,
     count_ptr,
     num_experts,
@@ -69,6 +70,7 @@ def _route_kernel(
     GSPLIT: gl.constexpr,
     GCOLS: gl.constexpr,
     NW: gl.constexpr,
+    ROW_MASK: gl.constexpr = False,
 ):
     """GSPLIT > 1: row t's logits are the gate's FP64 partials ``gpart[g, t, :]`` ([GSPLIT, gate_rows, GCOLS]) added
     in order g = 0 .. GSPLIT-1 and rounded once to FP32; else the FP32 ``logits`` rows. ``part``: [M, SPLIT, NW, KP]
@@ -159,6 +161,11 @@ def _route_kernel(
         scores = _sqrt_softplus64(dots)
         total = gl.sum(gl.where(keep, scores, 0.0), axis=0)
         weights = scores / (total + eps) * scale
+        if ROW_MASK:
+            # The DSpark verification row mask: a masked row takes no routed expert.
+            live = gl.load(row_live_ptr + t) != 0
+            weights = gl.where(live, weights, 0.0)
+            ids = gl.where(live, ids, -1)
         gl.store(weights_ptr + t * K + lane, weights.to(gl.float32), mask=keep)
         gl.store(ids_ptr + t * K + lane, ids, mask=keep)
         gl.store(count_ptr + t, 0)
@@ -177,15 +184,16 @@ def part_numel(M, split, kp_max):
 
 
 def launch(x, w, bias, bias_vl, input_ids, out_w, out_ids, part, counts, gpart, logits, gate_rows, gsplit, gcols,
-           split, sentinel_lo, sentinel_hi, scale, eps, options):
+           split, sentinel_lo, sentinel_hi, scale, eps, options, row_live=None):
     """Route the M rows of x (one program per row and K slice); see _route_kernel for the buffers. ``options``:
-    compile options of the launch."""
+    compile options of the launch. With ``row_live`` (int8 per row) a row whose entry is 0 gets ids -1 and
+    weights 0."""
     M, hidden = x.shape
     E = w.shape[0]
     k = out_ids.shape[1]
     nch = triton.cdiv(E, 32 * NUM_WARPS)
     _route_kernel[(M, split)](
-        gpart, logits, logits.stride(0), gate_rows, x, x.stride(0), w, bias, bias_vl, input_ids, out_w, out_ids, part,
-        counts, E, sentinel_lo, sentinel_hi, scale, eps, HIDDEN=hidden, K=k, KP=triton.next_power_of_2(k), NCH=nch,
-        NCHP=triton.next_power_of_2(nch), SPLIT=split, GSPLIT=gsplit, GCOLS=gcols, NW=NUM_WARPS, num_warps=NUM_WARPS,
-        **options)
+        gpart, logits, logits.stride(0), gate_rows, x, x.stride(0), w, bias, bias_vl, input_ids, out_w, out_ids,
+        out_ids if row_live is None else row_live, part, counts, E, sentinel_lo, sentinel_hi, scale, eps, HIDDEN=hidden,
+        K=k, KP=triton.next_power_of_2(k), NCH=nch, NCHP=triton.next_power_of_2(nch), SPLIT=split, GSPLIT=gsplit,
+        GCOLS=gcols, NW=NUM_WARPS, ROW_MASK=row_live is not None, num_warps=NUM_WARPS, **options)

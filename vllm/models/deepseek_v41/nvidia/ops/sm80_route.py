@@ -32,6 +32,11 @@ scores at the k-th place is kept. A NaN biased score ranks above every number,
 as in torch.topk (NaNs lowest expert first), so a NaN row keeps in-range
 expert ids and NaN weights instead of selecting past the experts. One program per token; the experts of a
 row fit one block.
+
+With ``row_live`` (the DSpark verification row mask, int8 per row, read in
+place) a row whose entry is 0 gets expert ids -1 and weights +0.0 (no routed
+expert); every other row's outputs are unchanged. Without it the kernel
+never reads the mask.
 """
 
 import os
@@ -90,6 +95,7 @@ def _route_kernel(
     token_ptr,
     weights_ptr,
     ids_ptr,
+    row_live_ptr,
     num_experts,
     sentinel_lo,
     sentinel_hi,
@@ -102,6 +108,7 @@ def _route_kernel(
     HAS_VL: tl.constexpr,
     RENORM: tl.constexpr,
     ACCURATE: tl.constexpr,
+    ROW_MASK: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK_E)
@@ -138,6 +145,11 @@ def _route_kernel(
         total = _torch_row_sum(weights, W, LOG2W) + eps
         weights = tl.math.div_rn(weights, total)
     weights = weights * scale
+    if ROW_MASK:
+        # A masked row takes no routed expert.
+        live = tl.load(row_live_ptr + t) != 0
+        weights = tl.where(live, weights, 0.0)
+        ids = tl.where(live, ids, -1)
     keep = lane < K
     tl.store(weights_ptr + t * K + lane, weights, mask=keep)
     tl.store(ids_ptr + t * K + lane, ids, mask=keep)
@@ -154,12 +166,15 @@ def route_fused(
     sentinel_hi: int = 0,
     renormalize: bool = True,
     routed_scaling_factor: float = 1.0,
+    row_live: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``sm80_moe.route`` with ``gate_temp`` 1 and the image mask of
     ``input_ids`` (``sm80_moe.image_token_mask``: ids in ``[sentinel_lo,
     sentinel_hi)``, none when ``sentinel_lo`` is 0) for FP32 ``logits``
     [tokens, experts]: FP32 weights and int32 expert ids [tokens, top_k].
-    No host synchronisation (graph-safe)."""
+    With ``row_live`` (int8, at least ``tokens`` entries) rows whose entry is
+    0 get ids -1 and weights 0. No host synchronisation (graph-safe; the
+    mask is read when the kernel runs)."""
     assert logits.dtype == torch.float32 and logits.dim() == 2, (logits.dtype, logits.shape)
     assert logits.stride(1) == 1, logits.stride()
     T, E = logits.shape
@@ -174,6 +189,12 @@ def route_fused(
     if has_vl:
         assert input_ids.shape == (T,) and input_ids.is_contiguous(), input_ids.shape
         assert bias_vl.shape == (E,) and bias_vl.is_contiguous(), bias_vl.shape
+    if row_live is not None:
+        assert (
+            row_live.dtype == torch.int8 and row_live.dim() == 1
+            and row_live.is_contiguous() and row_live.numel() >= T
+            and row_live.device == logits.device
+        ), (row_live.dtype, row_live.shape, row_live.device)
     w = 1 << (top_k.bit_length() - 1)
     options = {} if _INTERPRET else {"enable_reflect_ftz": False, "enable_fp_fusion": False}
     _route_kernel[(T,)](
@@ -184,6 +205,7 @@ def route_fused(
         input_ids if has_vl else ids,
         weights,
         ids,
+        ids if row_live is None else row_live,
         E,
         int(sentinel_lo),
         int(sentinel_hi),
@@ -196,6 +218,7 @@ def route_fused(
         HAS_VL=has_vl,
         RENORM=renormalize and top_k > 1,
         ACCURATE=not _INTERPRET,
+        ROW_MASK=row_live is not None,
         num_warps=4,
         **options,
     )

@@ -165,11 +165,19 @@ def route(
     input_ids: torch.Tensor | None,
     top_k: int,
     sentinel_lo: int,
+    row_live: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FP32 weights and int32 expert ids [M, top_k] of the gate call ``p``
     (image tokens: ``input_ids`` in [sentinel_lo, sentinel_lo + 5) select with
-    ``bias_vl``; none when ``sentinel_lo`` is 0)."""
+    ``bias_vl``; none when ``sentinel_lo`` is 0). With ``row_live`` (the DSpark
+    verification row mask: int8, at least M entries, read when the kernel
+    runs) a row whose entry is 0 gets ids -1 and weights +0.0."""
     M, E = p.logits.shape
+    if row_live is not None:
+        assert (
+            row_live.dtype == torch.int8 and row_live.dim() == 1
+            and row_live.is_contiguous() and row_live.numel() >= M
+        ), (row_live.dtype, row_live.shape)
     weights = torch.empty(M, top_k, dtype=torch.float32, device=p.x.device)
     ids = torch.empty(M, top_k, dtype=torch.int32, device=p.x.device)
     if input_ids is None or bias_vl is None or sentinel_lo <= 0:
@@ -183,11 +191,13 @@ def route(
     assert kp <= _KP_MAX, top_k
     if p.exact:
         RG.launch(p.x, weight_bf16, bias, bias_vl, tokens, weights, ids, p.rpart, p.locks, p.gpart, p.logits,
-                  p.gate_rows, p.gsplit, p.gcols, _ROUTE_SPLIT, lo, hi, SCALE, 1e-20, _ROUTE_OPTIONS)
+                  p.gate_rows, p.gsplit, p.gcols, _ROUTE_SPLIT, lo, hi, SCALE, 1e-20, _ROUTE_OPTIONS,
+                  row_live=row_live)
     else:
         R._route_kernel[(M,)](
-            p.logits, p.logits.stride(0), bias, bias_vl, tokens, weights, ids, E, lo, hi, SCALE, 1e-20,
-            K=top_k, KP=kp, BLOCK_E=triton.next_power_of_2(E),
+            p.logits, p.logits.stride(0), bias, bias_vl, tokens, weights, ids,
+            ids if row_live is None else row_live, E, lo, hi, SCALE, 1e-20,
+            K=top_k, KP=kp, BLOCK_E=triton.next_power_of_2(E), ROW_MASK=row_live is not None,
             num_warps=_ROUTE_WARPS_LARGE if M > _LARGE_ROWS else _ROUTE_WARPS, **_ROUTE_OPTIONS)
     return weights, ids
 
@@ -283,6 +293,9 @@ class RouterWarmup(VllmJitKernel["RouterWarmup.Key"]):
         top_k: int
         sentinel_lo: int
         biases: tuple
+        # The router marked for the DSpark verification row mask (its route
+        # launches compile with ROW_MASK).
+        row_mask: bool
         router: object = field(compare=False, hash=False, repr=False)
 
     def get_warmup_keys(self) -> list["RouterWarmup.Key"]:
@@ -303,7 +316,8 @@ class RouterWarmup(VllmJitKernel["RouterWarmup.Key"]):
             experts = weight.shape[0]
             biases = (_tensor_class(router.e_score_correction_bias), _tensor_class(router.bias_vl))
             for rows in warmup_rows(experts, _sms(weight.device)):
-                key = self.Key(rows, experts, router.top_k, router.image_sentinel_lo, biases, router)
+                key = self.Key(rows, experts, router.top_k, router.image_sentinel_lo, biases,
+                               bool(getattr(router, "row_mask", False)), router)
                 keys.setdefault(key, None)
         return list(keys)
 
@@ -313,9 +327,10 @@ class RouterWarmup(VllmJitKernel["RouterWarmup.Key"]):
         dev = w16.device
         x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
         input_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
+        row_live = torch.ones(rows, dtype=torch.int8, device=dev) if compile_key.row_mask else None
         _, pending = gate(x, w16)
         route(pending, w16, router.e_score_correction_bias, router.bias_vl, input_ids,
-              router.top_k, router.image_sentinel_lo)
+              router.top_k, router.image_sentinel_lo, row_live=row_live)
         torch.cuda.synchronize(dev)
 
 

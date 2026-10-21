@@ -36,6 +36,14 @@ the kernel, the FP32 GEMM of the calls the tensor cores do not serve to FP32
 for the call (:meth:`Sm80DeepseekV41Gate._fp32_fallback`). Their logits are
 the bytes of the FP32-held weight's.
 
+With ``VLLM_DSPARK_ROW_MASK`` (the DSpark verification row mask,
+``vllm/sm80/spec_decode/dspark_row_mask.py``) the routers of the target's
+layers (:func:`adopt_row_mask`; never the drafter's) give every row whose
+``row_live`` entry is 0 expert id -1 and weight 0: the EXL3 MoE kernels skip
+such a route on every rank, as they skip a route to another rank's expert,
+so the row takes no routed expert. Every other row's routing is unchanged,
+and the mask is read in place (CUDA graphs see each step's mask).
+
 The experts and the SwiGLU clamp run in the EXL3 MoE kernels
 (vllm/sm80/kernels/exl3/quant.py, ``swiglu_limit``). With
 ``VLLM_DEEPSEEK_V41_MOE_PREFILL_TC`` the experts may take the tensor-core
@@ -67,6 +75,7 @@ from vllm.models.deepseek_v41.nvidia.sm80_attention import (
     prefill_all_reduce,
     round_once_transport,
 )
+from vllm.sm80.spec_decode import dspark_row_mask
 
 logger = init_logger(__name__)
 
@@ -125,6 +134,29 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
     fused_route = False
     # VLLM_DEEPSEEK_V41_ROUTER_MMA: the adopted gate whose pending call this router routes.
     mma_gate = None
+    # VLLM_DSPARK_ROW_MASK: a target layer's router (adopt_row_mask).
+    row_mask = False
+
+    def _row_live(self, tokens: int, *, is_cuda: bool) -> torch.Tensor | None:
+        """The row mask's per-row flags (int8, 0: no routed expert) for a call
+        of ``tokens`` rows, or None when this router does not mask: not a
+        target layer's, or no mask state yet (nothing can have masked a row)."""
+        if not self.row_mask:
+            return None
+        state = dspark_row_mask.get_row_mask_state()
+        if state is None:
+            if is_cuda and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "VLLM_DSPARK_ROW_MASK: create the row mask state before CUDA "
+                    "graph capture (a graph captured without it never masks)"
+                )
+            return None
+        if tokens > state.row_live.numel():
+            raise ValueError(
+                f"VLLM_DSPARK_ROW_MASK: {tokens} rows exceed the row mask's "
+                f"{state.row_live.numel()}"
+            )
+        return state.row_live
 
     def _compute_routing(
         self,
@@ -136,6 +168,7 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if router_logits.dtype != torch.float32:
             raise ValueError("DeepSeek-V4.1 routing needs FP32 router logits")
+        row_live = self._row_live(router_logits.shape[0], is_cuda=router_logits.is_cuda)
         gate = self.mma_gate
         if gate is not None and gate.pending is not None:
             pending, gate.pending = gate.pending, None
@@ -149,6 +182,7 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
                 input_ids,
                 self.top_k,
                 self.image_sentinel_lo,
+                row_live=row_live,
             )
             if indices_type is None or indices_type == torch.int32:
                 return weights, ids
@@ -164,6 +198,7 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
                 sentinel_hi=self.image_sentinel_lo + IMAGE_SENTINEL_IDS,
                 renormalize=self.renormalize,
                 routed_scaling_factor=self.routed_scaling_factor,
+                row_live=row_live,
             )
             if indices_type is None or indices_type == torch.int32:
                 return weights, ids
@@ -178,7 +213,13 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
             routed_scaling_factor=self.routed_scaling_factor,
             gate_temp=self.gate_temp,
         )
-        return weights, ids.to(torch.int32 if indices_type is None else indices_type)
+        ids = ids.to(torch.int32 if indices_type is None else indices_type)
+        if row_live is not None:
+            # In place on this call's own outputs; live rows keep their bytes.
+            masked = (row_live[: ids.shape[0]] == 0).unsqueeze(1)
+            weights.masked_fill_(masked, 0.0)
+            ids.masked_fill_(masked, -1)
+        return weights, ids
 
 
 class Sm80DeepseekV41Gate(GateLinear):
@@ -323,6 +364,25 @@ def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
         "DeepSeek-V4.1 sm_80: MoE gate and routing on the BF16 tensor cores for calls "
         "of 1 to %d rows (VLLM_DEEPSEEK_V41_ROUTER_MMA=1)",
         sm80_router_mma.MAX_ROWS,
+        scope="global",
+    )
+
+
+def adopt_row_mask(layers) -> None:
+    """With ``VLLM_DSPARK_ROW_MASK``, mark the routers of these decoder
+    layers (the target model's, after :func:`adopt_moe`) to apply the
+    verification row mask. The DSpark drafter's layers are never given: its
+    rows are not the target's verify rows."""
+    if not dspark_row_mask.enabled():
+        return
+    for layer in layers:
+        router = layer.ffn.experts.router
+        if type(router) is not Sm80DeepseekV41Router:
+            raise TypeError(f"Unexpected DeepSeek-V4.1 router: {type(router).__name__}")
+        router.row_mask = True
+    logger.info_once(
+        "DeepSeek-V4.1 sm_80: the target's MoE routing gives verify rows the "
+        "DSpark row mask holds masked no routed expert (VLLM_DSPARK_ROW_MASK)",
         scope="global",
     )
 

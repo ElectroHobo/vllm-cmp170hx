@@ -16,7 +16,9 @@
   (:func:`torch_cuda_row_sum`, an independent model of
   ``ATen/native/cuda/Reduce.cuh`` for a short contiguous row), ``+ 1e-20``,
   the divide and the scale; and a sequential sum would not be.
-- The kernel compiles for sm_80 for both routers (no GPU needed).
+- The kernel compiles for sm_80 for both routers, with and without the
+  verification row mask (``row_live``; its behaviour is
+  ``test_row_mask_moe.py``) (no GPU needed).
 - The switch is off by default; ``supports`` refuses what the kernel does
   not serve.
 
@@ -252,15 +254,15 @@ def test_kernel_compiles_for_sm80():
 
     types = {"logits_ptr": "*fp32", "logits_stride": "i64", "bias_ptr": "*fp32",
              "bias_vl_ptr": "*fp32", "token_ptr": "*i32", "weights_ptr": "*fp32",
-             "ids_ptr": "*i32", "num_experts": "i32", "sentinel_lo": "i32",
-             "sentinel_hi": "i32", "scale": "fp32", "eps": "fp32"}
+             "ids_ptr": "*i32", "row_live_ptr": "*i8", "num_experts": "i32",
+             "sentinel_lo": "i32", "sentinel_hi": "i32", "scale": "fp32", "eps": "fp32"}
     kern = sm80_route._route_kernel
     for experts, top_k in ROUTERS:
         w = 1 << (top_k.bit_length() - 1)
-        for has_vl in (True, False):
+        for has_vl, row_mask in ((True, False), (False, False), (True, True)):
             consts = dict(K=top_k, W=w, LOG2W=w.bit_length() - 1,
                           BLOCK_E=triton.next_power_of_2(experts), HAS_VL=has_vl,
-                          RENORM=True, ACCURATE=True)
+                          RENORM=True, ACCURATE=True, ROW_MASK=row_mask)
             sig = {p: types.get(p, "constexpr") for p in kern.arg_names}
             ptx = {}
             for ftz in (False, True):
@@ -277,6 +279,9 @@ def test_kernel_compiles_for_sm80():
             assert "div.full.f32" not in ptx[False] and "sqrt.approx" not in ptx[False]
             assert set(re.findall(r"[a-z0-9.]+\.ftz\.f32", ptx[False])) == {"ex2.approx.ftz.f32"}
             assert "fma.rn.ftz.f32" in ptx[True]
+            # Without the mask the kernel never reads row_live (one byte load).
+            assert ("ld.global.b8" in ptx[False] or "ld.global.u8" in ptx[False]
+                    or "ld.global.s8" in ptx[False]) is row_mask
 
 
 def test_switch_default_and_supports(monkeypatch):

@@ -35,6 +35,7 @@ def _route_kernel(
     token_ptr,
     weights_ptr,
     ids_ptr,
+    row_live_ptr,
     num_experts,
     sentinel_lo,
     sentinel_hi,
@@ -43,6 +44,7 @@ def _route_kernel(
     K: tl.constexpr,
     KP: tl.constexpr,
     BLOCK_E: tl.constexpr,
+    ROW_MASK: tl.constexpr = False,
 ):
     t = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK_E)
@@ -75,5 +77,10 @@ def _route_kernel(
     scores = _sqrt_softplus64(chosen)
     total = tl.sum(tl.where(keep, scores, 0.0), 0)
     weights = scores / (total + eps) * scale
+    if ROW_MASK:
+        # The DSpark verification row mask: a masked row takes no routed expert.
+        live = tl.load(row_live_ptr + t) != 0
+        weights = tl.where(live, weights, 0.0)
+        ids = tl.where(live, ids, -1)
     tl.store(weights_ptr + t * K + lane, weights.to(tl.float32), mask=keep)
     tl.store(ids_ptr + t * K + lane, ids, mask=keep)

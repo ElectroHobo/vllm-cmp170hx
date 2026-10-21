@@ -58,7 +58,7 @@ from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side
 from vllm.sm80 import capture
 from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
 from vllm.models.deepseek_v41.nvidia import sm80_split_reduce
-from vllm.models.deepseek_v41.nvidia.sm80_moe import adopt_moe
+from vllm.models.deepseek_v41.nvidia.sm80_moe import adopt_moe, adopt_row_mask
 from vllm.sm80.kernels.exl3.quant import Exl3HeadLogitsProcessor
 from vllm.sm80.worker import target_argmax
 
@@ -362,6 +362,7 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             )
         model.__class__ = cls
         _adopt_layers(islice(model.layers, model.start_layer, model.end_layer), model.config)
+        adopt_row_mask(islice(model.layers, model.start_layer, model.end_layer))
         if envs.VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER:
             from .sm80_engram_prefetch import adopt_early_engram
 
