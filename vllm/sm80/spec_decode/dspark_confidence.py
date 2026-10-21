@@ -18,7 +18,8 @@ Each ``propose`` call first stages, stream-ordered and without waiting:
   exactly those drafts.
 
 TP rank 0 then appends one JSON line per request found in both batches to
-``<directory>/dspark-confidence.rank<rank>.jsonl``::
+``<directory>/dspark-confidence.<UTC start>-<pid>.rank<rank>.jsonl`` (a new
+file per server start)::
 
     {"step": n, "req": id, "conf": [p_1, ...], "width": drafted positions,
      "verified": drafts the target verified, "accepted": accepted drafts,
@@ -28,10 +29,12 @@ TP rank 0 then appends one JSON line per request found in both batches to
      benchmark windows)}
 
 ``verified`` and ``accepted`` come from ``num_sampled - 1 + num_rejected`` and
-``num_sampled - 1``. Requests with no sampled token this step (partial
-prefill chunks) are skipped. A row is written once its copy event completes,
-so in steady state the host never waits on the device; leftover rows are
-written at interpreter exit.
+``num_sampled - 1``. Rows that verified nothing are skipped: prefill chunks,
+and a step after a zero-draft step, which runs no draft step
+(``draft_context_only``) and so leaves no confidences of its batch. Warm-up
+requests (ids ``_warmup*``, ``_v2_mixed_warmup*``) are skipped. A row is
+written once its copy event completes, so in steady state the host never
+waits on the device; leftover rows are written at interpreter exit.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from __future__ import annotations
 import atexit
 import inspect
 import json
+import os
 import time
 import weakref
 from collections import deque
@@ -57,6 +61,9 @@ logger = init_logger(__name__)
 # Staging slots: a slot is reused only after its copies completed. With one
 # slot per step, 32 covers far more steps than the host runs ahead.
 NUM_SLOTS = 32
+
+# Request ids of the runner's warm-up batches (vllm/v1/worker/gpu/warmup.py).
+WARMUP_PREFIXES = ("_warmup", "_v2_mixed_warmup")
 
 
 @dataclass
@@ -101,7 +108,10 @@ class ConfidenceDump:
     ) -> None:
         self.rank = rank
         self.writes = rank == 0
-        self.path = Path(directory) / f"dspark-confidence.rank{rank}.jsonl"
+        self.path = Path(directory) / (
+            f"dspark-confidence.{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}"
+            f"-{os.getpid()}.rank{rank}.jsonl"
+        )
         self._file = None
         if self.writes:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,9 +154,10 @@ class ConfidenceDump:
             self._write(self._pending.popleft(), wait=True)
         slot = self._slots[slot_idx]
         n_prev, n = len(prev_req_ids), len(req_ids)
-        slot.conf[:n_prev, :prev_width].copy_(
-            confidences[:n_prev, :prev_width], non_blocking=True
-        )
+        # Whole rows of the contiguous (max_num_reqs, max_width) buffer: a
+        # strided device-to-host copy stages through unpinned memory and waits
+        # for the stream. _write reads only the drafted columns.
+        slot.conf[:n_prev].copy_(confidences[:n_prev], non_blocking=True)
         slot.num_sampled[:n].copy_(num_sampled[:n], non_blocking=True)
         slot.num_rejected[:n].copy_(num_rejected[:n], non_blocking=True)
         event = None
@@ -164,6 +175,11 @@ class ConfidenceDump:
         """Record the batch whose confidences the draft step just wrote."""
         self._prev = (list(req_ids), width)
 
+    def drafted_nothing(self) -> None:
+        """The draft step did not run: the confidence buffer holds no row of
+        this batch, so the next step pairs nothing."""
+        self._prev = None
+
     def drain(self, wait: bool) -> None:
         while self._pending:
             head = self._pending[0]
@@ -179,16 +195,18 @@ class ConfidenceDump:
         assert self._file is not None
         for i, rid in enumerate(p.req_ids):
             j = prev_row.get(rid)
-            sampled = int(slot.num_sampled[i])
-            if j is None or sampled <= 0:
+            if j is None or rid.startswith(WARMUP_PREFIXES):
                 continue
-            accepted = sampled - 1
+            accepted = int(slot.num_sampled[i]) - 1
+            verified = accepted + int(slot.num_rejected[i])
+            if accepted < 0 or verified <= 0:
+                continue
             row = {
                 "step": p.step,
                 "req": rid,
                 "conf": [float(x) for x in slot.conf[j, : p.prev_width].tolist()],
                 "width": p.prev_width,
-                "verified": accepted + int(slot.num_rejected[i]),
+                "verified": verified,
                 "accepted": accepted,
                 "batch": len(p.req_ids),
                 "t": p.t,
@@ -255,7 +273,14 @@ class ConfidenceDumpMixin:
             )
         result = super().propose(input_batch, *args, **kwargs)
         if real:
-            dump.drafted(input_batch.req_ids, int(getattr(self, "width", self.max_width)))
+            if arguments.get("num_speculative_tokens") == 0 and (
+                getattr(self, "dp_size", 1) <= 1
+            ):
+                # draft_context_only (zero_draft.py): no draft step ran.
+                dump.drafted_nothing()
+            else:
+                width = int(getattr(self, "width", self.max_width))
+                dump.drafted(input_batch.req_ids, width)
         return result
 
 
