@@ -1,3 +1,68 @@
+# DSpark per-round verification row mask (default off)
+
+`VLLM_DSPARK_ROW_MASK=<dspark-row-mask-costs/1 JSON>` lets each DSpark verify
+step keep, per request, only the drafts its trained confidence head makes
+worth verifying. The rows past them take no routed expert in the target's MoE
+layers, which shrinks the busiest rank's distinct experts, and their drafts
+count as rejected. Empty (the default) changes nothing: no class wrap, no state,
+no extra kernel; the runner hooks return at once.
+
+Pieces, all reading `dspark_row_mask.RowMaskState` (fixed-address buffers):
+
+1. `dspark_row_mask_conf.py`: the drafter computes its confidence head in
+   every draft step and one Triton launch inside the draft graph publishes
+   each request's per-position outputs into `conf_by_slot` at the request's
+   state slot (from `sample_idx_mapping`, which `prepare_dflash_inputs`
+   rewrites before every replay; padding requests write nothing; columns past
+   the drafted width are 0). A zero-draft step (no draft step runs) resets its
+   batch's slots to 1.0, so no later verify reads stale confidences.
+2. `dspark_row_mask_kernel.py`: before the target forward of a uniform
+   speculative decode step (one call in the runner, eager on the forward
+   stream before the graph replay), one Triton launch computes per request
+   `live_len = argmax_k E(k) / cost_r(k)`, with
+   `E(k) = 1 + sum_{i<=k} prod_{j<=i} p_j` and
+   `cost_r(k) = T_b(K) - (T_b(K) - T_b(k)) / b` from the cost table, and
+   writes `row_live` (rows `0..live_len` of each request live). Any other
+   step resets every row to live.
+3. `sm80_moe.py`, `ops/sm80_route.py`: target routers (marked by
+   `adopt_row_mask` in `DeepseekV4Model.adopt`; the drafter's layers are never
+   marked) give masked rows expert id -1 and weight +0.0: inside the fused
+   route kernel (`ROW_MASK` constexpr, no extra launch) or with `masked_fill`
+   on the torch path. The EXL3 MoE kernels skip id -1 at every stage.
+4. `dspark_row_mask_reject.py`: in the runner's `sample`, masked rows are
+   ORed into the rejection sampler's existing `invalid_drafts`, so drafts past
+   `live_len` are verified as -1 (rejected; the token at row `live_len` is the
+   target's). `num_rejected` then excludes them from the drafter's context.
+
+Exactness: a row's routed-expert output in `moe_out`/`moe_out_v2` depends only
+on that row (kernel reading; GPU test listed below), causal attention never
+reads a later row, and the all-reduces are per row, so rows `0..live_len` are
+bit-identical to the unmasked step. With greedy target sampling the emitted
+tokens are the unmasked step's truncated at `min(accepted, live_len)` drafts
+plus the target token at that row. Masked rows' KV and compressor-ring writes
+are positions past the accepted length, handled as for rejected rows. With
+sampled (probabilistic) drafts the cap would bias the verified distribution;
+the served drafter is greedy.
+
+Upstream-owned files: `vllm/v1/worker/gpu/model_runner.py` gets two imports and
+two calls: `begin_target_step(input_batch, dummy_run)` after
+`step_timing.forward_start()` (the mask must be written before the target
+forward) and `cap_drafts(input_batch.logits_indices, invalid_drafts)` before
+rejection sampling (after the forward, so the forward's inputs keep the real
+drafts). Both return immediately with the switch off. Seam rows pin
+`prepare_dflash_inputs` and `RejectionSampler.__call__`.
+
+Tests (CPU): `test_dspark_row_mask_conf.py`, `test_dspark_row_mask_kernel.py`,
+`test_row_mask_moe.py`, `test_dspark_row_mask_reject.py`, the fused-route
+test, seams. GPU, not run: `test_row_mask_moe.py`'s CUDA cases (fused vs torch
+bytes, graph replay reading `row_live` in place, live rows of `moe_out` and
+`moe_out_v2` bit-identical with other rows masked at 6/24/48 rows).
+
+Known limits: the cost table is an estimate until re-fitted from measured
+per-depth step times. `adaptive_k`'s acceptance statistics would count masked
+drafts as rejections. Spec-decode counters show masked drafts as proposed and
+rejected. The pipeline-parallel remote draft tail is not covered (not served).
+
 # Grouped MXFP8 wo_a as one Triton GEMM
 
 Intent: with `VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM=1` the FP8 `wo_a` of a

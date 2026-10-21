@@ -1586,3 +1586,17 @@ seams:
   why: it returns the draft model (confidence head at model.model.confidence_head) and sets use_confidence_head only under adaptive verification; dspark_confidence.py sets it afterwards so the captured draft step computes the head into draft_token_confidence_probs
   sha256: 7284ba4074a78bbb73f700b2fd4378f85358cc4b3bb0355a6ac0423cba4fc502
   signature: '(self, target_model: torch.nn.modules.module.Module, target_attn_layer_names: set[str]) -> torch.nn.modules.module.Module'
+
+- id: dsv41-row-mask-prepare-dflash-inputs
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:prepare_dflash_inputs
+  why: before every draft step (eager or replayed) it writes each real request's state slot into sample_idx_mapping at the request's first sample row and -1 for padding requests; dspark_row_mask_conf.py reads slot_r = sample_idx_mapping[r * width] inside the draft graph to publish confidences per slot
+  sha256: f79194be51fdaf5e9b7f5abccebb02ac6b3c8b24b425afc2dd21ac78ff40b7e5
+  signature: '(input_buffers: vllm.v1.worker.gpu.input_batch.InputBuffers, query_slot_mapping: torch.Tensor, context_positions: torch.Tensor, context_slot_mapping: torch.Tensor, sample_indices: torch.Tensor, sample_pos: torch.Tensor, sample_idx_mapping: torch.Tensor, temperature: torch.Tensor, seeds: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, num_sampled: torch.Tensor, num_rejected: torch.Tensor, last_sampled: torch.Tensor, next_prefill_tokens: torch.Tensor, input_temperature: torch.Tensor, input_seeds: torch.Tensor, block_table: torch.Tensor, block_size: int, cp_rank: int, cp_size: int, cp_interleave: int, parallel_drafting_token_id: int, num_query_per_req: int, num_speculative_steps: int, max_num_reqs: int, max_num_tokens: int, max_model_len: int, sample_from_anchor: bool = False) -> None'
+
+- id: dsv41-row-mask-rejection-invalid-drafts
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.rejection_sampler:RejectionSampler.__call__
+  why: invalid_drafts (one bool per logits row) turns a draft into -1 for verification only; a -1 draft is rejected and the token at its row is the target's (greedy argmax, or a plain target sample), and num_rejected counts it; dspark_row_mask_reject.py ORs the masked rows into it
+  sha256: 421fd2df7bb2e1c990eee3b650a23bc3f4c5cc03da5ae954f2f02897fa5ce551
+  signature: '(self, logits: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, draft_logits: torch.Tensor | None = None, invalid_drafts: torch.Tensor | None = None) -> vllm.v1.worker.gpu.sample.output.SamplerOutput'
