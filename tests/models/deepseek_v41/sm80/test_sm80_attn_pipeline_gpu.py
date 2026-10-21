@@ -119,6 +119,74 @@ def test_full_pipeline_rounding_state_and_selection(rows, ratio, role):
             _within_v2(F.Call(getattr(caches, name), getattr(refcache, name), ideal[name], True))
 
 
+def capture_dummy_inputs(rows, ratio, role, slots_mode, device='cuda'):
+    """``inputs`` with what the runner's graph-capture warm-up passes: every
+    position 0 (input_batch zeros them), all-zero block tables at the
+    capacity width (block_table zeros the dummy table), one token per
+    request, the window holding only the token's own slot, and slot
+    mappings either all padding (-1) or the null block's row 0."""
+    cfg, weights, caches, batch, matrices, x, raw, iw = inputs(rows, ratio, role, device)
+    dev = x.device
+    width = 262144
+    pos = torch.zeros(rows, dtype=torch.int64, device=dev)
+    req = torch.arange(rows, dtype=torch.int32, device=dev)
+    qsl = torch.arange(rows + 1, dtype=torch.int32, device=dev)
+    slot = torch.full((rows,), -1 if slots_mode == 'padding' else 0, dtype=torch.int64, device=dev)
+    wind = torch.full((rows, 128), -1, dtype=torch.int32, device=dev)
+    if slots_mode == 'null':
+        wind[:, 0] = 0
+    table = torch.zeros((max(rows, 1), width // 64), dtype=torch.int32, device=dev)
+    source = cfg.is_kv_source
+    batch = dataclasses.replace(batch, positions=pos, token_to_req=req, query_start_loc=qsl,
+        swa_slots=slot, swa_indices=wind,
+        comp_slots=slot.clone() if ratio and source else None,
+        comp_block_table=table if ratio else None,
+        idxk_slots=slot.clone() if ratio and source else None,
+        idxk_block_table=table if ratio else None,
+        ring_slots=slot.clone() if caches.ring is not None else None,
+        max_seq_len=width)
+    return cfg, weights, caches, batch, x, raw, iw
+
+
+@pytest.mark.parametrize('slots_mode', ['padding', 'null'])
+@pytest.mark.parametrize('rows', [4, 6, 48])
+@pytest.mark.parametrize('ratio,role', [(0, 'shared'), (1, 'source'), (2, 'source'),
+                                        (2, 'consumer'), (2, 'shared')])
+def test_capture_warmup_inputs_eager_then_graph(rows, ratio, role, slots_mode):
+    """The production capture path with the capture warm-up's dummy inputs
+    (zero positions and block tables, capacity width 262144, production
+    scratch shape): the eager warm-up call, then the captured call and its
+    replay. Run under compute-sanitizer memcheck, any out-of-range access in
+    the pipeline kernels (prepare, index scoring, selection, attention) is an
+    error; without the sanitizer the outputs must stay finite and the
+    selections in range."""
+    cfg, weights, caches, batch, x, raw, iw = capture_dummy_inputs(rows, ratio, role, slots_mode)
+    ws = pipe.PipelineWorkspace(48, 262144, 128, 'cuda')
+    out = torch.zeros((rows, 16, 512), dtype=BF16, device='cuda')
+
+    def run():
+        q = core.prepare_layer(cfg, weights, caches, batch, x, raw, iw, pipeline=True, workspace=ws)
+        core.attend_layer(cfg, weights, caches, batch, q, out, pipeline=True, workspace=ws)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    eager = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all()
+    assert F.bits_equal(out, eager)
+    if ratio:
+        width = 262144 // ratio
+        assert bool(((caches.topk >= -1) & (caches.topk < width)).all())
+
+
 def test_graph_eager_repeat_alternating_sizes_and_workspace_ownership():
     from vllm.v1.worker.workspace import WorkspaceManager
 
