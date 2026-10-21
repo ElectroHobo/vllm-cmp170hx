@@ -1,0 +1,213 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""DSpark verification row mask: the per-step decision kernel.
+
+Before the target forward of a uniform speculative decode step (every request
+verifies K > 0 drafts in K + 1 rows, no prefill rows), one Triton program per
+request turns its confidences and the cost table into ``live_len`` and
+``row_live`` (see ``dspark_row_mask``). For request r of a b-request step with
+confidences p_1 .. p_K from ``conf_by_slot[idx_mapping[r]]``, in FP32::
+
+    E(k)      = 1 + sum_{i <= k} prod_{j <= i} p_j
+    cost_r(k) = T_b(K) - (T_b(K) - T_b(k)) / b
+    live_len  = argmax_{k = 0 .. K} E(k) / cost_r(k)     (ties: larger k)
+
+and rows ``r*(K+1) + j`` are live iff ``j <= live_len``. Rows past the step's
+``b*(K+1)`` up to the widest step the state can mask are set live (an earlier
+wider step may have masked them); rows past that are never written.
+
+Any other step leaves every row live (``RowMaskState.reset_live``). The kernel
+runs eagerly on the current stream, after the previous step's draft (which
+wrote ``conf_by_slot`` on the same stream) and before the target forward or
+graph replay that reads ``row_live`` in place. No host synchronisation.
+"""
+
+from __future__ import annotations
+
+import os
+
+import torch
+
+from vllm.sm80.spec_decode.dspark_row_mask import RowMaskState, get_row_mask_state
+from vllm.triton_utils import tl, triton
+
+__all__ = [
+    "MAX_DRAFTS",
+    "begin_step",
+    "begin_target_step",
+    "compute_row_mask",
+    "reference_row_mask",
+    "uniform_num_drafts",
+]
+
+# Drafts per request the kernel serves (its unrolled loop).
+MAX_DRAFTS = 8
+_BLOCK_ROWS = triton.next_power_of_2(MAX_DRAFTS + 1)
+# The Triton interpreter (CPU tests) runs the kernel on CPU tensors and
+# launches without the CUDA compile options.
+_INTERPRET = os.environ.get("TRITON_INTERPRET", "0") == "1"
+
+
+def _mask_span(state: RowMaskState) -> int:
+    """Rows any step can mask: max_num_reqs requests of max_draft + 1 rows."""
+    return min(state.max_num_reqs * (state.max_draft + 1), state.max_num_tokens)
+
+
+@triton.jit(do_not_specialize=["num_reqs", "num_drafts"])
+def _row_mask_kernel(
+    conf_ptr,
+    conf_stride,
+    cost_ptr,
+    cost_stride,
+    idx_ptr,
+    live_len_ptr,
+    row_live_ptr,
+    num_reqs,
+    num_drafts,
+    span,
+    MAX_K: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_TAIL: tl.constexpr,
+):
+    r = tl.program_id(0)
+    rows_per_req = num_drafts + 1
+    if r < num_reqs:
+        slot = tl.load(idx_ptr + r).to(tl.int64)
+        conf_row = conf_ptr + slot * conf_stride
+        cost_row = cost_ptr + num_reqs * cost_stride
+        b = num_reqs.to(tl.float32)
+        t_full = tl.load(cost_row + num_drafts)
+        t_zero = tl.load(cost_row)
+        best = tl.math.div_rn(1.0, t_full - tl.math.div_rn(t_full - t_zero, b))
+        best_k = tl.zeros((), dtype=tl.int32)
+        prod = tl.full((), 1.0, dtype=tl.float32)
+        expected = tl.full((), 1.0, dtype=tl.float32)
+        for k in tl.static_range(1, MAX_K + 1):
+            ok = k <= num_drafts
+            p = tl.load(conf_row + (k - 1), mask=ok, other=1.0)
+            t_k = tl.load(cost_row + k, mask=ok, other=1.0)
+            prod = prod * p
+            expected = expected + prod
+            cost = t_full - tl.math.div_rn(t_full - t_k, b)
+            score = tl.math.div_rn(expected, cost)
+            take = ok & (score >= best)
+            best = tl.where(take, score, best)
+            best_k = tl.where(take, k, best_k)
+        tl.store(live_len_ptr + r, best_k)
+        j = tl.arange(0, BLOCK_ROWS)
+        live = (j <= best_k).to(tl.int8)
+        tl.store(row_live_ptr + r * rows_per_req + j, live, mask=j < rows_per_req)
+    else:
+        # Rows past this step that a wider earlier step may have masked.
+        offs = num_reqs * rows_per_req + tl.arange(0, BLOCK_TAIL)
+        ones = tl.full((BLOCK_TAIL,), 1, dtype=tl.int8)
+        tl.store(row_live_ptr + offs, ones, mask=offs < span)
+
+
+def _check(state: RowMaskState, idx_mapping: torch.Tensor, num_reqs: int, num_drafts: int):
+    assert 0 < num_reqs <= state.max_num_reqs, (num_reqs, state.max_num_reqs)
+    assert 0 < num_drafts <= min(state.max_draft, MAX_DRAFTS), (num_drafts, state.max_draft)
+    assert num_reqs * (num_drafts + 1) <= state.max_num_tokens
+    assert idx_mapping.dim() == 1 and idx_mapping.shape[0] >= num_reqs, idx_mapping.shape
+
+
+def reference_row_mask(
+    state: RowMaskState, idx_mapping: torch.Tensor, num_reqs: int, num_drafts: int
+) -> None:
+    """:func:`compute_row_mask` in torch, the same FP32 operations in the same
+    order (bitwise the kernel's result)."""
+    _check(state, idx_mapping, num_reqs, num_drafts)
+    n, k_full = num_reqs, num_drafts
+    conf = state.conf_by_slot[idx_mapping[:n].long(), :k_full]
+    row = state.cost[n]
+    b = torch.tensor(float(n), dtype=torch.float32, device=row.device)
+    t_full = row[k_full]
+    one = torch.ones(n, dtype=torch.float32, device=row.device)
+    best = torch.div(one, t_full - torch.div(t_full - row[0], b))
+    best_k = torch.zeros(n, dtype=torch.int32, device=row.device)
+    prod = one.clone()
+    expected = one.clone()
+    for k in range(1, k_full + 1):
+        prod = prod * conf[:, k - 1]
+        expected = expected + prod
+        cost = t_full - torch.div(t_full - row[k], b)
+        score = torch.div(expected, cost)
+        take = score >= best
+        best = torch.where(take, score, best)
+        best_k = torch.where(take, torch.full_like(best_k, k), best_k)
+    state.live_len[:n] = best_k
+    j = torch.arange(k_full + 1, device=best_k.device, dtype=torch.int32)
+    end = n * (k_full + 1)
+    state.row_live[:end] = (j[None, :] <= best_k[:, None]).to(torch.int8).reshape(-1)
+    state.row_live[end : _mask_span(state)] = 1
+    state.active = True
+
+
+def compute_row_mask(
+    state: RowMaskState, idx_mapping: torch.Tensor, num_reqs: int, num_drafts: int
+) -> None:
+    """Write ``live_len[:num_reqs]`` and ``row_live`` for a uniform step of
+    ``num_reqs`` requests verifying ``num_drafts`` drafts each; ``idx_mapping``
+    gives each request's state slot (device, batch order). One launch, no
+    host synchronisation; the torch reference on CPU tensors."""
+    if not (state.row_live.is_cuda or _INTERPRET):
+        reference_row_mask(state, idx_mapping, num_reqs, num_drafts)
+        return
+    _check(state, idx_mapping, num_reqs, num_drafts)
+    span = _mask_span(state)
+    options = {} if _INTERPRET else {"enable_fp_fusion": False}
+    _row_mask_kernel[(num_reqs + 1,)](
+        state.conf_by_slot,
+        state.conf_by_slot.stride(0),
+        state.cost,
+        state.cost.stride(0),
+        idx_mapping,
+        state.live_len,
+        state.row_live,
+        num_reqs,
+        num_drafts,
+        span,
+        MAX_K=MAX_DRAFTS,
+        BLOCK_ROWS=_BLOCK_ROWS,
+        BLOCK_TAIL=triton.next_power_of_2(span),
+        num_warps=1,
+        **options,
+    )
+    state.active = True
+
+
+def uniform_num_drafts(state: RowMaskState, input_batch, dummy_run: bool) -> int:
+    """K when the step is a uniform speculative decode the mask serves (every
+    request verifies the same K > 0 drafts in K + 1 rows, no prefill rows,
+    no GPU-side draft reallocation), else 0. Host facts only."""
+    if dummy_run or input_batch.has_prefill or input_batch.max_query_len is not None:
+        # max_query_len is set only when drafts are reallocated on the GPU.
+        return 0
+    drafts = input_batch.num_draft_tokens_per_req
+    num_reqs = input_batch.num_reqs
+    if drafts is None or not 0 < num_reqs <= state.max_num_reqs:
+        return 0
+    k = int(drafts[0])
+    if not 0 < k <= min(state.max_draft, MAX_DRAFTS):
+        return 0
+    if input_batch.num_tokens != num_reqs * (k + 1) or not (drafts[:num_reqs] == k).all():
+        return 0
+    return k
+
+
+def begin_step(state: RowMaskState, input_batch, dummy_run: bool) -> None:
+    """The mask for this step's target forward: computed on a uniform
+    speculative decode step, every row live on any other."""
+    k = uniform_num_drafts(state, input_batch, dummy_run)
+    if k:
+        compute_row_mask(state, input_batch.idx_mapping, input_batch.num_reqs, k)
+    else:
+        state.reset_live()
+
+
+def begin_target_step(input_batch, dummy_run: bool) -> None:
+    """Runner entry, right before the target forward: :func:`begin_step` on
+    the shared state; nothing when the row mask is off."""
+    state = get_row_mask_state()
+    if state is not None:
+        begin_step(state, input_batch, dummy_run)
