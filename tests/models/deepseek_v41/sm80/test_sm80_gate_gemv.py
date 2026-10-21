@@ -356,6 +356,28 @@ def test_switch_default_off_and_adoption(monkeypatch):
         assert gate.gemv is switch
 
 
+def test_hybrid_capture_refuses_the_kernel(monkeypatch):
+    """The hybrid capture records gate calls through GateLinear.forward,
+    which the kernel bypasses, so a capture boot with the flag on refuses."""
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        FusedTopKBiasRouter,
+    )
+    from vllm.models.deepseek_v41.nvidia import sm80_moe
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V41_GATE_GEMV", "1")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", "/nonexistent/capture")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "attn,hybrid")
+    gate = _gate(monkeypatch)
+    gate.e_score_correction_bias = torch.zeros(8)
+    gate.tid2eid = None
+    router = object.__new__(FusedTopKBiasRouter)
+    router.num_fused_shared_experts = 0
+    ffn = SimpleNamespace(use_native_mega_moe=False, gate=gate, scoring_func="sqrtsoftplus",
+                          experts=SimpleNamespace(router=router))
+    with pytest.raises(ValueError, match="hybrid capture"):
+        sm80_moe.adopt_moe(ffn, SimpleNamespace())
+
+
 def test_gate_forward_takes_the_kernel_only_when_on_and_served(monkeypatch):
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
     from vllm.models.deepseek_v41.nvidia import sm80_moe

@@ -221,6 +221,13 @@ def adopt_moe(ffn: nn.Module, config) -> None:
         reason = sm80_gate_gemv.supports(*gate.weight.shape)
         if reason is not None:
             raise ValueError(f"VLLM_DEEPSEEK_V41_GATE_GEMV: {reason}")
+        if envs.VLLM_SM80_CAPTURE_DIR and "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+            # The hybrid capture records the gate through GateLinear.forward,
+            # which the kernel bypasses: its gate and route cases would vanish.
+            raise ValueError(
+                "VLLM_DEEPSEEK_V41_GATE_GEMV: the hybrid capture records the FP32 "
+                "gate GEMM, not this kernel; capture with the flag off"
+            )
         gate.gemv = True
         logger.info_once(
             "DeepSeek-V4.1 sm_80: MoE gate calls of at most %d rows compute the "
