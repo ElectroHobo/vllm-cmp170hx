@@ -178,7 +178,9 @@ class _Family:
         self.block_table_ptrs = tables[1]
         self.block_table_strides = tables[2]
         self.out_ptrs = tables[3:]
-        self.gather_lens = torch.zeros(
+        # Uninitialised, as upstream's per-step tensor: a launch writes the
+        # prefill rows before any metadata exposes them, and nothing else.
+        self.gather_lens = torch.empty(
             first.no_replay_start.shape[0], dtype=torch.int32, device=device
         )
 

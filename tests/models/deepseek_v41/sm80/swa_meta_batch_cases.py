@@ -288,14 +288,24 @@ def snapshot(metadata, builders):
 
 
 class _Ops(TorchDispatchMode):
+    """The torch ops that launch a CUDA compare or fill kernel, counted as
+    the CUDA profiler counts those kernels: a zero-filled allocation is a
+    fill launch on CUDA."""
+
+    FILLS = frozenset(
+        ("fill_", "fill", "zero_", "zeros", "zeros_like", "full", "full_like")
+    )
+
     def __init__(self):
         super().__init__()
         self.counts = Counter()
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         name = func._overloadpacket.__name__
-        if name in ("ge", "fill_"):
-            self.counts[f"aten.{name}"] += 1
+        if name == "ge":
+            self.counts[GE] += 1
+        elif name in self.FILLS:
+            self.counts[FILL] += 1
         return func(*args, **(kwargs or {}))
 
 
