@@ -69,7 +69,10 @@ def mhc_ops(config):
     ``mhc_fused_post_pre_delayed``, ``mhc_post``) the decoder layers call:
     ``ops/sm80_mhc_fused.py`` with ``VLLM_DEEPSEEK_V41_FUSED_MHC``, else the
     reference's torch formulas ``ops/sm80_mhc.py``. The layers look each op
-    up on the module at every call."""
+    up on the module at every call. With ``VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2``
+    the finish v2's gate is decided here, once: open, its kernels are registered
+    for the pre-capture warmup; closed, the switch is cleared and the line
+    says why."""
     if not envs.VLLM_DEEPSEEK_V41_FUSED_MHC:
         return sm80_mhc
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
@@ -84,6 +87,30 @@ def mhc_ops(config):
         else "in torch",
         scope="global",
     )
+    if sm80_mhc_fused.FINISH_V2:
+        why = sm80_mhc_fused.finish_v2_unavailable(
+            config.hc_mult, config.hidden_size, config.hc_sinkhorn_iters
+        )
+        if why is None:
+            from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc_finish_v2 import (
+                FINISH_V2_WARMUP,
+            )
+
+            FINISH_V2_WARMUP.register_warmup()
+            logger.info_once(
+                "DeepSeek-V4.1 sm_80: delayed mHC finish v2 live "
+                "(VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2=1): kernel A with its "
+                "staging reuse, then _delayed_finish_v2_kernel, for 1..2048 rows",
+                scope="global",
+            )
+        else:
+            sm80_mhc_fused.FINISH_V2 = False
+            logger.info_once(
+                "DeepSeek-V4.1 sm_80: VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2 is set "
+                "but its gate is closed (%s); the finish v2 does not run",
+                why,
+                scope="global",
+            )
     return sm80_mhc_fused
 
 

@@ -362,6 +362,40 @@ def test_mhc_finish_requires_fused_parent_and_changes_latched_dispatch(monkeypat
         assert layer._mhc_ops is sm80_mhc_fused
 
 
+def test_mhc_finish_v2_requires_the_finish_kernel_and_warms_its_arm(monkeypatch, state):
+    import torch
+
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc, sm80_mhc_fused
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_finish_v2 as finish_v2
+
+    warmed = []
+    monkeypatch.setattr(finish_v2.FINISH_V2_WARMUP, "warmup",
+                        lambda **kw: warmed.append(kw["vllm_config"]))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
+    layer = NS(_mhc_ops=sm80_mhc, hc_mult=4, hidden_size=5120, hc_sinkhorn_iters=20)
+    config = object()
+    runner = NS(model=NS(modules=lambda: [layer]), vllm_config=config)
+    switch = ab.SWITCHES["dsv41_fused_mhc_finish_v2"]
+    assert switch.graph_bound and not switch.output_identical
+    assert switch.env == "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2"
+    assert "boot with" in switch.unavailable(runner)
+    layer._mhc_ops = sm80_mhc_fused
+    monkeypatch.setattr(sm80_mhc_fused, "FINISH_KERNEL", False)
+    assert "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH=1" in switch.unavailable(runner)
+    monkeypatch.setattr(sm80_mhc_fused, "FINISH_KERNEL", True)
+    monkeypatch.setattr(sm80_mhc_fused, "FINISH_V2", False)
+    monkeypatch.setenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2", "0")
+    assert switch.unavailable(runner) is None and switch.current(runner) is False
+    switch.apply(runner, True)
+    assert switch.current(runner) is True and warmed == [config]
+    assert ab.os.environ["VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2"] == "1"
+    switch.apply(runner, False)
+    assert switch.current(runner) is False and warmed == [config]
+    assert layer._mhc_ops is sm80_mhc_fused
+    layer.hidden_size = 4096
+    assert "hidden size 4096" in switch.unavailable(runner)
+
+
 def test_dense_prefill_requires_boot_warmup_and_preserves_route_configuration(monkeypatch, state):
     from vllm.sm80.kernels.exl3 import dense_prefill_tc as dense, ops
 

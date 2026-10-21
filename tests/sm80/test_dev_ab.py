@@ -174,6 +174,7 @@ def test_allowlist():
         "exl3_dense_prefill_tc",
         "dsv41_fused_mhc",
         "dsv41_fused_mhc_finish",
+        "dsv41_fused_mhc_finish_v2",
         "dsv41_fused_route",
         "dsv41_draft_prologue_fused",
         "dsv41_gate_gemv",

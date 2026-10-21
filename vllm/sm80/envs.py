@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
     VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
@@ -967,6 +968,16 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Default OFF. Read in vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
     "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: the finish v2 in its validated
+    # configuration (hidden 5120, 20 Sinkhorn iterations, 1..2048 rows, with the
+    # norm, sm_80): kernel A with its staging reuse from 17 rows, then the Gluon finish
+    # (ops/sm80_mhc_finish_v2.py: FP64 reciprocals by MUFU approximation and
+    # Newton steps, one-pass collapse) instead of the Triton finish kernel.
+    # Order-changing. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
+    "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the MoE routing after the FP32 gate GEMM
     # (sqrt-softplus, bias select and add, top-k, gather, renormalisation,

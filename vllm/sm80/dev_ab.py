@@ -652,6 +652,38 @@ def _mhc_finish_apply(runner, on: bool) -> None:
     sm80_mhc_fused.FINISH_KERNEL = on
 
 
+def _mhc_finish_v2_unavailable(runner) -> str | None:
+    reason = _mhc_finish_unavailable(runner)
+    if reason is not None:
+        return reason
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
+
+    for layer, _, _ in _STATE.saved["dsv41_mhc"]:
+        reason = sm80_mhc_fused.finish_v2_unavailable(
+            layer.hc_mult, layer.hidden_size, layer.hc_sinkhorn_iters
+        )
+        if reason is not None:
+            return reason
+    return None
+
+
+def _mhc_finish_v2_current(runner) -> bool:
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
+
+    return sm80_mhc_fused.FINISH_V2
+
+
+def _mhc_finish_v2_apply(runner, on: bool) -> None:
+    """The on arm compiles its kernels here, before its graphs are captured."""
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused
+    from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc_finish_v2 import FINISH_V2_WARMUP
+
+    _set_env("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2", on)
+    sm80_mhc_fused.FINISH_V2 = on
+    if on:
+        FINISH_V2_WARMUP.warmup(vllm_config=runner.vllm_config)
+
+
 def _route_routers(runner):
     from vllm.models.deepseek_v41.nvidia.sm80_moe import Sm80DeepseekV41Router
 
@@ -885,6 +917,10 @@ SWITCHES: dict[str, Switch] = {
         Switch(
             "dsv41_fused_mhc_finish", "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", True, False,
             _mhc_finish_unavailable, _mhc_finish_current, _mhc_finish_apply,
+        ),
+        Switch(
+            "dsv41_fused_mhc_finish_v2", "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2", True, False,
+            _mhc_finish_v2_unavailable, _mhc_finish_v2_current, _mhc_finish_v2_apply,
         ),
         Switch(
             "dsv41_fused_route", "VLLM_DEEPSEEK_V41_FUSED_ROUTE", True, True,

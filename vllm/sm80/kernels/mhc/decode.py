@@ -140,7 +140,7 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
                              M, HIDDEN: gl.constexpr, NOUT: gl.constexpr, HB: gl.constexpr,
                              BM: gl.constexpr, NP2: gl.constexpr, NW: gl.constexpr,
                              HAS_POST: gl.constexpr, ROUND_MIX: gl.constexpr,
-                             FP64_ACC: gl.constexpr = False):
+                             FP64_ACC: gl.constexpr = False, HS_REUSE: gl.constexpr = False):
     """Kernel A for hc == 4: residual_cur + prenorm GEMM partials on the tensor cores.
 
     grid (cdiv(M, BM), HIDDEN // HB).  CTA (pm, ks) owns tokens [pm*BM, pm*BM+BM)
@@ -289,16 +289,24 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
         acc_b = gl.zeros([BM, NP2], gl.float32, layout=MMA)
     acc_t = gl.zeros([BM, NP2], gl.float32, layout=MMA)
     z = gl.zeros([BM, NP2], gl.float32, layout=MMA)
-    # operand A split hi/lo once here (4 elements per thread) - see the docstring
+    # operand A split hi/lo once here (4 elements per thread) - see the docstring.
+    # HS_REUSE (more than one row block): two hi/lo buffer pairs, each reused
+    # once - stream 2 goes into stream 0's pair and stream 3 into stream 1's
+    # after the barrier that ends the pair's mma. Shared memory 32 -> 24 KB per
+    # CTA, so 5+ CTAs fit an SM (M = 32's 320 CTAs in one wave instead of 4 + a
+    # straggler); in one row block the late stores only lengthen the chain. The
+    # products and their order are the same either way; without HS_REUSE the
+    # statements are the original ones, in their order.
     SA: gl.constexpr = gl.SwizzledSharedLayout(4, 1, 8, [1, 0])
     hs0 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
     hs1 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
     hs2 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
     hs3 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
-    hs4 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
-    hs5 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
-    hs6 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
-    hs7 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
+    if not HS_REUSE:
+        hs4 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
+        hs5 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
+        hs6 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
+        hs7 = gl.allocate_shared_memory(gl.float32, [BM, HB], SA)
     h0 = _tf32_hi(n0)
     h1 = _tf32_hi(n1)
     h2 = _tf32_hi(n2)
@@ -307,22 +315,40 @@ def _glu_post_prenorm_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, fn_ptr, rc_ptr,
     hs1.store(n0 - h0)
     hs2.store(h1)
     hs3.store(n1 - h1)
-    hs4.store(h2)
-    hs5.store(n2 - h2)
-    hs6.store(h3)
-    hs7.store(n3 - h3)
-    async_copy.wait_group(3)
-    gl.barrier()
-    acc_s, acc_t, acc_b = _mma3_smem(hs0, hs1, s0, acc_s, acc_t, acc_b, z, LA, LB, HB)
-    async_copy.wait_group(2)
-    gl.barrier()
-    acc_s, acc_t, acc_b = _mma3_smem(hs2, hs3, s1, acc_s, acc_t, acc_b, z, LA, LB, HB)
-    async_copy.wait_group(1)
-    gl.barrier()
-    acc_s, acc_t, acc_b = _mma3_smem(hs4, hs5, s2, acc_s, acc_t, acc_b, z, LA, LB, HB)
-    async_copy.wait_group(0)
-    gl.barrier()
-    acc_s, acc_t, acc_b = _mma3_smem(hs6, hs7, s3, acc_s, acc_t, acc_b, z, LA, LB, HB)
+    if HS_REUSE:
+        async_copy.wait_group(3)
+        gl.barrier()
+        acc_s, acc_t, acc_b = _mma3_smem(hs0, hs1, s0, acc_s, acc_t, acc_b, z, LA, LB, HB)
+        async_copy.wait_group(2)
+        gl.barrier()
+        hs0.store(h2)
+        hs1.store(n2 - h2)
+        acc_s, acc_t, acc_b = _mma3_smem(hs2, hs3, s1, acc_s, acc_t, acc_b, z, LA, LB, HB)
+        async_copy.wait_group(1)
+        gl.barrier()
+        hs2.store(h3)
+        hs3.store(n3 - h3)
+        acc_s, acc_t, acc_b = _mma3_smem(hs0, hs1, s2, acc_s, acc_t, acc_b, z, LA, LB, HB)
+        async_copy.wait_group(0)
+        gl.barrier()
+        acc_s, acc_t, acc_b = _mma3_smem(hs2, hs3, s3, acc_s, acc_t, acc_b, z, LA, LB, HB)
+    else:
+        hs4.store(h2)
+        hs5.store(n2 - h2)
+        hs6.store(h3)
+        hs7.store(n3 - h3)
+        async_copy.wait_group(3)
+        gl.barrier()
+        acc_s, acc_t, acc_b = _mma3_smem(hs0, hs1, s0, acc_s, acc_t, acc_b, z, LA, LB, HB)
+        async_copy.wait_group(2)
+        gl.barrier()
+        acc_s, acc_t, acc_b = _mma3_smem(hs2, hs3, s1, acc_s, acc_t, acc_b, z, LA, LB, HB)
+        async_copy.wait_group(1)
+        gl.barrier()
+        acc_s, acc_t, acc_b = _mma3_smem(hs4, hs5, s2, acc_s, acc_t, acc_b, z, LA, LB, HB)
+        async_copy.wait_group(0)
+        gl.barrier()
+        acc_s, acc_t, acc_b = _mma3_smem(hs6, hs7, s3, acc_s, acc_t, acc_b, z, LA, LB, HB)
     if FP64_ACC:
         acc = (acc_b + (acc_s + acc_t).to(gl.float64)).to(gl.float32)
     else:
@@ -790,13 +816,13 @@ BM_A = 16           # bf16/tf32 mma is m16n8k16: 16 rows is the minimum unit
 
 
 def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_mix=False,
-                 fp64_acc=False):
+                 fp64_acc=False, hs_reuse=False):
     """Kernel A alone: ``rc`` [M, 4, H] bf16, the prenorm GEMM partials ``mix``
     [H / HB_GLU, M, 24] and the squared-sum partials ``sqr`` [H / HB_GLU, M].
 
     ``x`` [M, H] bf16, ``res`` [M, 4, H] bf16, ``post`` [M, 4] and ``comb``
     [M, 4, 4] fp32, ``fn`` [24, 4 * H] fp32, all contiguous; H a multiple of
-    HB_GLU. Three compile-time options, all off for GLM-5.3-Flash (whose
+    HB_GLU. Four compile-time options, all off for GLM-5.3-Flash (whose
     kernels are then the ones measured above, unchanged):
       * ``has_post=False``: no post step; the streams are ``res`` itself (the
         delayed ``pre``-only call). ``x``, ``post`` and ``comb`` are not used,
@@ -812,6 +838,10 @@ def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_m
         split are unchanged. At DeepSeek-V4.1's 4 x 5120 streams the FP32
         accumulation was kernel A's largest error source in the
         coefficients (CPU emulation: pre max error 1.3e-7 -> 7e-8).
+      * ``hs_reuse=True``: from 17 rows (more than one 16-row block of
+        `_glu_post_prenorm_kernel`) the hi/lo staging of operand A reuses two
+        shared-memory buffer pairs (24 KB per CTA instead of 32, one wave at
+        32 rows). The same products in the same order: the same bits.
     """
     M, hidden = res.shape[0], res.shape[-1]
     nout = fn.shape[0]
@@ -828,7 +858,8 @@ def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_m
             x, res, post, comb, fn, rc, mix, sqr, M,
             HIDDEN=hidden, NOUT=nout, HB=HB_GLU, BM=BM_A,
             NP2=triton.next_power_of_2(nout), NW=WARPS_GLU, HAS_POST=has_post,
-            ROUND_MIX=round_mix, FP64_ACC=fp64_acc, num_warps=WARPS_GLU)
+            ROUND_MIX=round_mix, FP64_ACC=fp64_acc,
+            HS_REUSE=hs_reuse and triton.cdiv(M, BM_A) > 1, num_warps=WARPS_GLU)
 
 
 def mhc_fused_post_pre(

@@ -103,6 +103,13 @@ unless named in full.
   element moves the coefficients by more than their FP32 arithmetic does).
   Row invariance holds within a kernel variant (up to 8 rows and from 9
   rows, the two kernel A forms reduce in different orders).
+- ``mhc_finish_consumer``: a byte-linked pair of captured ``mhc_delayed``
+  calls of one layer and step (``export_mhc_consumer_cases.py``), the
+  attention boundary's outputs carried into the FFN boundary -> the pair
+  through the finish v2 / through the served finish kernel / FP64
+  (``mhc_consumer_cases.py``). The case names one of the consumer call's
+  outputs as for ``mhc_delayed``; the ``.rp`` forms at each chain's own
+  rounding points.
 - ``attn_prologue``: ``sm80_attn_fused:prologue`` (qr_kv, q_norm, kv_norm,
   positions, freqs, swa_cache, swa_slots, eps) -> the fused prologue
   (``sm80_attn_fused``; the reference path on CPU) / ``sm80_attn_core``'s
@@ -946,7 +953,7 @@ def attn_attend(a: dict, device: torch.device, _src: Source) -> Call:
 
 # Families with several outputs: the case names the one it judges.
 MULTI_OUTPUT = {"mhc_delayed", "mhc_pre_delayed", "attn_prologue", "attn_pipeline",
-                "hybrid_linear_consumer"}
+                "hybrid_linear_consumer", "mhc_finish_consumer"}
 
 
 def index_select(a, device, src):
@@ -976,6 +983,12 @@ def hybrid_linear_consumer(a, device, src):
     return run(a, device, src)
 
 
+def mhc_finish_consumer(a, device, src):
+    from tests.models.deepseek_v41.sm80.mhc_consumer_cases import mhc_finish_consumer as run
+
+    return run(a, device, src)
+
+
 FAMILIES = {
     "hybrid_linear": hybrid_linear,
     "hybrid_linear_consumer": hybrid_linear_consumer,
@@ -992,6 +1005,7 @@ FAMILIES = {
     },
     "mhc_delayed": mhc_delayed,
     "mhc_pre_delayed": mhc_pre_delayed,
+    "mhc_finish_consumer": mhc_finish_consumer,
     "attn_prologue": attn_prologue,
     "attn_attend": attn_attend,
     "index_select": index_select,
@@ -1045,6 +1059,10 @@ POINTS = {
     "mhc_delayed": (f"{_MHC}:mhc_fused_post_pre_delayed",
                     ["x", "residual", "post_layer_mix", "comb_res_mix", *_MHC_ARGS]),
     "mhc_pre_delayed": (f"{_MHC}:mhc_pre_delayed", ["residual", *_MHC_ARGS]),
+    # the consumer call of the linked pair (its producer is the same point)
+    "mhc_finish_consumer": (f"{_MHC}:mhc_fused_post_pre_delayed",
+                            ["x", "residual", "post_layer_mix", "comb_res_mix",
+                             *_MHC_ARGS]),
     "attn_prologue": (f"{_FUSED}:prologue",
                       ["qr_kv", "q_norm", "kv_norm", "positions", "freqs", "swa_cache",
                        "swa_slots", "eps"]),

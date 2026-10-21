@@ -49,6 +49,13 @@ finish, in Triton:
   the RMSNorm in FP32 as torch does, its statistic from that BF16 value and
   ``weight * x`` rounded to BF16. The two CTAs share nothing.
 
+With ``VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2`` (and the finish kernel
+selected) a call inside the validated configuration (hidden 5120, 20
+Sinkhorn iterations, up to 2048 rows, with the norm, sm_80; :func:`finish_v2_unavailable`
+at model construction) runs kernel A with its staging reuse and the Gluon
+finish of ``ops/sm80_mhc_finish_v2.py`` instead of ``_delayed_finish_kernel``;
+every other call runs the kernels above unchanged.
+
 The rounding points are the reference's; the arithmetic differs from the
 torch path in summation order, in the projection (split-K tensor core
 passes against cuBLAS SGEMM) and in the FP64 coefficients, and is held to
@@ -65,6 +72,7 @@ from triton.language.extra import libdevice
 
 import vllm.envs as envs
 from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
+from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_finish_v2 as finish_v2
 from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
 from vllm.sm80.kernels.mhc.decode import HB_GLU, post_prenorm
 from vllm.triton_utils import tl, triton
@@ -76,6 +84,10 @@ NOUT = (2 + HC) * HC
 # Kernel B for the finish (VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH), read once per
 # process; the tests set it directly.
 FINISH_KERNEL = bool(envs.VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH)
+# The finish v2 (VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2), read once per process;
+# cleared by ``mhc_ops`` when finish_v2_unavailable gives a reason; the tests
+# set it directly.
+FINISH_V2 = bool(envs.VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2)
 # Hidden chunk of the collapse CTA (two passes over the streams: the norm's
 # statistic, then the scaled output).
 _BH = 1024
@@ -90,6 +102,22 @@ def supports(hc_mult: int, hidden_size: int) -> str | None:
         return f"hc_mult {hc_mult}, not {HC}"
     if hidden_size <= 0 or hidden_size % HB_GLU:
         return f"hidden size {hidden_size} is not a multiple of {HB_GLU}"
+    return None
+
+
+def finish_v2_unavailable(hc_mult: int, hidden_size: int, sinkhorn_repeat: int) -> str | None:
+    """None when the finish v2 can serve the model's delayed mHC on this
+    device, else why not: it replaces the finish kernel in the configuration
+    it was validated for, on sm_80."""
+    if not FINISH_KERNEL:
+        return "it replaces the finish kernel: VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH=1 is required"
+    reason = supports(hc_mult, hidden_size) or finish_v2.gate_closed(
+        hidden_size, sinkhorn_repeat, 1
+    )
+    if reason is not None:
+        return reason
+    if torch.cuda.get_device_capability() != (8, 0):
+        return "validated on sm_80 only"
     return None
 
 
@@ -333,12 +361,21 @@ def _delayed(
     sqr = torch.empty(ksb, T, dtype=torch.float32, device=dev)
     rc = torch.empty_like(res)
     fnc = fn.contiguous()
+    # the finish v2: only inside its validated configuration, which includes
+    # the finish kernel being selected and the norm (every decoder layer call
+    # has one)
+    v2 = (
+        FINISH_V2
+        and FINISH_KERNEL
+        and norm_weight is not None
+        and finish_v2.gate_closed(hidden, sinkhorn_repeat, T) is None
+    )
     if x is None:
         # pre only: the kernel reads the streams themselves; x, post and comb
         # are placeholders of sufficient size (not used)
         post_prenorm(
             res, res, mix, mix, fnc, rc, mix, sqr, has_post=False, round_mix=True,
-            fp64_acc=True,
+            fp64_acc=True, hs_reuse=v2,
         )
         streams = res
     else:
@@ -356,6 +393,7 @@ def _delayed(
             sqr,
             round_mix=True,
             fp64_acc=True,
+            hs_reuse=v2,
         )
         streams = rc
     if not FINISH_KERNEL:
@@ -382,6 +420,28 @@ def _delayed(
     else:
         pre_in = next_pre  # not read
     nw = layer_input if norm_weight is None else norm_weight.contiguous()
+    if v2:
+        finish_v2.delayed_finish_v2(
+            mix,
+            sqr,
+            hc_scale.contiguous(),
+            hc_base.contiguous(),
+            rc,
+            pre_in,
+            nw,
+            post,
+            comb,
+            next_pre,
+            layer_input,
+            rms_eps,
+            hc_pre_eps,
+            hc_post_mult_value,
+            norm_eps,
+            sinkhorn_repeat,
+            has_pre_in=pre_mix is not None,
+            has_norm=norm_weight is not None,
+        )
+        return streams, post, comb, layer_input, next_pre
     _delayed_finish_kernel[(T, 2)](
         mix,
         sqr,

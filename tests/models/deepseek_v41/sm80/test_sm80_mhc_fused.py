@@ -100,10 +100,11 @@ def variants(T: int, hidden: int, seed: int = 0) -> dict:
 
 
 def _stand_in_kernel_a(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True,
-                       round_mix=False, fp64_acc=False):
+                       round_mix=False, fp64_acc=False, hs_reuse=False):
     """kernel A's contract in torch: the streams (stored BF16), FP32 partial
     projections and squared sums over 32-wide hidden slices of the streams
-    as stored (``round_mix``; the only mode this model uses)."""
+    as stored (``round_mix``; the only mode this model uses). ``hs_reuse``
+    changes only kernel A's shared-memory staging, not its results."""
     assert round_mix and fp64_acc  # this model's options
     T, hc, hidden = res.shape
     streams = sm80_mhc.mhc_post(x, res, post, comb) if has_post else res

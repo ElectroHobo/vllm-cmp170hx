@@ -147,8 +147,8 @@ The hidden-5120 shape of `moe_out_v2` follows Curtis White's Apache-2.0 port of 
 worker captures both implementations before serving and switches only while
 requests are drained. Available DeepSeek selectors are
 `dsv41_fused_attn_decode`, `dsv41_attn_pipeline`, `dsv41_moe_prefill_tc`,
-`dsv41_fused_mhc`, `dsv41_fused_mhc_finish`, `exl3_moe_v2`,
-`exl3_dense_splitk`, and `exl3_dense_prefill_tc`. The mHC selectors change the loaded decoder operation
+`dsv41_fused_mhc`, `dsv41_fused_mhc_finish`, `dsv41_fused_mhc_finish_v2`,
+`exl3_moe_v2`, `exl3_dense_splitk`, and `exl3_dense_prefill_tc`. The mHC selectors change the loaded decoder operation
 module or its cached finish dispatch; capture wrappers retain their ownership.
 The dense-prefill selector changes the cached dispatcher, not its decode bound,
 workspace, hardware gate, or schedule.
@@ -156,6 +156,8 @@ workspace, hardware gate, or schedule.
 MoE V2, MoE-prefill and dense-prefill selection require their feature enabled at
 construction so that the existing workspace and warmup have completed.
 Selecting the fused mHC finish requires fused mHC enabled at construction.
+Selecting the mHC finish v2 also requires the fused mHC finish enabled at
+construction; switching it on compiles its kernels before its graphs are captured.
 Attention pipeline selection reserves both implementations' scratch before
 profiling. None of these selectors changes the speculative-width policy,
 graph-size ladder, checkpoint, or loaded expert placement.
