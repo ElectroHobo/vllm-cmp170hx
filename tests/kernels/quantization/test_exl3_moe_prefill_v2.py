@@ -423,7 +423,10 @@ def test_apply_dispatches_by_rows_and_scheduler_phase(
 def test_workspace_contract():
     assert exl3_ops.MOE_PREFILL_V2_MAX_ROWS == MAX_ROWS
     assert exl3_ops.MOE_PREFILL_V2_CONFIGS == {
-        (HIDDEN, INTERMEDIATE, TOPK, LOCAL, 384): (6, 4)
+        (HIDDEN, INTERMEDIATE, TOPK, LOCAL, 384): (6, 4),
+        # Tensor-parallel routed experts (test_exl3_moe_tp_shapes.py).
+        (HIDDEN, 640, TOPK, 384, 384): (6, 4),
+        (HIDDEN, 512, TOPK, 384, 384): (6, 4),
     }
     _extension_or_skip()
     size = torch.ops._exl3_C.moe_workspace_size_prefill_v2

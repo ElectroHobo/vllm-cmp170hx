@@ -2,7 +2,10 @@
 // served shapes (LaneTiling below), every expert matrix of a layer stored with
 // one bit width and the mul1 codebook:
 //   - hidden 2560, intermediate 640, bits_x2 10;
-//   - hidden 5120, intermediate 2304, bits_x2 6 or 4.
+//   - hidden 5120, intermediate 2304, bits_x2 6 or 4;
+//   - hidden 5120, intermediate 640 or 512, bits_x2 6 or 4: tensor-parallel
+//     routed experts, each rank holding a 640- or 512-column chunk of every
+//     expert's 2304-column intermediate.
 // The caller (vllm/sm80/kernels/exl3/quant.py) takes this operator only for
 // the configurations ops.moe_v2_closed_reason opens and at most 64 rows; every
 // other call stays on moe_out (moe.cu), which this file does not change.
@@ -1264,6 +1267,41 @@ struct LaneTiling<5120, 2304> {
   static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
 };
 
+// Hidden 5120, intermediate 640 (tensor-parallel routed experts: every expert
+// local, this rank's 640-column chunk of the 2304 intermediate): gate/up as
+// for intermediate 2304 (16 slices of 20 steps), down 2 slices of 20. One
+// slice layout for every call of up to 64 rows.
+template <>
+struct LaneTiling<5120, 640> {
+  using Bits = std::integer_sequence<int, 6, 4>;
+  static constexpr int kColumnTiles = 4;
+  static constexpr int kGateUpShortScaleK = 5120;
+  static constexpr int kGateUpShortSliceTiles = 20;
+  static constexpr int kGateUpLongScaleK = kGateUpShortScaleK;
+  static constexpr int kGateUpLongSliceTiles = kGateUpShortSliceTiles;
+  static constexpr int kDownShortSliceTiles = 20;
+  static constexpr int kDownLongSliceTiles = kDownShortSliceTiles;
+  static constexpr int64_t kLongSliceAssignments = std::numeric_limits<int64_t>::max();
+  static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
+};
+
+// Hidden 5120, intermediate 512 (tensor-parallel routed experts, this rank's
+// 512-column chunk): gate/up 16 slices of 20 steps, down 2 slices of 16. One
+// slice layout for every call of up to 64 rows.
+template <>
+struct LaneTiling<5120, 512> {
+  using Bits = std::integer_sequence<int, 6, 4>;
+  static constexpr int kColumnTiles = 4;
+  static constexpr int kGateUpShortScaleK = 5120;
+  static constexpr int kGateUpShortSliceTiles = 20;
+  static constexpr int kGateUpLongScaleK = kGateUpShortScaleK;
+  static constexpr int kGateUpLongSliceTiles = kGateUpShortSliceTiles;
+  static constexpr int kDownShortSliceTiles = 16;
+  static constexpr int kDownLongSliceTiles = kDownShortSliceTiles;
+  static constexpr int64_t kLongSliceAssignments = std::numeric_limits<int64_t>::max();
+  static constexpr int64_t kLongDownAssignments = std::numeric_limits<int64_t>::max();
+};
+
 template <int64_t kH, int64_t kI>
 struct LaneShape : LaneTiling<kH, kI> {
   using Tiling = LaneTiling<kH, kI>;
@@ -1300,7 +1338,7 @@ struct LaneShape : LaneTiling<kH, kI> {
 
 constexpr const char* kShapeMessage =
     "EXL3 MoE v2 supports padded hidden 2560 with intermediate 640 and padded hidden 5120 "
-    "with intermediate 2304 only";
+    "with intermediate 2304, 640 or 512 only";
 
 // f(LaneShape<hpad, ipad>{}) for a served shape; false for any other.
 template <class F>
@@ -1311,6 +1349,14 @@ bool with_shape(int64_t hpad, int64_t ipad, F&& f) {
   }
   if (hpad == 5120 && ipad == 2304) {
     f(LaneShape<5120, 2304>{});
+    return true;
+  }
+  if (hpad == 5120 && ipad == 640) {
+    f(LaneShape<5120, 640>{});
+    return true;
+  }
+  if (hpad == 5120 && ipad == 512) {
+    f(LaneShape<5120, 512>{});
     return true;
   }
   return false;

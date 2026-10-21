@@ -204,7 +204,7 @@ def test_workspace_contract():
     v1 = torch.ops._exl3_C.moe_workspace_size(2048, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
     assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) < v1
     with pytest.raises(RuntimeError, match="hidden 5120 with intermediate 2304"):
-        size(1, HIDDEN, 640, TOPK, LOCAL)
+        size(1, HIDDEN, 768, TOPK, LOCAL)
     with pytest.raises(RuntimeError, match="1024 routed assignments"):
         size(171, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
 

@@ -38,6 +38,10 @@ MOE_V2_CONFIGS = {
     (2560, 640, 10, 256, 512): (10,),
     # Whole experts, a quarter of them local (expert parallel size 4).
     (5120, 2304, 6, 96, 384): (6, 4),
+    # Tensor-parallel routed experts: every expert local, each rank a 640- or
+    # 512-column chunk of the 2304-column intermediate.
+    (5120, 640, 6, 384, 384): (6, 4),
+    (5120, 512, 6, 384, 384): (6, 4),
 }
 # moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the first of them only; it
 # serves calls of MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the
@@ -50,7 +54,13 @@ MOE_PREFILL_MAX_ROWS = 3460
 # size 4, bits_x2 6 or 4. It serves calls of MOE_PREFILL_MIN_ROWS to
 # MOE_PREFILL_V2_MAX_ROWS rows (the validated range: one 2048-token prefill
 # chunk).
-MOE_PREFILL_V2_CONFIGS = {(5120, 2304, 6, 96, 384): (6, 4)}
+MOE_PREFILL_V2_CONFIGS = {
+    (5120, 2304, 6, 96, 384): (6, 4),
+    # Tensor-parallel routed experts: every expert local, each rank a 640- or
+    # 512-column chunk of the 2304-column intermediate.
+    (5120, 640, 6, 384, 384): (6, 4),
+    (5120, 512, 6, 384, 384): (6, 4),
+}
 MOE_PREFILL_V2_MAX_ROWS = 2048
 
 

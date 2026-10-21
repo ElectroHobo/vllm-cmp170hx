@@ -1,7 +1,9 @@
 // EXL3 routed-expert MoE on the tensor cores for prefill-sized calls of the DeepSeek-V4.1-Flash
 // routed experts: moe_out_prefill (moe_prefill.cu) generalised from its one compile-time shape (hidden
 // 2560, intermediate 640, bits_x2 10) to one kernel family parameterised by (hidden, intermediate,
-// bits_x2), instantiated for hidden 5120, intermediate 2304 and bits_x2 6 and 4 (the decoder layers).
+// bits_x2), instantiated for hidden 5120, intermediate 2304 and bits_x2 6 and 4 (the decoder layers),
+// and for hidden 5120, intermediate 640 and 512, bits_x2 6 and 4 (tensor-parallel routed experts: each
+// rank a 640- or 512-column chunk of every expert's 2304-column intermediate).
 // Codebook 2 (mul1) only. The caller (vllm/sm80/kernels/exl3/quant.py) takes this
 // operator only for those configurations, for calls of more than 64 rows in prefill steps; every other
 // call keeps moe_out, moe_out_v2 or moe_out_prefill, which this file does not change.
@@ -1052,7 +1054,9 @@ void run_call(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch
 }
 
 // The configurations this file is instantiated for: (hidden, intermediate, bits_x2), codebook 2.
-#define EXL3_MOE_PREFILL_CONFIGS(X) X(5120, 2304, 6) X(5120, 2304, 4)
+#define EXL3_MOE_PREFILL_CONFIGS(X)                                                           \
+  X(5120, 2304, 6) X(5120, 2304, 4) X(5120, 640, 6) X(5120, 640, 4) X(5120, 512, 6)           \
+      X(5120, 512, 4)
 
 bool covered(int64_t hidden, int64_t intermediate, int64_t bits_x2) {
 #define EXL3_COVERED(H, I, B) if (hidden == H && intermediate == I && bits_x2 == B) return true;
