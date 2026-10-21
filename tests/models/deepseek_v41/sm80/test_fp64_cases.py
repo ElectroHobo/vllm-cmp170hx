@@ -891,3 +891,31 @@ def test_the_outputs_of_one_call_replay_it_once(monkeypatch):
     assert calls == [id(good), id(bad)]
     assert P.pipeline_outputs(dict(good), CPU, None) == "outputs"
     assert len(calls) == 3
+
+
+def test_pipeline_caches_are_judged_on_the_slots_the_call_touches():
+    """A served capture (pipeline-359, r3) gathered a write-guard comp page
+    whose unwritten entries held NaN memory; the call neither reads nor
+    writes them. Only touched slots are judged; a NaN there still fails."""
+    from types import SimpleNamespace
+    from . import attn_pipeline_cases as P
+    e = 4
+    a = {"comp": torch.zeros(4, e, 8),
+         # two requests; page 1 holds request 0's entries 0-3, page 2 entry 4
+         "batch.comp_block_table": torch.tensor([[1, 2], [3, 0]], dtype=torch.int32),
+         "batch.positions": torch.tensor([3, 4, 1]),
+         "batch.token_to_req": torch.tensor([0, 0, 1], dtype=torch.int32),
+         "batch.swa_slots": torch.tensor([0, 1, 2]),
+         "batch.comp_slots": torch.tensor([7, 8, 13])}
+    cfg = SimpleNamespace(compress_ratio=1)
+    mask = P.touched(a, "comp", 1)
+    assert mask.nonzero().tolist() == [[1, 0], [1, 1], [1, 2], [1, 3], [2, 0], [3, 0], [3, 1]]
+    guard = a["comp"].clone()
+    guard[0] = float("nan")
+    guard[2, 1:] = float("nan")
+    assert P.finite_where_read(a, cfg, "comp", guard)
+    for page, entry in ((1, 2), (2, 0), (3, 1)):
+        read = a["comp"].clone()
+        read[page, entry, 3] = float("nan")
+        assert not P.finite_where_read(a, cfg, "comp", read)
+    assert not P.finite_where_read(a, cfg, "qr", torch.tensor([0.0, float("nan")]))

@@ -59,6 +59,58 @@ def _physical(a, name, tensor):
     return tensor[first.to(tensor.device)]
 
 
+CACHES = ('swa', 'comp', 'idxk', 'ring')
+
+
+def touched(a, name, ratio):
+    """The (page, entry) slots of a captured cache that the call reads or
+    writes: the window rows it attends and writes, the compressed/index-key
+    entries below each row's visibility (n_vis = (pos + 1) // ratio) through
+    its request's block table plus the entries it writes, the ring rows of
+    its requests. The captured pages also hold slots no call reads (null and
+    write-guard pages, unwritten entries); those stay covered by the write
+    guards' bit check and carry whatever memory the page held."""
+    cache = a.get(name)
+    if cache is None:
+        return None
+    pages, entries = cache.shape[:2]
+    mask = torch.zeros(pages, entries, dtype=torch.bool)
+
+    def mark(slots):
+        slots = slots.flatten().long()
+        slots = slots[slots >= 0]
+        mask[slots // entries, slots % entries] = True
+
+    if name == 'swa':
+        mark(a['batch.swa_slots'])
+        if a.get('batch.swa_indices') is not None:
+            mark(a['batch.swa_indices'])
+    elif name in ('comp', 'idxk'):
+        if a.get(f'batch.{name}_slots') is not None:
+            mark(a[f'batch.{name}_slots'])
+        table = a.get(f'batch.{name}_block_table')
+        if table is not None:
+            pos, req = a['batch.positions'].long(), a['batch.token_to_req'].long()
+            visible = torch.where(a['batch.swa_slots'] >= 0, (pos + 1) // max(ratio, 1), 0)
+            for r in range(table.shape[0]):
+                n = int(visible[req == r].max()) if bool((req == r).any()) else 0
+                k = torch.arange(n)
+                mark(table[r, k // entries].long() * entries + k % entries)
+    elif a.get('batch.ring_slots') is not None:
+        rows = a['batch.ring_slots'].long()
+        mask[(rows[rows >= 0] // entries).unique()] = True
+    return mask
+
+
+def finite_where_read(a, cfg, name, value):
+    """Whether ``value`` (one call's output ``name``) is finite where the
+    call reads or writes it; caches are judged on their touched slots."""
+    if name in CACHES:
+        mask = touched(a, name, cfg.compress_ratio)
+        value = value[mask.to(value.device)]
+    return bool(torch.isfinite(value).all())
+
+
 def _write_guards(a, cfg, caches, batch):
     """Every unowned slot, including null/adjacent guards, remains byte exact."""
     closes = batch.comp_slots >= 0 if cfg.is_kv_source else None
@@ -110,9 +162,14 @@ def _execute(a, src, device, pipeline):
     values = {f.name: getattr(caches, f.name) for f in dataclasses.fields(caches)}
     values.update(out=out, query=query)
     if pipeline:
-        values.update(qr=ws.qr[:t], latent=ws.latent[:t], index_query=ws.iq[:t],
-                      scaled_index_weights=ws.iw[:t],
-                      scores=ws.scores[:t, :max(batch.max_seq_len // max(cfg.compress_ratio, 1), 1)])
+        # Workspace rows a layer does not produce hold earlier memory: latent
+        # is a kv source's, the index rows an index source's.
+        values.update(qr=ws.qr[:t])
+        if cfg.is_kv_source:
+            values.update(latent=ws.latent[:t])
+        if cfg.is_index_source:
+            values.update(index_query=ws.iq[:t], scaled_index_weights=ws.iw[:t],
+                          scores=ws.scores[:t, :max(batch.max_seq_len // max(cfg.compress_ratio, 1), 1)])
     elif src.meta.get('fused_control', False):
         values['query'] = core.rope(query, batch.positions, weights.freqs)
     return values, (cfg, weights, caches, batch, layers, exact)
@@ -273,7 +330,8 @@ def _pipeline_outputs(a, device, src):
     for name in OUTPUTS:
         for values in (cand, ref, ideal):
             value = values.get(name)
-            if value is not None and name not in ('scores', 'topk', 'candidates') and not torch.isfinite(value).all():
+            if (value is not None and name not in ('scores', 'topk', 'candidates')
+                    and not finite_where_read(a, cfg, name, value)):
                 raise ValueError(f'nonfinite pipeline {name}')
     invariant = True
     for request in sorted({0, a['batch.query_start_loc'].numel() - 2}):
@@ -289,10 +347,13 @@ def _pipeline_outputs(a, device, src):
 def attn_pipeline(a, device, src):
     if src.output not in OUTPUTS:
         raise ValueError(f'attn_pipeline needs a named output from {OUTPUTS}')
-    cand, ref, ideal, invariant, _ = pipeline_outputs(a, device, src)
+    cand, ref, ideal, invariant, objects = pipeline_outputs(a, device, src)
     name = src.output
     if any(values.get(name) is None for values in (cand, ref, ideal)):
         raise ValueError(f'output {name} is not reached by this layer')
+    if name in CACHES:
+        mask = touched(a, name, objects[0].compress_ratio)
+        return F.Call(*[v[name][mask.to(v[name].device)] for v in (cand, ref, ideal)], invariant)
     return F.Call(*[_physical(a, name, v[name]) for v in (cand, ref, ideal)], invariant)
 
 
