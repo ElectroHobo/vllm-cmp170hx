@@ -46,17 +46,14 @@ MOE_V2_CONFIGS = {
     # (expert parallel size 4); kernels and stages of their own (moe_v2.cu
     # DraftTiling: 16-row tiles, the hi/lo split in the MMA's C operand).
     (5120, 2304, 3, 32, 128): (8,),
-    # The drafter's experts split across tensor-parallel ranks like the
-    # target's: the tensor-parallel shapes' stages at bits_x2 8.
-    (5120, 640, 3, 128, 128): (8,),
-    (5120, 512, 3, 128, 128): (8,),
 }
 # The MOE_V2_CONFIGS entries only VLLM_EXL3_MOE_V2_DRAFT opens (the DSpark
 # drafter's layers); VLLM_EXL3_MOE_V2 opens the others. The drafter's calls
-# are never folded (moe_out_v2_fold refuses bits_x2 8).
-MOE_V2_DRAFT_CONFIGS = frozenset(
-    {(5120, 2304, 3, 32, 128), (5120, 640, 3, 128, 128), (5120, 512, 3, 128, 128)}
-)
+# are never folded (moe_out_v2_fold refuses bits_x2 8). The drafter's experts
+# split across tensor-parallel ranks (intermediate 640 or 512, all 128 local)
+# keep moe_out: moe_out_v2 has bits_x2 8 kernels for those shapes, but their
+# output has not been checked through the drafter's consumer.
+MOE_V2_DRAFT_CONFIGS = frozenset({(5120, 2304, 3, 32, 128)})
 # moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the first of them only; it
 # serves calls of MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the
 # validated range: one 3460-token prefill chunk).

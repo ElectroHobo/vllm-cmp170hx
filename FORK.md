@@ -91,7 +91,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/hybrid.py` | 133 |
 | `vllm/sm80/kernels/exl3/layout.py` | 108 |
 | `vllm/sm80/kernels/exl3/loader.py` | 230 |
-| `vllm/sm80/kernels/exl3/ops.py` | 1,175 |
+| `vllm/sm80/kernels/exl3/ops.py` | 1,172 |
 | `vllm/sm80/kernels/exl3/override.py` | 128 |
 | `vllm/sm80/kernels/exl3/placement.py` | 131 |
 | `vllm/sm80/kernels/exl3/quant.py` | 1,785 |
@@ -129,7 +129,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **54 files** | **18,451** |
+| **54 files** | **18,448** |
 
 ### `vllm/sm80/`
 
@@ -153,7 +153,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
 | `vllm/sm80/distributed/step_errors.py` | 166 |
-| `vllm/sm80/envs.py` | 1,575 |
+| `vllm/sm80/envs.py` | 1,577 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -189,7 +189,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 231 |
-| **52 files** | **15,313** |
+| **52 files** | **15,315** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -320,7 +320,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_swiglu_clamp.py` | 83 |
 | `tests/kernels/quantization/test_exl3_moe_tp_shapes.py` | 102 |
 | `tests/kernels/quantization/test_exl3_moe_v2.py` | 618 |
-| `tests/kernels/quantization/test_exl3_moe_v2_draft.py` | 819 |
+| `tests/kernels/quantization/test_exl3_moe_v2_draft.py` | 824 |
 | `tests/kernels/quantization/test_exl3_moe_v2_fold.py` | 1,029 |
 | `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 594 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
@@ -538,7 +538,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **251 files** | **110,327** |
+| **251 files** | **110,332** |
 
 #### `tools/`
 
@@ -850,11 +850,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 184 |
-| Fork-added product lines | 61,505 |
+| Fork-added product lines | 61,504 |
 | Patched upstream files | 102 |
 | Patched upstream lines | +4,886 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 65,129 |
+| Product lines added (new files and patches) | 65,128 |
 | Fork environment variables (flags) | 143 |
 | Unreferenced fork definitions | 5 (42 lines) |
