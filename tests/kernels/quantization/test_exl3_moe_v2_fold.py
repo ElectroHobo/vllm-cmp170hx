@@ -38,8 +38,9 @@ same at the tensor-split shapes, for every configuration the gate opens with
 every expert local (synthetic experts with one 2-byte aligned weight set, the
 identity expert map, rows 1..48 and 64, the same routings with padding and
 out-of-range ids in place of other ranks' experts), and on the real experts
-of layers 10 and 20 (and the drafter's layer 40 where its gate opens) as
-rank 0 of the split holds them.
+of layers 10 and 20 as rank 0 of the split holds them. The DSpark drafter's
+configurations (MOE_V2_DRAFT_CONFIGS, bits_x2 8) are never folded: no fold
+kernel is built for them, and they are left out here.
 """
 
 import os
@@ -177,12 +178,23 @@ def _launches(hidden, intermediate):
 
 
 def _v2_configs():
-    """MOE_V2_CONFIGS as (hidden, intermediate, top_k, local, global, bits)."""
+    """The MOE_V2_CONFIGS entries the fold serves, as (hidden, intermediate,
+    top_k, local, global, bits): not the DSpark drafter's
+    (MOE_V2_DRAFT_CONFIGS), whose calls are never folded."""
+    draft = getattr(exl3_ops, "MOE_V2_DRAFT_CONFIGS", frozenset())
     return [
         (h, i, k, local, total, bits)
         for (h, i, k, local, total), widths in exl3_ops.MOE_V2_CONFIGS.items()
+        if (h, i, k, local, total) not in draft
         for bits in widths
     ]
+
+
+def _folded_bits(hidden, intermediate):
+    """The bits_x2 the fold serves at a shape (its fold kernels are built for
+    these only)."""
+    shape = (hidden, intermediate)
+    return sorted({b for h, i, *_, b in _v2_configs() if (h, i) == shape})
 
 
 def test_tilings_cover_every_open_configuration_and_the_split_shapes():
@@ -332,25 +344,32 @@ def test_extension_registers_the_folded_operator():
     torch._C._dispatch_find_schema_or_throw("_exl3_C::moe_out_v2_fold", "")
 
 
-# The lane kernels (fold and not) of every shape moe_v2.cu builds, at every
-# bits_x2 it builds them for (LaneTiling), and the folded route launches.
+# The lane kernels of every shape moe_v2.cu builds: unfolded at every bits_x2
+# LaneTiling lists, folded at the bits_x2 the fold serves there; and the
+# folded route launches.
 LANE_KERNELS = {
-    f"moe_lane_kernel<{nt}, {kt}, {bits}{fold}>"
+    f"moe_lane_kernel<{nt}, {kt}, {bits}, NoFold>"
     for (h, i), tiling in TILINGS.items()
-    for nt, gate_up_kt, gate_up_slices, down_kt, down_slices in _launches(h, i)
+    for nt, gate_up_kt, _, down_kt, _ in _launches(h, i)
     for bits in tiling["bits"]
+    for kt in (gate_up_kt, down_kt)
+}
+FOLD_KERNELS = {
+    f"moe_lane_kernel<{nt}, {kt}, {bits}{fold}>"
+    for (h, i) in TILINGS
+    for nt, gate_up_kt, gate_up_slices, down_kt, down_slices in _launches(h, i)
+    for bits in _folded_bits(h, i)
     for kt, fold in (
-        (gate_up_kt, ", NoFold"),
         (gate_up_kt, f", FoldGateUp<{gate_up_slices}, {i // 128}>"),
-        (down_kt, ", NoFold"),
         (down_kt, f", FoldDown<{down_slices}>"),
     )
 }
+LANE_KERNELS |= FOLD_KERNELS
 ROUTE_KERNELS = {
     f"route_and_gate_up_input<{bits}, {h // 128 // 20}, {scale_k}, "
     f"{scale_k // (16 * tiles)}, true>"
     for (h, i), tiling in TILINGS.items()
-    for bits in tiling["bits"]
+    for bits in _folded_bits(h, i)
     for scale_k, tiles in {
         (tiling["kGateUpShortScaleK"], tiling["kGateUpShortSliceTiles"]),
         (tiling["kGateUpLongScaleK"], tiling["kGateUpLongSliceTiles"]),
@@ -360,8 +379,9 @@ ROUTE_KERNELS = {
 
 def test_fold_kernels_cover_the_split_shapes():
     for h, i in SPLIT_SHAPES:
+        assert _folded_bits(h, i), (h, i)
         for nt, gate_up_kt, gate_up_slices, down_kt, down_slices in _launches(h, i):
-            for bits in TILINGS[(h, i)]["bits"]:
+            for bits in _folded_bits(h, i):
                 down = (
                     f"moe_lane_kernel<{nt}, {down_kt}, {bits}, "
                     f"FoldDown<{down_slices}>>"
@@ -456,6 +476,10 @@ def test_sm80_build_has_every_fold_kernel_and_spill_free_gemm_loops(sm80_sass):
             key = re.sub(r"\(.*", "", name).replace("void ", "")
             lane[re.sub(r"\s+>", ">", key)] = instructions
     assert LANE_KERNELS <= set(lane), sorted(LANE_KERNELS - set(lane))
+    # No fold kernel beyond the bits_x2 the fold serves (the drafter's are
+    # never folded).
+    folded = {name for name in lane if ", Fold" in name}
+    assert folded == FOLD_KERNELS, sorted(folded ^ FOLD_KERNELS)
     routes = {
         re.sub(r"\(.*", "", n).replace("void ", "")
         for n in sm80_sass
@@ -915,9 +939,8 @@ def test_fold_graph_replay_is_bitwise_at_split_shapes(split_layer, rows):
 
 # Real layers as one rank of the split holds them: (layer, rank). Rank 0
 # holds chunk (0 + layer) % 4 of the 640/640/512/512 columns: layer 10 a
-# 512-column chunk at bits_x2 6, layer 20 a 640-column one at bits_x2 4; the
-# drafter layer 40 (bits_x2 8) where the gate opens for it.
-SPLIT_REAL = [(10, 0), (20, 0), (40, 0)]
+# 512-column chunk at bits_x2 6, layer 20 a 640-column one at bits_x2 4.
+SPLIT_REAL = [(10, 0), (20, 0)]
 
 
 def _split_real_layer(layer, rank, size=4):
