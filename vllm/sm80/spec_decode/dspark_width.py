@@ -30,6 +30,12 @@ def draft_widths(vllm_config: VllmConfig) -> tuple[int, ...]:
 def create_dspark_speculator(
     vllm_config: VllmConfig, device: torch.device
 ) -> DSparkSpeculator:
+    if envs.VLLM_DSPARK_ROW_MASK and envs.VLLM_DSPARK_CONFIDENCE_DUMP:
+        # The dump would record the drafts the mask cut as rejected by the target.
+        raise ValueError(
+            "VLLM_DSPARK_ROW_MASK and VLLM_DSPARK_CONFIDENCE_DUMP cannot be set "
+            "together: the dump would label drafts the mask cut as rejected."
+        )
     cls = DSparkSpeculator
     if envs.VLLM_DSPARK_PER_K_WIDTH:
         cls = PerKDSparkSpeculator

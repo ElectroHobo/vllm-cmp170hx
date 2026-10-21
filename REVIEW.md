@@ -40,17 +40,20 @@ reads a later row, and the all-reduces are per row, so rows `0..live_len` are
 bit-identical to the unmasked step. With greedy target sampling the emitted
 tokens are the unmasked step's truncated at `min(accepted, live_len)` drafts
 plus the target token at that row. Masked rows' KV and compressor-ring writes
-are positions past the accepted length, handled as for rejected rows. With
-sampled (probabilistic) drafts the cap would bias the verified distribution;
-the served drafter is greedy.
+are positions past the accepted length, handled as for rejected rows. Sampled
+(probabilistic) drafts are refused at drafter load (the cap would bias the
+verified distribution), and so is `VLLM_DSPARK_CONFIDENCE_DUMP` together with
+the mask (the dump would label the cut drafts as rejected by the target).
 
 Upstream-owned files: `vllm/v1/worker/gpu/model_runner.py` gets two imports and
 two calls: `begin_target_step(input_batch, dummy_run)` after
 `step_timing.forward_start()` (the mask must be written before the target
 forward) and `cap_drafts(input_batch.logits_indices, invalid_drafts)` before
 rejection sampling (after the forward, so the forward's inputs keep the real
-drafts). Both return immediately with the switch off. Seam rows pin
-`prepare_dflash_inputs` and `RejectionSampler.__call__`.
+drafts). Both return immediately with the switch off; both are listed in
+`tools/sm80/upstream_edit_exceptions.yaml` (hunks 75b463763419, 645d5ea70245)
+with their removal plan. Seam rows pin `prepare_dflash_inputs` and
+`RejectionSampler.__call__`.
 
 Tests (CPU): `test_dspark_row_mask_conf.py`, `test_dspark_row_mask_kernel.py`,
 `test_row_mask_moe.py`, `test_dspark_row_mask_reject.py`, the fused-route

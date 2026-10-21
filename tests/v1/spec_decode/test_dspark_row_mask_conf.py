@@ -21,7 +21,6 @@ import pytest
 import torch
 
 from vllm.sm80.envs import FORK_ENV_VARS
-from vllm.sm80.spec_decode import dspark_confidence as dump_module
 from vllm.sm80.spec_decode import dspark_row_mask as state_module
 from vllm.sm80.spec_decode import dspark_row_mask_conf as conf_module
 from vllm.sm80.spec_decode import dspark_width as width_module
@@ -34,13 +33,14 @@ ROOT = Path(__file__).resolve().parents[3]
 MAX_REQS, MAX_TOKENS, MAX_DRAFT = 8, 64, 5
 
 
-def _config():
+def _config(draft_sample_method="greedy"):
     spec = SimpleNamespace(
         num_speculative_tokens=MAX_DRAFT,
         num_speculative_tokens_per_batch_size=[(1, 3, 5), (4, 8, 3)],
         adaptive_k_config=None,
         draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         uses_dynamic_speculative_decoding=lambda: True,
+        draft_sample_method=draft_sample_method,
     )
     return SimpleNamespace(
         speculative_config=spec, scheduler_config=SimpleNamespace(max_num_seqs=8)
@@ -49,6 +49,7 @@ def _config():
 
 def _init_cpu(self, config, device):
     self.vllm_config = config
+    self.speculative_config = config.speculative_config
     self.device = device
     self.max_num_reqs = MAX_REQS
     self.max_num_tokens = MAX_TOKENS
@@ -87,7 +88,7 @@ def make(monkeypatch, tmp_path):
         width_module.envs, "VLLM_DSPARK_ROW_MASK", _cost_table(tmp_path / "c.json")
     )
 
-    def build(head=_head):
+    def build(head=_head, draft_sample_method="greedy"):
         monkeypatch.setattr(
             upstream.DSparkSpeculator,
             "load_draft_model",
@@ -96,7 +97,9 @@ def make(monkeypatch, tmp_path):
             ),
             raising=False,
         )
-        return width_module.create_dspark_speculator(_config(), torch.device("cpu"))
+        return width_module.create_dspark_speculator(
+            _config(draft_sample_method), torch.device("cpu")
+        )
 
     return build
 
@@ -132,16 +135,21 @@ def test_switch_wraps_the_plain_and_the_per_width_drafter(make):
     assert cls.__mro__[1] is conf_module.RowMaskConfidenceMixin
 
 
-def test_composes_with_the_confidence_dump(make, monkeypatch, tmp_path):
+def test_refuses_the_confidence_dump(make, monkeypatch, tmp_path):
+    # The dump would label drafts the mask cut as rejected by the target.
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", str(tmp_path))
     monkeypatch.setenv("VLLM_DSPARK_CONFIDENCE_DUMP", str(tmp_path))
-    drafter = make()
-    assert isinstance(drafter, conf_module.RowMaskConfidenceMixin)
-    assert isinstance(drafter, dump_module.ConfidenceDumpMixin)
-    drafter.load_draft_model(None, set())
-    assert drafter.use_confidence_head is True
-    assert state_module.get_row_mask_state() is drafter._row_mask
-    drafter._confidence_dump.close()
+    with pytest.raises(ValueError, match="VLLM_DSPARK_CONFIDENCE_DUMP"):
+        make()
+
+
+def test_load_refuses_probabilistic_drafts(make):
+    # With sampled drafts the live length depends on the sampled tokens, which
+    # would bias the verified distribution.
+    drafter = make(draft_sample_method="probabilistic")
+    with pytest.raises(ValueError, match="greedy"):
+        drafter.load_draft_model(None, set())
+    assert state_module.get_row_mask_state() is None
 
 
 def test_load_turns_the_head_on_and_creates_the_state(make):

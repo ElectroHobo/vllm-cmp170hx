@@ -30,8 +30,10 @@ draft width has its own graphs, captured at that width.
 Drafted tokens do not change: the head runs on the sampler's existing
 inputs, and the publish only reads them.
 
-Composes with ``VLLM_DSPARK_CONFIDENCE_DUMP``: both mixins only read the
-head's outputs.
+Refused together with ``VLLM_DSPARK_CONFIDENCE_DUMP`` (the factory): the dump
+would record the drafts the mask cut as rejected by the target. Refused with
+sampled drafts: the live length would depend on the sampled tokens and bias the
+verified distribution.
 """
 
 from __future__ import annotations
@@ -113,6 +115,13 @@ class RowMaskConfidenceMixin:
     _row_mask: RowMaskState | None = None
 
     def load_draft_model(self, target_model, target_attn_layer_names):
+        method = self.speculative_config.draft_sample_method
+        if method != "greedy":
+            raise ValueError(
+                "VLLM_DSPARK_ROW_MASK needs greedy drafts (draft_sample_method "
+                f"'greedy', got {method!r}): with sampled drafts the live length "
+                "depends on the sampled tokens and biases verification."
+            )
         model = super().load_draft_model(target_model, target_attn_layer_names)
         if getattr(model.model, "confidence_head", None) is None:
             raise ValueError(
