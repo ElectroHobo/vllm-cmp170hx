@@ -403,6 +403,48 @@ def test_abs_errors():
         F.abs_errors(torch.zeros(2), torch.zeros(3))
 
 
+def _bf16_nearest_even(v: float) -> float:
+    """Independent definition: the nearest BF16 value of ``v`` by exact rational arithmetic, ties to even."""
+    from fractions import Fraction
+
+    if v == 0.0 or not math.isfinite(v):
+        return v
+    _, e = math.frexp(abs(v))  # |v| = m * 2**e, m in [0.5, 1)
+    ulp = Fraction(2) ** (max(e, -125) - 8)
+    q, rem = divmod(Fraction(abs(v)), ulp)
+    if rem * 2 > ulp or (rem * 2 == ulp and q % 2):
+        q += 1
+    return math.copysign(float(q * ulp), v)
+
+
+def test_bf16_rn_rounds_fp64_once():
+    # The two window elements of the hybrid capture's verify M18 ratio-1 case: each FP64 value lies just
+    # below a BF16 midpoint, FP32 rounds it onto the midpoint, and the tie then goes up.
+    m18 = torch.tensor([0.48339843055547654, 0.12084960763886914], dtype=torch.float64)
+    assert F.bf16_rn(m18).double().tolist() == [0.482421875, 0.12060546875]
+    assert m18.to(BF16).double().tolist() == [0.484375, 0.12109375]  # torch: through FP32
+
+    one = 1.0
+    ties = torch.tensor([one + 2**-8, one + 3 * 2**-8, -(one + 2**-8), 2**-134, 3 * 2**-134],
+                        dtype=torch.float64)
+    assert F.bf16_rn(ties).double().tolist() == [1.0, one + 2**-6, -1.0, 0.0, 2**-132]
+    special = torch.tensor([float("inf"), -float("inf"), float("nan"), -0.0, 3.4e38, -3.4e38],
+                           dtype=torch.float64)
+    got = F.bf16_rn(special).double()
+    assert got[:2].tolist() == [math.inf, -math.inf] and got[2].isnan()
+    assert got[3] == 0.0 and math.copysign(1.0, float(got[3])) == -1.0
+    assert got[4:].tolist() == [math.inf, -math.inf]
+
+    g = torch.Generator().manual_seed(5)
+    wide = torch.randn(4096, generator=g, dtype=torch.float64) * torch.exp2(
+        torch.randint(-140, 120, (4096,), generator=g).double())
+    assert F.bf16_rn(wide).double().tolist() == [_bf16_nearest_even(v) for v in wide.tolist()]
+    # Where FP32 holds the value exactly, the single and the double rounding agree.
+    exact32 = wide.float().double()
+    assert torch.equal(F.bf16_rn(exact32), exact32.float().to(BF16))
+
+
+
 @pytest.mark.skipif(torch.cuda.is_available(), reason="checks the CPU refusal")
 def test_main_refuses_without_cuda(tmp_path, capsys):
     assert F.main(["--cases", str(tmp_path / "c"), "--out", str(tmp_path / "o")]) == 2

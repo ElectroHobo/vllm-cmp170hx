@@ -111,6 +111,9 @@ unless named in full.
   against FP64 unrounded) or ``window`` (the cache rows of the slots >= 0:
   RMSNorm and RoPE in FP64, each rounded to BF16 as the reference does, then
   the exact FP8 qdq).
+  Every rounding of an FP64 value to BF16 here is one round-to-nearest-even
+  onto the BF16 grid (:func:`bf16_rn`); torch's FP64 -> BF16 cast goes
+  through FP32 and rounds twice.
 - ``attn_attend``: ``sm80_attn_fused:attend`` (q, positions, freqs,
   swa_cache, swa_indices, comp_cache, comp_block_table, comp_local, req,
   attn_sink, scale, n_groups, out) -> the fused attend (the reference path
@@ -198,6 +201,23 @@ def abs_errors(out: torch.Tensor, exact: torch.Tensor) -> tuple[float, float, in
 
 def _to(value, device):
     return value.to(device) if isinstance(value, torch.Tensor) else value
+
+
+def bf16_rn(x: torch.Tensor) -> torch.Tensor:
+    """``x`` (FP64) rounded once, to nearest even, onto the BF16 grid.
+
+    ``x.to(torch.bfloat16)`` rounds to FP32 first: a value within half an
+    FP32 ulp of a BF16 midpoint lands on the midpoint and then ties to even,
+    the wrong way for half of them. Here the spacing of the BF16 grid at
+    ``|x|`` (8 significant bits, subnormals from 2**-133) divides ``x``
+    exactly and ``torch.round`` ties to even; the result is a BF16 value, so
+    the final cast is exact. Values that round past the largest BF16 become
+    infinite; non-finite values pass unchanged."""
+    x = x.double()
+    _, exp = torch.frexp(x)  # |x| in [2**(exp-1), 2**exp)
+    ulp = torch.ldexp(torch.ones_like(x), exp.clamp_min(-125) - 8)
+    r = torch.round(x / ulp) * ulp
+    return torch.where(torch.isfinite(x), r, x).to(BF16)
 
 
 # ---------------------------------------------------------------- attention
@@ -611,7 +631,7 @@ def mhc_delayed_fp64(
     if not rounding:
         used = streams
     elif own is None:
-        used = streams.to(BF16).double()
+        used = bf16_rn(streams).double()
     else:
         used = own.double()
     flat = used.reshape(T, hc * hidden)
@@ -636,7 +656,7 @@ def mhc_delayed_fp64(
         w = pre_mix.double().reshape(T, hc)
     li = (w[..., None] * used).sum(dim=1)
     if rounding:
-        li = li.to(BF16).double()
+        li = bf16_rn(li).double()
     norm_weight = t.get("norm_weight")
     if norm_weight is not None:
         li = li * torch.rsqrt(li.square().mean(-1, keepdim=True) + float(t["norm_eps"]))
@@ -832,8 +852,8 @@ def attn_prologue(a: dict, device: torch.device, src: Source) -> Call:
     if output == "qr":
         exact = _rms_fp64(qr_part, t["q_norm"], eps)
     else:
-        kvn = _rms_fp64(kv_part, t["kv_norm"], eps).to(BF16)
-        rope = _rope_fp64(kvn, pos, t["freqs"]).to(BF16)
+        kvn = bf16_rn(_rms_fp64(kv_part, t["kv_norm"], eps))
+        rope = bf16_rn(_rope_fp64(kvn, pos, t["freqs"]))
         exact = act_quant_qdq_fp8(rope, 32).double()[keep]
 
     def alone(i):
@@ -913,9 +933,9 @@ def attn_attend(a: dict, device: torch.device, _src: Source) -> Call:
                 comp_block_table=t["comp_block_table"],
             ),
         )
-        qr = _rope_fp64(q[rows], pos[rows], t["freqs"]).to(BF16)
-        o = _fp64_attention(qr, gathered, valid, t["attn_sink"], scale).to(BF16)
-        o = _rope_fp64(o, pos[rows], t["freqs"], inverse=True).to(BF16)
+        qr = bf16_rn(_rope_fp64(q[rows], pos[rows], t["freqs"]))
+        o = bf16_rn(_fp64_attention(qr, gathered, valid, t["attn_sink"], scale))
+        o = bf16_rn(_rope_fp64(o, pos[rows], t["freqs"], inverse=True))
         n = o.shape[0]
         exacts.append(
             act_quant_qdq_fp8(o.view(n, groups, (h // groups) * d), 32).view(n, h, d)
