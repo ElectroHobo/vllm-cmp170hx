@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
     VLLM_DEEPSEEK_V41_WO_A_STRIDED: bool = False
+    VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
@@ -1001,6 +1002,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
     "VLLM_DEEPSEEK_V41_WO_A_STRIDED": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_WO_A_STRIDED", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the grouped MXFP8 wo_a (one Marlin GEMM per
+    # group and a concat) as one grouped Triton W8A16 GEMM over all groups
+    # that writes the [T, groups * o_lora_rank] result directly
+    # (ops/sm80_wo_a_grouped.py). It holds the loaded FP8 codes and E8M0
+    # scales instead of Marlin's repack (the same bytes); the decoded weights
+    # are Marlin's, the FP32 sums run in another order, so outputs change
+    # within rounding. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the attention core of decode, speculative verify
     # and draft steps (the norms and window row of prepare_layer, the query

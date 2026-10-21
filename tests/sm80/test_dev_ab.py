@@ -177,6 +177,7 @@ def test_allowlist():
         "dsv41_draft_prologue_fused",
         "dsv41_gate_gemv",
         "dsv41_wo_a_strided",
+        "dsv41_wo_a_grouped_gemm",
         "dsv41_swa_meta_batch",
         "dsv41_fused_attn_decode",
         "dsv41_attn_pipeline",

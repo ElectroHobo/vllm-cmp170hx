@@ -387,6 +387,40 @@ def test_wo_a_strided_switch_reaches_every_grouped_wo_a(
     assert {m.strided_input for m in methods} == {strided == "1"}
 
 
+@pytest.mark.parametrize(
+    "flag,ab", [("1", ""), ("0", "dsv41_wo_a_grouped_gemm"), ("1", "dsv41_wo_a_grouped_gemm")]
+)
+def test_wo_a_grouped_gemm_switch_reaches_every_grouped_wo_a(
+    monkeypatch,
+    meta_platform,  # noqa: F811
+    hybrid_on,
+    hybrid,
+    flag,
+    ab,
+):
+    """VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM adopts every MXFP8 wo_a of the
+    target and the drafter as the grouped GEMM (TP4: 2 local groups); the dev
+    A/B switch keeps the per-group Marlin layers too and boots on the flag."""
+    from vllm.models.deepseek_v41.nvidia.ops.sm80_wo_a_grouped import (
+        WoAGroupedGemmMethod,
+    )
+    from vllm.sm80 import plugin
+
+    plugin._register_exl3()
+    monkeypatch.setenv("VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM", flag)
+    monkeypatch.setenv("VLLM_DEV_AB_SWITCH", ab)
+    construct.set_groups(monkeypatch, 4, 0)
+    construct.stub_engram_tables(monkeypatch, 4)
+    methods = []
+    for config in construct.vllm_configs(str(hybrid[0]), 4):
+        model = construct.build_model(config)
+        methods += [m.quant_method for n, m in model.named_modules()
+                    if n.endswith(".wo_a")]  # fmt: skip
+    assert methods and all(type(m) is WoAGroupedGemmMethod for m in methods)
+    assert {m.groups for m in methods} == {2}
+    assert {(m.gemm, m.keep_groups) for m in methods} == {(flag == "1", bool(ab))}
+
+
 @pytest.mark.parametrize("device", ["meta", "cuda"])
 def test_out_dtype_linear_keeps_the_fp32_sum(device):
     """FP32 output of BF16 x and weight (torch.mm out_dtype, a CUDA kernel;

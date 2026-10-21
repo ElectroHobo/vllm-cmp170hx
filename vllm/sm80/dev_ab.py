@@ -761,6 +761,34 @@ def _wo_a_apply(runner, on: bool) -> None:
         method.strided_input = on
 
 
+def _wo_a_gemm_methods(runner):
+    """The grouped wo_a methods that hold the grouped GEMM's codes."""
+    from vllm.models.deepseek_v41.nvidia.ops.sm80_wo_a_grouped import (
+        WoAGroupedGemmMethod,
+    )
+
+    for method in _wo_a_methods(runner):
+        if isinstance(method, WoAGroupedGemmMethod):
+            yield method
+
+
+def _wo_a_gemm_unavailable(runner) -> str | None:
+    methods = list(_wo_a_gemm_methods(runner))
+    if not methods or not all(m.keep_groups for m in methods):
+        return ("boot with VLLM_DEV_AB_SWITCH=dsv41_wo_a_grouped_gemm on an MXFP8 "
+                "wo_a: every grouped wo_a needs its codes and its per-group Marlin "
+                "layers")
+    return None
+
+
+def _wo_a_gemm_apply(runner, on: bool) -> None:
+    # apply_grouped reads the arm per call: each arm's graphs capture its
+    # launches (the grouped GEMM or the per-group Marlin GEMMs).
+    _set_env("VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM", on)
+    for method in _wo_a_gemm_methods(runner):
+        method.gemm = on
+
+
 SWITCHES: dict[str, Switch] = {
     s.name: s
     for s in (
@@ -794,6 +822,12 @@ SWITCHES: dict[str, Switch] = {
             _wo_a_unavailable,
             lambda runner: any(m.strided_input for m in _wo_a_methods(runner)),
             _wo_a_apply,
+        ),
+        Switch(
+            "dsv41_wo_a_grouped_gemm", "VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM", True, False,
+            _wo_a_gemm_unavailable,
+            lambda runner: any(m.gemm for m in _wo_a_gemm_methods(runner)),
+            _wo_a_gemm_apply,
         ),
         Switch(
             "dsv41_swa_meta_batch", _SWA_BATCH_ENV, False, True,
