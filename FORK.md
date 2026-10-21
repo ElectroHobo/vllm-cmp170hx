@@ -30,7 +30,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 220 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_topk.py` | 383 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_finish_v2.py` | 394 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_finish_v2.py` | 396 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 556 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_route.py` | 202 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_sparse_attn.py` | 180 |
@@ -39,7 +39,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **19 files** | **8,307** |
+| **19 files** | **8,309** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -215,8 +215,8 @@ Files added elsewhere, grouped by top-level directory.
 | `CITATION.cff` | 7 |
 | `COMMUNITY_RECIPES.md` | 68 |
 | `NOTICE` | 9 |
-| `REVIEW.md` | 178 |
-| **4 files** | **262** |
+| `REVIEW.md` | 222 |
+| **4 files** | **306** |
 
 #### `.github/`
 
@@ -830,11 +830,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 181 |
-| Fork-added product lines | 59,175 |
+| Fork-added product lines | 59,177 |
 | Patched upstream files | 102 |
 | Patched upstream lines | +4,886 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 62,799 |
+| Product lines added (new files and patches) | 62,801 |
 | Fork environment variables (flags) | 137 |
 | Unreferenced fork definitions | 5 (42 lines) |

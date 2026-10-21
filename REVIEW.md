@@ -132,3 +132,49 @@ replica, and a hybrid capture, whose shard copies would each carry this
 rank's capture facts. Prefill only: decode is unchanged by construction.
 
 Removes: nothing; the sharded path stays for decode and for the flag off.
+
+Removes: nothing.
+
+# Delayed mHC finish v2
+
+`VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2` (default off) speeds up DeepSeek-V4.1's
+delayed mHC call (kernel A + finish, 86 calls per decode step per rank). With
+the finish kernel selected (`VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH=1`), a call in
+the validated configuration (hc 4, hidden 5120, 20 Sinkhorn iterations,
+1..2048 rows, with the norm, sm_80) runs kernel A with `HS_REUSE` from 17
+rows (two shared-memory staging pairs reused: 24 KB per CTA instead of 32, the
+same products in the same order) and the Gluon `_delayed_finish_v2_kernel`
+instead of the Triton `_delayed_finish_kernel`: the same contract, outputs
+and rounding points; FP64 `1/x` and `rsqrt` by MUFU approximation and Newton
+steps, the mean as a product with an FP64 constant, one CTA barrier for the
+partial reduction, the Sinkhorn in scale-vector form, one pass over the
+streams. `mhc_ops` decides the gate once (banner when open, a line with the
+reason when closed) and registers the pre-capture JIT warmup.
+
+Files: `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_finish_v2.py` (new),
+`ops/sm80_mhc_fused.py` (dispatch, `finish_v2_unavailable`), `sm80_model.py`
+(`mhc_ops`), `vllm/sm80/kernels/mhc/decode.py` (`HS_REUSE`, `hs_reuse`; shared
+with GLM-5.3-Flash, which never passes it), `vllm/sm80/envs.py`,
+`vllm/sm80/dev_ab.py` (switch `dsv41_fused_mhc_finish_v2`, not
+output-identical), the consumer family `mhc_finish_consumer` of
+`fp64_cases.py` (`mhc_consumer_cases.py`, `export_mhc_consumer_cases.py`).
+Tests: `test_sm80_mhc_finish_v2.py` (CPU: switch default, unchanged off-path
+launches, the gate in every direction, reasons, banner through the vLLM
+logger, warmup keys, kernel A without `HS_REUSE` pinned to its previous sm_80
+SASS for both models' options, sm_80 compiles), `test_sm80_mhc_finish_v2_gpu.py`
+(kernel A bits with and without the reuse, the FP64 rule against the served
+finish, kernel names, determinism, graph replay equal to eager with no
+allocation growth, no compile after the warmup; GPU, unrun),
+`test_mhc_consumer_cases.py`, the dev A/B tests.
+
+Numerics: order-changing. The coefficients are held to the FP64 rule against
+the served finish (errors 1.000x of it on the captured cells), but the
+arithmetic differs: expect about a 2^-16 per-element rate of one-ulp FP32
+flips against the served path, and the BF16 outputs downstream of them.
+
+Known limits: the GPU tests, the FP64 rule on captured inputs, the consumer
+check (`mhc_finish_consumer`, bounds declared before any GPU run), a boot
+and a matched served profile are not run yet; no forced-tile switch (the
+finish's tiles are fixed inside the gate and `HS_REUSE` changes no bits).
+
+Removes: nothing (the served finish stays the default and the fallback).

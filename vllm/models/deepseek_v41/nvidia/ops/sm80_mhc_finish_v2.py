@@ -83,8 +83,10 @@ def _rcp64(x):
 
 @gluon.jit
 def _rcp64_q(x):
-    """1 / ``x`` with one quadratic Newton step (~2^-44 relative): the Sinkhorn
-    scales, far below the FP32 outputs' resolution."""
+    """1 / ``x`` with one quadratic Newton step: about 2^-40 relative
+    (rcp.approx.ftz.f64 reads only 20 mantissa bits of ``x``, about 2^-20
+    before the step): the Sinkhorn scales, far below the FP32 outputs'
+    resolution."""
     r = _rcp_approx64(x)
     return gl.fma(r, gl.fma(-x, r, 1.0), r)
 
