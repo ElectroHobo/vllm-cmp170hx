@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
     VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
+    VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
     VLLM_DEEPSEEK_V41_SWA_META_BATCH: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
@@ -1136,6 +1137,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # no sequence parallelism, batched Engram projection or microbatching.
     "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER", "0"))
+    ),
+    # Every TP rank holds every rank's Engram wkv shard (gathered once after
+    # loading; the layer's own shard is a view of it) and projects steps of
+    # more rows than any decode step or CUDA graph capture from all shards,
+    # without the all-gather of the output: the same GEMM per shard, the
+    # gathered bytes. Smaller steps keep the sharded GEMM and the all-gather.
+    # Costs the other shards' bytes on every card. TP only; no sequence
+    # parallelism or batched Engram projection
+    # (vllm/models/deepseek_v41/nvidia/sm80_engram_wkv.py). Default OFF.
+    "VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the sliding-window metadata of every SWA KV
     # cache group of a step (one group per layer) in one Triton launch

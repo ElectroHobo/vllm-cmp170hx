@@ -385,6 +385,7 @@ def test_dense_prefill_requires_boot_warmup_and_preserves_route_configuration(mo
     "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE",
     "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE",
     "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER",
+    "VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL",
     "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX",
 ])
 def test_combined_features_keep_default_off(monkeypatch, name):

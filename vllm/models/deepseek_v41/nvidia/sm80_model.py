@@ -319,6 +319,10 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             from .sm80_engram_prefetch import adopt_early_engram
 
             adopt_early_engram(model)
+        if envs.VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL:
+            from .sm80_engram_wkv import adopt_replicated_wkv
+
+            adopt_replicated_wkv(model)
         if envs.VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE:
             sm80_split_reduce.adopt_split_reduce(
                 islice(model.layers, model.start_layer, model.end_layer)

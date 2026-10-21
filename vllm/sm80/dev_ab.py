@@ -821,6 +821,35 @@ def _wo_a_gemm_apply(runner, on: bool) -> None:
         method.gemm = on
 
 
+_WKV_REPLICA_ENV = "VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL"
+
+
+def _wkv_replicas(runner):
+    """The served Engram wkv layers that hold a prefill replica."""
+    from vllm.models.deepseek_v41.nvidia.sm80_engram_wkv import ReplicatedPrefillWkv
+
+    return [m for m in _model_modules(runner) if isinstance(m, ReplicatedPrefillWkv)]
+
+
+def _wkv_replica_unavailable(runner) -> str | None:
+    if not _wkv_replicas(runner):
+        return (
+            f"boot with {_WKV_REPLICA_ENV}=1 so each Engram wkv holds its "
+            "replica; its off arm keeps the sharded path"
+        )
+    return None
+
+
+def _wkv_replica_apply(runner, on: bool) -> None:
+    layers = _STATE.saved.setdefault(
+        "dsv41_engram_wkv_replicated_prefill",
+        [(m, m.min_rows) for m in _wkv_replicas(runner)],
+    )
+    _set_env(_WKV_REPLICA_ENV, on)
+    for module, boot in layers:
+        module.min_rows = boot if on else None
+
+
 SWITCHES: dict[str, Switch] = {
     s.name: s
     for s in (
@@ -860,6 +889,12 @@ SWITCHES: dict[str, Switch] = {
             _wo_a_gemm_unavailable,
             lambda runner: any(m.gemm for m in _wo_a_gemm_methods(runner)),
             _wo_a_gemm_apply,
+        ),
+        Switch(
+            "dsv41_engram_wkv_replicated_prefill", _WKV_REPLICA_ENV, False, True,
+            _wkv_replica_unavailable,
+            lambda runner: any(m.min_rows is not None for m in _wkv_replicas(runner)),
+            _wkv_replica_apply,
         ),
         Switch(
             "dsv41_swa_meta_batch", _SWA_BATCH_ENV, False, True,
