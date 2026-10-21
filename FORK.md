@@ -23,19 +23,21 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_act_quant.py` | 259 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 932 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_fused.py` | 611 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_pipeline.py` | 442 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_pipeline.py` | 449 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_engram_dequant.py` | 112 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_gate_gemv.py` | 260 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 220 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_topk.py` | 186 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 496 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_route.py` | 202 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_sparse_attn.py` | 180 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_swa_meta.py` | 249 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue.py` | 538 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **15 files** | **6,928** |
+| **17 files** | **7,444** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -44,15 +46,16 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | Path | Lines |
 |---|---:|
 | `vllm/models/deepseek_v41/nvidia/hybrid_capture.py` | 364 |
-| `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 1,068 |
-| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 978 |
+| `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 1,145 |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,314 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_prefetch.py` | 79 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_projection.py` | 18 |
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
-| `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 442 |
-| `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 275 |
+| `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 466 |
+| `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 327 |
 | `vllm/models/deepseek_v41/nvidia/sm80_pipeline_capture.py` | 184 |
 | `vllm/models/deepseek_v41/nvidia/sm80_split_reduce.py` | 242 |
+| `vllm/models/deepseek_v41/nvidia/sm80_swa_meta_batch.py` | 378 |
 | `vllm/models/glm5next/nvidia/model_state.py` | 113 |
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
 | `vllm/models/glm5next/nvidia/sm80_mla.py` | 123 |
@@ -60,7 +63,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **17 files** | **5,896** |
+| **18 files** | **6,763** |
 
 ### `vllm/sm80/kernels/`
 
@@ -87,7 +90,8 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/ops.py` | 1,059 |
 | `vllm/sm80/kernels/exl3/override.py` | 128 |
 | `vllm/sm80/kernels/exl3/placement.py` | 131 |
-| `vllm/sm80/kernels/exl3/quant.py` | 1,537 |
+| `vllm/sm80/kernels/exl3/quant.py` | 1,589 |
+| `vllm/sm80/kernels/exl3/replicas.py` | 389 |
 | `vllm/sm80/kernels/exl3/step_phase.py` | 85 |
 | `vllm/sm80/kernels/exl3/utils.py` | 395 |
 | `vllm/sm80/kernels/idx_glue_gate.py` | 75 |
@@ -121,7 +125,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **53 files** | **17,661** |
+| **54 files** | **18,102** |
 
 ### `vllm/sm80/`
 
@@ -134,17 +138,18 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/attention/triton_mla_sparse.py` | 386 |
 | `vllm/sm80/capture.py` | 565 |
 | `vllm/sm80/deepseek_v41_recovery.py` | 337 |
-| `vllm/sm80/dev_ab.py` | 1,333 |
+| `vllm/sm80/dev_ab.py` | 1,430 |
 | `vllm/sm80/dev_ab_batch.py` | 367 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
+| `vllm/sm80/distributed/ce_ring_all_reduce.py` | 406 |
 | `vllm/sm80/distributed/communicator.py` | 356 |
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
-| `vllm/sm80/distributed/step_errors.py` | 155 |
-| `vllm/sm80/envs.py` | 1,387 |
+| `vllm/sm80/distributed/step_errors.py` | 166 |
+| `vllm/sm80/envs.py` | 1,465 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -152,7 +157,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/guard.py` | 68 |
 | `vllm/sm80/kv_planning.py` | 610 |
 | `vllm/sm80/layers/__init__.py` | 4 |
-| `vllm/sm80/layers/grouped_linear.py` | 91 |
+| `vllm/sm80/layers/grouped_linear.py` | 111 |
 | `vllm/sm80/layers/moe/__init__.py` | 19 |
 | `vllm/sm80/layers/moe/gate.py` | 44 |
 | `vllm/sm80/layers/moe/routed_experts.py` | 100 |
@@ -179,7 +184,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **50 files** | **14,044** |
+| **51 files** | **14,656** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -208,8 +213,8 @@ Files added elsewhere, grouped by top-level directory.
 | `CITATION.cff` | 7 |
 | `COMMUNITY_RECIPES.md` | 68 |
 | `NOTICE` | 9 |
-| `REVIEW.md` | 147 |
-| **4 files** | **231** |
+| `REVIEW.md` | 178 |
+| **4 files** | **262** |
 
 #### `.github/`
 
@@ -234,8 +239,8 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/dense_prefill_tc.h` | 41 |
 | `csrc/exl3/dense_splitk.cu` | 618 |
 | `csrc/exl3/dense_splitk.h` | 26 |
-| `csrc/exl3/engram_fetch.cpp` | 792 |
-| `csrc/exl3/engram_fetch.h` | 37 |
+| `csrc/exl3/engram_fetch.cpp` | 862 |
+| `csrc/exl3/engram_fetch.h` | 41 |
 | `csrc/exl3/gemm.cu` | 489 |
 | `csrc/exl3/gemm.cuh` | 82 |
 | `csrc/exl3/module.cpp` | 103 |
@@ -251,8 +256,8 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/ple.h` | 53 |
 | `csrc/exl3/ple_read.cpp` | 373 |
 | `csrc/exl3/reference.cu` | 450 |
-| `csrc/exl3/row_read.h` | 204 |
-| **30 files** | **9,814** |
+| `csrc/exl3/row_read.h` | 279 |
+| **30 files** | **9,963** |
 
 #### `docs/`
 
@@ -260,9 +265,9 @@ Files added elsewhere, grouped by top-level directory.
 |---|---:|
 | `docs/THIRD_PARTY.md` | 85 |
 | `docs/UPSTREAM_README.md` | 111 |
-| `docs/features/quantization/exl3.md` | 138 |
+| `docs/features/quantization/exl3.md` | 168 |
 | `docs/features/speculative_decoding/adaptive_k.md` | 168 |
-| **4 files** | **502** |
+| **4 files** | **532** |
 
 #### `plugins/`
 
@@ -310,6 +315,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 592 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
 | `tests/kernels/quantization/test_exl3_placement.py` | 202 |
+| `tests/kernels/quantization/test_exl3_replicas.py` | 409 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 119 |
 | `tests/kernels/quantization/test_sm80_capture.py` | 408 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
@@ -363,11 +369,12 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/export_attn_pipeline_cases.py` | 306 |
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
 | `tests/models/deepseek_v41/sm80/fixtures/exl3_headers.json` | 25,297 |
-| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 1,234 |
+| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 1,236 |
 | `tests/models/deepseek_v41/sm80/hybrid_consumer_cases.py` | 281 |
 | `tests/models/deepseek_v41/sm80/hybrid_fixture.py` | 189 |
 | `tests/models/deepseek_v41/sm80/hybrid_linear_cases.py` | 224 |
 | `tests/models/deepseek_v41/sm80/lifecycle_contracts.py` | 1,508 |
+| `tests/models/deepseek_v41/sm80/swa_meta_batch_cases.py` | 411 |
 | `tests/models/deepseek_v41/sm80/test_act_quant.py` | 249 |
 | `tests/models/deepseek_v41/sm80/test_attn_layers.py` | 309 |
 | `tests/models/deepseek_v41/sm80/test_boot_warmup.py` | 337 |
@@ -375,22 +382,25 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_dspark_draft_identity_gpu.py` | 34 |
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax.py` | 397 |
 | `tests/models/deepseek_v41/sm80/test_engram_early_gather.py` | 196 |
-| `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,171 |
+| `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,757 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 379 |
-| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 921 |
+| `tests/models/deepseek_v41/sm80/test_fp64_cases.py` | 926 |
 | `tests/models/deepseek_v41/sm80/test_full_graph_shapes.py` | 336 |
 | `tests/models/deepseek_v41/sm80/test_hybrid_capture.py` | 193 |
 | `tests/models/deepseek_v41/sm80/test_hybrid_capture_gpu.py` | 78 |
-| `tests/models/deepseek_v41/sm80/test_hybrid_checkpoint.py` | 438 |
+| `tests/models/deepseek_v41/sm80/test_hybrid_checkpoint.py` | 465 |
 | `tests/models/deepseek_v41/sm80/test_lifecycle_contracts.py` | 126 |
 | `tests/models/deepseek_v41/sm80/test_no_host_sync.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_official_reference.py` | 1,402 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 513 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attn_fused.py` | 212 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attn_fused_gpu.py` | 279 |
-| `tests/models/deepseek_v41/sm80/test_sm80_attn_pipeline_gpu.py` | 385 |
+| `tests/models/deepseek_v41/sm80/test_sm80_attn_pipeline_gpu.py` | 439 |
+| `tests/models/deepseek_v41/sm80/test_sm80_ce_allreduce_dispatch.py` | 126 |
 | `tests/models/deepseek_v41/sm80/test_sm80_decoder_replay.py` | 37 |
+| `tests/models/deepseek_v41/sm80/test_sm80_gate_gemv.py` | 430 |
+| `tests/models/deepseek_v41/sm80/test_sm80_gate_gemv_gpu.py` | 170 |
 | `tests/models/deepseek_v41/sm80/test_sm80_index_topk.py` | 98 |
 | `tests/models/deepseek_v41/sm80/test_sm80_index_topk_gpu.py` | 139 |
 | `tests/models/deepseek_v41/sm80/test_sm80_index_visible.py` | 177 |
@@ -400,10 +410,14 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
 | `tests/models/deepseek_v41/sm80/test_sm80_moe_allreduce.py` | 207 |
 | `tests/models/deepseek_v41/sm80/test_sm80_pipeline_lifecycle.py` | 126 |
+| `tests/models/deepseek_v41/sm80/test_sm80_pipeline_rope.py` | 59 |
 | `tests/models/deepseek_v41/sm80/test_sm80_route_fused.py` | 297 |
 | `tests/models/deepseek_v41/sm80/test_sm80_route_fused_gpu.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_sm80_split_reduce.py` | 453 |
+| `tests/models/deepseek_v41/sm80/test_sm80_swa_meta_batch.py` | 65 |
+| `tests/models/deepseek_v41/sm80/test_sm80_swa_meta_batch_gpu.py` | 19 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
+| `tests/models/deepseek_v41/sm80/test_wo_a_strided.py` | 261 |
 | `tests/models/deepseek_v41/sm80/test_wo_b_allreduce_bits_gpu.py` | 120 |
 | `tests/models/deepseek_v41/sm80/test_wo_b_bits_verdict.py` | 84 |
 | `tests/models/deepseek_v41/sm80/wo_b_allreduce_bits.py` | 364 |
@@ -436,8 +450,9 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/plugins_tests/conftest.py` | 17 |
 | `tests/sm80/round_once_allreduce_bits.py` | 207 |
 | `tests/sm80/round_once_unchecked.py` | 46 |
-| `tests/sm80/seams.yaml` | 1,463 |
-| `tests/sm80/test_dev_ab.py` | 565 |
+| `tests/sm80/seams.yaml` | 1,505 |
+| `tests/sm80/test_ce_ring_all_reduce.py` | 289 |
+| `tests/sm80/test_dev_ab.py` | 595 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
 | `tests/sm80/test_dev_ab_batch.py` | 330 |
 | `tests/sm80/test_dev_ab_dynamic.py` | 423 |
@@ -498,7 +513,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **221 files** | **99,555** |
+| **231 files** | **102,540** |
 
 #### `tools/`
 
@@ -675,16 +690,22 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEEPSEEK_V41_FUSED_MHC` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_FUSED_ROUTE` | `bool` | `False` | `'0'` |
+| `VLLM_DEEPSEEK_V41_GATE_GEMV` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE` | `bool` | `False` | `'0'` |
+| `VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE` | `bool` | `False` | `'0'` |
+| `VLLM_DEEPSEEK_V41_SWA_META_BATCH` | `bool` | `False` | `'0'` |
+| `VLLM_DEEPSEEK_V41_WO_A_STRIDED` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEV_AB_SWITCH` | `str` | `''` | `''` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
 | `VLLM_DSPARK_PER_K_WIDTH` | `bool` | `False` | `'0'` |
+| `VLLM_ENGRAM_DIRECT_READ` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
+| `VLLM_ENGRAM_ROW_CACHE_PRELOAD` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_TELEMETRY_STEPS` | `int` | `0` | `'0'` |
 | `VLLM_EXL3_DENSE_MMA` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE` | `str` | `''` | `''` |
@@ -694,6 +715,8 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_EXL3_EXPERTS_CONTIGUOUS` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_EXPERT_PLACEMENT` | `str` | `''` | `''` |
 | `VLLM_EXL3_EXPERT_PLACEMENT_SHA256` | `str` | `''` | `''` |
+| `VLLM_EXL3_EXPERT_REPLICAS` | `str` | `''` | `''` |
+| `VLLM_EXL3_EXPERT_REPLICAS_SHA256` | `str` | `''` | `''` |
 | `VLLM_EXL3_HYBRID` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_CHUNK_ROWS` | `int` | `0` | `'0'` |
 | `VLLM_EXL3_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
@@ -771,7 +794,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **126 variables** | | | |
+| **134 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -780,9 +803,11 @@ Functions, methods and classes in fork-added product files whose name occurs now
 | Path | Line | Name | Lines | Used by tests |
 |---|---:|---|---:|---|
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 914 | `forward_layer` | 19 | yes |
-| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 260 | `engram_telemetry` | 4 | yes |
-| `vllm/sm80/dev_ab.py` | 1319 | `get_ab_arm` | 4 | yes |
-| **3 definitions** | | | **27** | |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 286 | `engram_telemetry` | 4 | yes |
+| `vllm/sm80/dev_ab.py` | 1416 | `get_ab_arm` | 4 | yes |
+| `vllm/sm80/distributed/ce_ring_all_reduce.py` | 98 | `emulate_owner` | 7 | yes |
+| `vllm/sm80/kernels/exl3/replicas.py` | 249 | `expert_map_reference` | 8 | yes |
+| **5 definitions** | | | **42** | |
 
 ## 5. Health numbers
 
@@ -790,12 +815,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 174 |
-| Fork-added product lines | 55,447 |
+| Fork-added product files | 179 |
+| Fork-added product lines | 58,032 |
 | Patched upstream files | 102 |
 | Patched upstream lines | +4,886 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 59,071 |
-| Fork environment variables (flags) | 126 |
-| Unreferenced fork definitions | 3 (27 lines) |
+| Product lines added (new files and patches) | 61,656 |
+| Fork environment variables (flags) | 134 |
+| Unreferenced fork definitions | 5 (42 lines) |
