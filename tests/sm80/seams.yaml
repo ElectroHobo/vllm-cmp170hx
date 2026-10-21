@@ -1573,3 +1573,16 @@ seams:
   why: a temperature-0 request needs no logits processing from these states (temperature and min-p are not applied by apply_sampling_params for it; its top-k/top-p, reset by SamplingParams, are stored as no filter, top_k = vocab_size and top_p = 1.0); target_argmax.greedy_only reads temperature.np, top_k.np, top_p.np and the sampler's needs_logits_processing this sets
   sha256: 3b14a9e897290c536b7e41f8b33217942c5b973a12ba75df670d78a0e6e72318
   signature: '(self, req_idx: int, sampling_params: vllm.sampling_params.SamplingParams) -> bool'
+- id: dsv41-dspark-propose-arguments
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator.propose
+  why: dspark_confidence.py binds its arguments by name (num_sampled, num_rejected, dummy_run, is_profile) and, before the draft step overwrites draft_token_confidence_probs, pairs the previous draft step's confidences with this step's verification result
+  sha256: 0b0a95528ca4bd603543deade30b5c6ad5145b645052bf74cf268037320c97c3
+  signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, attn_metadata: dict[str, typing.Any], slot_mappings: dict[str, torch.Tensor], last_hidden_states: torch.Tensor, aux_hidden_states: list[torch.Tensor] | None, num_sampled: torch.Tensor, num_rejected: torch.Tensor, last_sampled: torch.Tensor, next_prefill_tokens: torch.Tensor, temperature: torch.Tensor, seeds: torch.Tensor, dp_sync_state: vllm.v1.worker.gpu.dp_utils.DPSyncState | None = None, dummy_run: bool = False, skip_attn_for_dummy_run: bool = False, mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None, is_profile: bool = False, num_speculative_tokens: int | None = None) -> torch.Tensor'
+
+- id: dsv41-dspark-load-draft-model
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.load_draft_model
+  why: it returns the draft model (confidence head at model.model.confidence_head) and sets use_confidence_head only under adaptive verification; dspark_confidence.py sets it afterwards so the captured draft step computes the head into draft_token_confidence_probs
+  sha256: 7284ba4074a78bbb73f700b2fd4378f85358cc4b3bb0355a6ac0423cba4fc502
+  signature: '(self, target_model: torch.nn.modules.module.Module, target_attn_layer_names: set[str]) -> torch.nn.modules.module.Module'

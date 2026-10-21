@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_TOOL_CHOICE_NONE_MASK: bool = False
     VLLM_DFLASH_BOUNDARY_CACHE: bool = False
     VLLM_DSPARK_PER_K_WIDTH: bool = False
+    VLLM_DSPARK_CONFIDENCE_DUMP: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
@@ -553,6 +554,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # truncating. Each positive width has persistent anchors and CUDA graphs.
     "VLLM_DSPARK_PER_K_WIDTH": lambda: bool(
         int(os.getenv("VLLM_DSPARK_PER_K_WIDTH", "0"))
+    ),
+    # Diagnostics: a directory. The DSpark drafter computes its confidence
+    # head in every draft step (without adaptive verification) and TP rank 0
+    # appends each request's per-position confidences with the accepted
+    # length of the round they predicted (dspark_confidence.py). Empty: off.
+    "VLLM_DSPARK_CONFIDENCE_DUMP": lambda: os.getenv(
+        "VLLM_DSPARK_CONFIDENCE_DUMP", ""
     ),
     # Diagnostics (step-cost calibration): a file holding a depth; while it
     # holds one inside the adaptive_k load width, every step verifies that

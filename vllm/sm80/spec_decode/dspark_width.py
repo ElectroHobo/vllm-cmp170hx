@@ -33,6 +33,10 @@ def create_dspark_speculator(
     cls = DSparkSpeculator
     if envs.VLLM_DSPARK_PER_K_WIDTH:
         cls = PerKDSparkSpeculator
+    if envs.VLLM_DSPARK_CONFIDENCE_DUMP:
+        from vllm.sm80.spec_decode.dspark_confidence import confidence_dump_class
+
+        cls = confidence_dump_class(cls)
     return cls(vllm_config, device)
 
 
