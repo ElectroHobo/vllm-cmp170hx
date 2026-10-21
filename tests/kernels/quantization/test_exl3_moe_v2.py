@@ -246,10 +246,12 @@ def test_operator_list_and_workspace_contract():
     # FP16 hi/lo operands (2 x 2560 + 640 floats), 2^-e per (row, slice)
     # rounded to 4, then the routing table (header, sorted, tiles, the expert
     # of each sorted entry and of each assignment, then per row tile and
-    # projection the int64 trellis address and the tile columns).
+    # projection the int64 trellis address and the tile columns), then per row
+    # the folded call's counters (one per H128 block) and local-route count.
     lane = 640 * (2 * 8 * 640 + 2 * 2560 + 2 * 2560 + 640) + 640 * 18
     table = 4 + 640 + 4 * 640 + 640 + 640 + 2 * 3 * 640 + 3 * 640
-    assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) == lane + table
+    fold = 64 * (2560 // 128 + 1)
+    assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) == lane + table + fold
     assert size(1, 2500, 600, TOPK, LOCAL) == size(1, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
     assert size(64, HIDDEN, INTERMEDIATE, TOPK, 0) == 0
     with pytest.raises(RuntimeError, match="hidden 2560"):

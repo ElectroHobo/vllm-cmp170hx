@@ -21,5 +21,14 @@ void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
                 const torch::Tensor& expert_map, int64_t intermediate_size,
                 int64_t bits_x2, torch::Tensor& out, torch::Tensor& workspace,
                 double swiglu_limit);
+// moe_out_v2's arguments and output bits; the activation and combine stages
+// run inside the gate/up and down launches (three launches, not five).
+void moe_out_v2_fold(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                     const torch::Tensor& topk_weights,
+                     const torch::Tensor& packed_ptrs,
+                     const torch::Tensor& packed_meta,
+                     const torch::Tensor& expert_map, int64_t intermediate_size,
+                     int64_t bits_x2, torch::Tensor& out, torch::Tensor& workspace,
+                     double swiglu_limit);
 
 }  // namespace exl3

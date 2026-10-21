@@ -194,9 +194,11 @@ def test_workspace_contract():
     size = torch.ops._exl3_C.moe_workspace_size_v2
     a = 64 * TOPK
     # Slice partials (gate/up 2 x 16 x 2304, down 8 x 5120), FP16 hi/lo
-    # operands (2 x 5120 + 2304 floats), 2^-e per (row, slice), then the table.
+    # operands (2 x 5120 + 2304 floats), 2^-e per (row, slice), the table, then
+    # per row the folded call's counters (one per H128 block) and route count.
     lane = a * (2 * 16 * 2304 + 8 * 5120 + 2 * 5120 + 2304) + a * (2 * 16 + 8)
-    assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) == lane + _route_ints(a)
+    fold = 64 * (5120 // 128 + 1)
+    assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) == lane + _route_ints(a) + fold
     assert size(64, HIDDEN, INTERMEDIATE, TOPK, 0) == 0
     # The served moe_out workspace (2048 rows) already holds it.
     v1 = torch.ops._exl3_C.moe_workspace_size(2048, HIDDEN, INTERMEDIATE, TOPK, LOCAL)

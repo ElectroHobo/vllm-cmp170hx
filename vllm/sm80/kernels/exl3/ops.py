@@ -557,7 +557,61 @@ def moe_out_v2(
     )
 
 
-# (device, hidden, intermediate, bits_x2) warmed by warmup_moe_v2.
+_moe_v2_fold_fake_registered = False
+
+
+def require_moe_v2_fold() -> None:
+    """Refuse a library without moe_out_v2_fold (built from a tree before
+    it) and register the operator's fake implementation once per process."""
+    global _moe_v2_fold_fake_registered
+    ensure_extension()
+    try:
+        torch._C._dispatch_find_schema_or_throw("_exl3_C::moe_out_v2_fold", "")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "VLLM_EXL3_MOE_V2_FOLD needs _exl3_C::moe_out_v2_fold: rebuild the "
+            "EXL3 extension from this tree (python csrc/exl3/build_standalone.py "
+            f"--out vllm), or unset the flag. Detail: {exc}"
+        ) from exc
+    if not _moe_v2_fold_fake_registered:
+        torch.library.register_fake("_exl3_C::moe_out_v2_fold")(_moe_v2_fake)
+        _moe_v2_fold_fake_registered = True
+
+
+def moe_out_v2_fold(
+    x,
+    topk_ids,
+    topk_weights,
+    packed_ptrs,
+    packed_meta,
+    expert_map,
+    intermediate_size: int,
+    out,
+    workspace,
+    swiglu_limit: float = 0.0,
+    *,
+    bits_x2: int,
+) -> None:
+    """moe_out_v2's arguments and output bits in three launches: the
+    activation and the combine run inside the gate/up and down lane launches
+    (csrc/exl3/moe_v2.cu FoldArgs). Callers check require_moe_v2_fold first."""
+    ensure_extension()
+    torch.ops._exl3_C.moe_out_v2_fold(
+        x,
+        topk_ids,
+        topk_weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        bits_x2,
+        out,
+        workspace,
+        swiglu_limit,
+    )
+
+
+# (device, hidden, intermediate, bits_x2, fold) warmed by warmup_moe_v2.
 _moe_v2_warm: set[tuple] = set()
 
 
@@ -571,9 +625,10 @@ def warmup_moe_v2(
     top_k: int,
     bits_x2: int,
     swiglu_limit: float = 0.0,
+    fold: bool = False,
 ) -> None:
-    """Run moe_out_v2 per device, shape and bits_x2 before any CUDA graph
-    capture.
+    """Run moe_out_v2 (fold: moe_out_v2_fold) per device, shape and bits_x2
+    before any CUDA graph capture.
 
     Each lane kernel instance's first call queries the SM count and the
     kernel's occupancy and keeps them (moe_v2.cu launch_lane). The operator
@@ -584,9 +639,10 @@ def warmup_moe_v2(
     The temporary buffers are freed again.
     """
     device = packed_ptrs.device
-    key = (device, hidden_size, intermediate_size, bits_x2)
+    key = (device, hidden_size, intermediate_size, bits_x2, fold)
     if key in _moe_v2_warm:
         return
+    operator = moe_out_v2_fold if fold else moe_out_v2
     rows = MOE_V2_MAX_ROWS
     ids = torch.tensor(
         [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
@@ -602,7 +658,7 @@ def warmup_moe_v2(
         device=device,
     )
     for count in (1, rows):
-        moe_out_v2(
+        operator(
             x[:count],
             ids[:count],
             weights[:count],

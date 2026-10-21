@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     VLLM_ENGRAM_DIRECT_READ: bool = False
     VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
     VLLM_EXL3_MOE_V2: bool = False
+    VLLM_EXL3_MOE_V2_FOLD: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
     VLLM_EXL3_EXPERT_PLACEMENT: str = ""
@@ -1196,6 +1197,15 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # sm_80 (vllm/sm80/kernels/exl3/quant.py). Results differ from the default
     # kernels in the last bits. Default OFF: unset, every call takes moe_out.
     "VLLM_EXL3_MOE_V2": lambda: bool(int(os.getenv("VLLM_EXL3_MOE_V2", "0"))),
+    # With VLLM_EXL3_MOE_V2: its calls take moe_out_v2_fold, which runs the
+    # activation at the end of the gate/up launch and the combine at the end
+    # of the down launch (completion counters; csrc/exl3/moe_v2.cu FoldArgs):
+    # three launches per call instead of five, the same output bits. Needs an
+    # EXL3 extension built from this tree. Default OFF. Read in
+    # vllm/sm80/kernels/exl3/quant.py.
+    "VLLM_EXL3_MOE_V2_FOLD": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_V2_FOLD", "0"))
+    ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_prefill.cu) for
     # calls of 65..3460 rows in prefill steps (some request scheduled more
     # than 1 + num_speculative_tokens tokens), with the hidden-2560

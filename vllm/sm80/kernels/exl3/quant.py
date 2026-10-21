@@ -1032,6 +1032,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             moe_out_rows=moe_out_rows,
             moe_v2_rows=moe_v2_rows,
             moe_v2_bits_x2=moe_v2_bits_x2,
+            moe_v2_fold=bool(moe_v2_rows) and envs.VLLM_EXL3_MOE_V2_FOLD,
             prefill_decode_len=prefill_decode_len,
             prefill_v2_bits_x2=prefill_v2_bits_x2,
             prefill_v2_decode_len=prefill_v2_decode_len,
@@ -1095,6 +1096,25 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             bits_x2,
             rows,
         )
+        if envs.VLLM_EXL3_MOE_V2_FOLD:
+            exl3_ops.require_moe_v2_fold()
+            exl3_ops.warmup_moe_v2(
+                layer.exl3_ptrs,
+                layer.exl3_meta,
+                layer.exl3_expert_map,
+                self.global_expert_ids,
+                self.hidden_size,
+                self.intermediate_size,
+                layer.top_k,
+                bits_x2,
+                self.swiglu_limit,
+                fold=True,
+            )
+            logger.info_once(
+                "EXL3 MoE v2 folded (VLLM_EXL3_MOE_V2_FOLD): moe_out_v2_fold runs "
+                "the activation and combine inside the expert GEMM launches "
+                "(three launches per call, the same output bits).",
+            )
         return rows, bits_x2, workspace
 
     def _moe_prefill(self, layer, metadata, max_rows: int, workspace: int):
@@ -1273,6 +1293,8 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
     # per-call expert map that picks one owner rank per replicated expert
     # (replicas.py); None: the static expert map always.
     replica_map = None
+    # VLLM_EXL3_MOE_V2_FOLD: the moe_out_v2 calls take moe_out_v2_fold.
+    moe_v2_fold = False
 
     def __init__(
         self,
@@ -1285,6 +1307,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         moe_out_rows=None,
         moe_v2_rows=0,
         moe_v2_bits_x2=0,
+        moe_v2_fold=False,
         prefill_decode_len=0,
         prefill_v2_bits_x2=0,
         prefill_v2_decode_len=0,
@@ -1303,6 +1326,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         # the layer's routed-matrix bits_x2.
         self.moe_v2_rows = moe_v2_rows
         self.moe_v2_bits_x2 = moe_v2_bits_x2
+        self.moe_v2_fold = moe_v2_fold
         # Nonzero (VLLM_EXL3_MOE_PREFILL_TC with its gate open): calls of more
         # than 64 rows in a step that schedules some request more than this
         # many tokens take moe_out_prefill.
@@ -1391,7 +1415,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         expert_tokens_meta,
         apply_router_weight_on_input,
     ):
-        from vllm.sm80.kernels.exl3.ops import moe_out, moe_out_v2
+        from vllm.sm80.kernels.exl3.ops import moe_out, moe_out_v2, moe_out_v2_fold
 
         rows = hidden_states.shape[0]
         if rows > self.max_rows:
@@ -1403,7 +1427,10 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         ):
             raise ValueError("EXL3 MoE requires unquantized, unweighted BF16 inputs")
         if 0 < rows <= self.moe_v2_rows:
-            operator = partial(moe_out_v2, bits_x2=self.moe_v2_bits_x2)
+            operator = partial(
+                moe_out_v2_fold if self.moe_v2_fold else moe_out_v2,
+                bits_x2=self.moe_v2_bits_x2,
+            )
         else:
             operator = moe_out
         if self.prefill_decode_len:

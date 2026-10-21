@@ -520,6 +520,32 @@ def _moe_v2_apply(runner, on: bool) -> None:
         experts.moe_v2_rows = rows if on else 0
 
 
+def _moe_v2_fold_experts(runner) -> list:
+    return [e for e in _moepf_experts(runner) if getattr(e, "moe_v2_rows", 0)]
+
+
+def _moe_v2_fold_unavailable(runner) -> str | None:
+    from vllm.sm80.kernels.exl3 import ops
+
+    if not _moe_v2_fold_experts(runner):
+        return ("boot with VLLM_EXL3_MOE_V2=1: the fold changes how moe_out_v2 "
+                "calls run")
+    try:
+        ops.require_moe_v2_fold()
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
+def _moe_v2_fold_apply(runner, on: bool) -> None:
+    """The folded kernels' first call (SM count and occupancy, moe_v2.cu
+    launch_lane) is the arm's eager warmup run, before its graphs are
+    captured."""
+    _set_env("VLLM_EXL3_MOE_V2_FOLD", on)
+    for experts in _moe_v2_fold_experts(runner):
+        experts.moe_v2_fold = on
+
+
 def _splitk_unavailable(runner) -> str | None:
     from vllm.sm80.kernels.exl3 import ops
     if not ops._loaded:
@@ -865,6 +891,12 @@ SWITCHES: dict[str, Switch] = {
         Switch(
             "exl3_moe_v2", "VLLM_EXL3_MOE_V2", True, False,
             _moe_v2_unavailable, _moe_v2_current, _moe_v2_apply,
+        ),
+        Switch(
+            "exl3_moe_v2_fold", "VLLM_EXL3_MOE_V2_FOLD", True, True,
+            _moe_v2_fold_unavailable,
+            lambda runner: any(e.moe_v2_fold for e in _moe_v2_fold_experts(runner)),
+            _moe_v2_fold_apply,
         ),
         Switch(
             "exl3_dense_splitk", "VLLM_EXL3_DENSE_SPLITK", True, False,
