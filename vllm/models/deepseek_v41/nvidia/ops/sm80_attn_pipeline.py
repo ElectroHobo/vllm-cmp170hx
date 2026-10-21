@@ -27,8 +27,15 @@ def _rope_row(x, pos, freqs, D: tl.constexpr, RD: tl.constexpr):
     b = tl.gather(x, D - RD + (r ^ 1), 0).to(tl.float32)
     angle = pos.to(tl.float32) * tl.load(freqs + r // 2)
     sine = libdevice.sin(angle)
-    rotated = libdevice.add_rn(libdevice.mul_rn(a, libdevice.cos(angle)),
-        libdevice.mul_rn(b, tl.where(r % 2 == 0, -sine, sine)))
+    cosine = libdevice.cos(angle)
+    # The reference's complex64 multiply (sm80_attn_core.rope) as CUDA
+    # compiles c10::complex: real = fma(re, cos, -(im * sin)), imag =
+    # fma(re, sin, im * cos) -- one product rounded, then one fused rounding.
+    # Even r holds the real part (a = re, b = im), odd r the imaginary (a = im,
+    # b = re).
+    rotated = tl.where(r % 2 == 0,
+        libdevice.fma(a, cosine, -libdevice.mul_rn(b, sine)),
+        libdevice.fma(b, sine, libdevice.mul_rn(a, cosine)))
     rotated = rotated.to(tl.bfloat16).to(tl.float32)
     return tl.where(d >= D - RD,
         tl.gather(rotated, tl.maximum(d - (D - RD), 0), 0), x.to(tl.float32))
