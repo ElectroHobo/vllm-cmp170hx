@@ -1,148 +1,59 @@
-# B1: DeepSeek-V4.1 step fusion, attention pipeline fixes and prefill split-reduce
+# Copy-engine ring all-reduce for DeepSeek-V4.1 prefill sums
 
-Intent: one tree for the B1 bundle on base 7b31d6b252. Every item is behind
-its own default-off switch; B1 turns them on together:
-`VLLM_DEEPSEEK_V41_FUSED_ROUTE`, `VLLM_DEEPSEEK_V41_ATTN_PIPELINE`,
-`VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE`,
-`VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE` (an existing 7b31 switch)
-and the switches the current candidate already runs. Sections below, one per
-slice, in commit order.
-
-# MoE routing after the gate GEMM as one kernel
-
-`VLLM_DEEPSEEK_V41_FUSED_ROUTE` replaces the fifteen torch kernels of
-`sm80_moe.route` that follow the FP32 gate GEMM (image-token bias select,
-sqrt-softplus, bias add, top-k and its sort, gather, row sum, `+ 1e-20`,
-divide, scale, int32 ids) with one Triton kernel
-(`ops/sm80_route.py`). The FP32 operations and their order are torch's:
-libdevice `exp`/`log1p` compiled without flush-to-zero, `sqrt_rn`, `div_rn`,
-and the row sum in the order of torch's CUDA reduction kernel for a short
-contiguous row; the outputs are the torch path's bytes for finite logits
-(the order of exactly equal biased scores aside, which torch leaves open).
-`gate_temp != 1` is refused. A NaN biased score ranks first, as in
-`torch.topk`, so a NaN row keeps in-range expert ids and NaN weights. Files: `ops/sm80_route.py` (new),
-`sm80_moe.py` (router attribute and dispatch), `vllm/sm80/envs.py`,
-`vllm/sm80/dev_ab.py` (switch `dsv41_fused_route`). Tests:
-`test_sm80_route_fused.py` (interpreter vs torch, bitwise vs a NumPy model of
-the CUDA order, sm_80 compile and PTX checks, switch default) and
-`test_sm80_route_fused_gpu.py` (bytes vs the torch path on CUDA, the order
-model vs `torch.sum`, graph replay; GPU, unrun).
-
-# Attention pipeline: index work bounded by visibility
-
-In a FULL graph the pipeline's index width is the capacity
-(`max_model_len // ratio`); the score producer and the radix selector
-processed every column of every row each step. Segments past a row's visible
-count now take a fast path in the producer (the same -inf scores, block
-maxima and empty histogram, no scoring) and are skipped by every selector
-pass; grids keep the capacity width. Scores, maxima and selections are
-unchanged bit for bit. Files: `ops/sm80_attn_pipeline.py`,
-`ops/sm80_index_topk.py`. Tests: `test_sm80_index_visible.py` (interpreter,
-with the GPU `tl.histogram` semantics installed: the stock interpreter counts
-the out-of-range sentinel in the last bin), and a capacity-width case in
-`test_sm80_index_topk_gpu.py`.
-
-# Pipeline compressor circular predecessor
-
-The default-off attention pipeline now wraps a position-zero predecessor
-within its own ring, matching the existing Torch compressor. Triton lowers
-signed integer remainder to LLVM `srem`; `(position - 1) % capacity` is -1
-at position zero. The first row of a dummy request reads that predecessor
-even when its compressed-cache slot is padding. Clamping the ring slot to
-zero therefore previously read one row before the null ring block.
-Adding the capacity before subtracting one preserves the circular index for
-all supported nonnegative positions without changing pooling arithmetic,
-workspace ownership, graph mode, supported limits or flag defaults.
-
-The only production change is in `sm80_attn_pipeline.py`. Direct sibling
-ring stores require a nonnegative slot; the Torch reference already uses
-nonnegative remainder. No shared or upstream-owned production file changes.
-
-`test_sm80_pipeline_lifecycle.py` drives the actual launch wrapper and
-Triton interpreter through both predecessor loads, checking their addresses
-before dereferencing. It covers position zero, wrap boundaries, maximum
-context, null/owned blocks and padded strides. It also exercises actual
-manager-owned workspace allocations, ownership separation and locking.
-The address probe deliberately stops before unsupported libdevice math;
-it is not a GPU lifetime or numerical qualification. A focused CUDA test in
-`test_sm80_attn_pipeline_gpu.py` covers a fresh ring and graph pool before
-and after retirement with persistent production scratch; it remains unrun.
-The observed asynchronous CUDA fault still needs targeted device attribution.
-
-
-# Attention pipeline: graph-capture warm-up inputs test
-
-`test_sm80_attn_pipeline_gpu.py::test_capture_warmup_inputs_eager_then_graph`
-runs the pipeline with the capture warm-up's dummy inputs (zero positions,
-all-zero block tables at width 262144, padding or null-block slots, 4/6/48
-rows, all roles, production scratch shape) eagerly, then captured and
-replayed. Only the padding form is checked bitwise between eager and replay:
-with null-block slots every row writes the same null-block window row. Run
-on one card: 34 passed with the ring and capacity-width tests.
-
-# Prefill split-reduce: DeepSeek-V4.1 prefill all-reduces beside compute, in two row slices
-
-Intent: in a TP4 prefill step each of the 20 full-row decoder layers runs two
-large NCCL all-reduces (the FP32 `wo_b` sum and the BF16 MoE sum) between the
-compute that makes and the compute that needs them, so communication and
-compute add up. With `VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE=1` an eager step
-of at least 1024 rows runs each target layer's `wo_a`/`wo_b`, FFN mHC, MoE and
-both all-reduces in two row slices cut at a multiple of 512 rows, issuing the
-all-reduces on one side stream in program order: `wo_b(B)` runs beside the
-sum of `wo_b(A)`, `FFN(A)` beside the sum of `wo_b(B)`, `FFN(B)` beside the
-sum of `FFN(A)`. The attention runs on every row as before, and the layer's
-outputs are whole again at the join, so the next layer, the Engram layers and
-the decoder replay are unchanged. Default off; switch read at load.
+Intent: with `VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE=1`, the TP sums of the
+FP32 `wo_b` partial and of the MoE output that the host-staged and custom
+all-reduce do not take (eager prefill-sized messages) run on a copy-engine
+ring instead of NCCL. NCCL's ring moves the bytes with SM kernels that stay
+resident for the whole transfer, and the compute beside them (the prefill
+split reduction's overlap) slows 2-3x; copy-engine copies do not occupy SMs.
+The design follows b12x's PCIe DMA all-reduce (Apache-2.0): reduce-scatter +
+all-gather ring, `cudaMemcpyAsync` into the next rank's IPC scratch,
+one-block flag kernels, one add per reduce-scatter step. Default off; decode,
+graph capture and messages the custom all-reduce takes are unchanged.
 
 Files:
-- `vllm/models/deepseek_v41/nvidia/sm80_split_reduce.py` (new): the cut
-  (`cut_rows`, `split_point`), the side stream and its hand-offs
-  (`SideStream`, `_Pending`), the split post-attention schedule
-  (`post_attention`), the adoption (`adopt_split_reduce`).
-- `sm80_model.py`: the decoder layer takes the split path when its
-  `_split_reduce` is set and `split_point` cuts; the backbone adoption marks
-  its layers under the switch.
-- `sm80_attention.py`: `forward` is `_o_proj(attend(...))`; `_o_proj` is
-  `reduce_wo_b(wo_b_partial(...))` when `reduces_wo_b()`, as before.
-- `sm80_moe.py`: the layer-reduced MoE (`Sm80DeepseekV41MoE`) is now
-  `reduce(forward_partial(...))`; the switch adopts it with the runner's own
-  all-reduce (`_adopt_layer_all_reduce(round_once=False)`), the round-once
-  switch as before (`round_once=True`).
+- `vllm/sm80/distributed/ce_ring_all_reduce.py` (new): `ring_steps`,
+  `emulate` (the host's bits of the ring), `ring_ops` (one call's copies,
+  flag stores, flag waits and adds on a backend), the device backend (Triton
+  flag store, volatile-load flag wait, elementwise add; `cudaMemcpyAsync`
+  through the loaded CUDA runtime), `CeRingAllReduce` (IPC scratch: one slot
+  per ring step for a `max_num_batched_tokens` x hidden FP32 message, plus a
+  flag block; collective construction), `init_ce_ring` / `ce_ring`.
+- `sm80_attention.py`: `prefill_all_reduce` (the ring when it takes the
+  message and neither the host-staged nor the custom all-reduce does, else
+  `tensor_model_parallel_all_reduce`); the FP32 `wo_b` sum goes through it.
+- `sm80_moe.py`: the layer-reduced MoE's runner-path sum goes through
+  `prefill_all_reduce`; the switch adopts the layer-reduced MoE.
+- `sm80_model.py`: the backbone adoption builds the ring under the switch.
 - `vllm/sm80/envs.py`: the switch. `FORK.md` regenerated.
 
-Tests (CPU, `CUDA_VISIBLE_DEVICES=""`):
-- `tests/models/deepseek_v41/sm80/test_sm80_split_reduce.py`: the cut for
-  2044/2048/4096/1536/1100/1024 rows and refusals; `split_point` refuses graph
-  capture and replay, the kernel capture, MegaMoE metadata, short steps and
-  slices the host-staged or custom all-reduce would take; two split decoder
-  layers (model entry and a fused boundary, torch mHC) return the unsplit
-  layers' outputs bit for bit with row-wise sums, and issue attention,
-  `wo_b(A)`, its sum, `wo_b(B)`, its sum, `FFN(A)`, its sum, `FFN(B)`, its sum;
-  the side-stream hand-off order (wait for the current stream, run, record,
-  keep the input alive on the side stream; the consumer waits for the event
-  and keeps the output alive); adoption marks only layers that issue their own
-  sums; default off.
-- `test_sm80_moe_allreduce.py`: adoption in both modes, `forward` equals
-  `reduce(forward_partial)`.
-- `test_sm80_attention_wiring.py`: `reduces_wo_b`, and `_o_proj` equals the
-  concatenated row-slice `reduce_wo_b(wo_b_partial)`.
-- `tests/models/deepseek_v41/sm80` with `tests/sm80/test_seams.py` and the
-  guard tests: 650 passed, 357 skipped (GPU-only).
+Protocol per call (epoch = call count, the same on every rank): store the
+epoch into the previous rank's ready flag, wait for this rank's; then per ring
+step copy the send shard into the next rank's slot, store its step flag, wait
+for this rank's step flag, add (reduce-scatter: `out = input + slot`) or copy
+(all-gather). Flags are monotonic, slots are per step, the ready flag keeps a
+rank from writing a slot its neighbour may still read.
 
-Bits: not equal to the unsplit step. The cut keeps the MoE prefill kernel's
-512-row chunks and Marlin's 64-row blocks, but both all-reduce paths sum an
-element in an order set by its place in the message: NCCL's ring, and the
-two-stage custom all-reduce that carries the round-once `wo_b` pieces (rank
-ownership by position within the piece; a review case moves a sum by one BF16
-ulp). The split is judged by the V2 prefill dNLL check (B1's rounding job), not
-bitwise. On TP4 at 2048-row chunks only 1844-2048-row steps split.
+Bits: each element is summed in its owner's ring order in the message dtype
+(FP32 for `wo_b`, BF16 per add for the MoE, as NCCL's BF16 ring); every rank
+gets the same bits, `emulate` reproduces them. The order differs from NCCL's,
+so outputs change against the NCCL build (V6).
 
-Known limits: the speed gain depends on how much the compute beside an NCCL
-all-reduce slows (unmeasured for these kernels); the two slices' FFN mHC
-outputs (streams, mixes, next pre-mix) are concatenated, one extra copy of
-the streams per layer; a step whose slices the host-staged or custom
-all-reduce would take runs whole. Four-card correctness and speed are outside
-pytest.
+Tests (CPU): `tests/sm80/test_ce_ring_all_reduce.py`: schedule properties
+(world 2/3/4/8), emulation against the FP64 sum, `ring_ops` for every rank on
+a host memory model over three back-to-back calls (world 2 and 4, FP32 and
+BF16): emulated bits on every rank and every copy's bytes checked where they
+land; ready-before-write ordering; host tensors refused. Dispatch:
+`tests/models/deepseek_v41/sm80/test_sm80_ce_allreduce_dispatch.py`. With
+`tests/models/deepseek_v41/sm80` and `tests/sm80/test_seams.py`: 695 passed,
+403 skipped (GPU-only). The ring test file fails to collect on the base (no
+module).
+
+Known limits: one stream, one piece per step (no copy/add pipelining); the
+flag wait spins one block while a peer copy is in flight (the four-card
+check measures Marlin beside it); 63 MiB of device memory per rank at TP4
+with 2048-row steps; decode sums are unaffected by construction (custom
+all-reduce sizes, graphs). Four-card bits and timing are outside pytest.
 
 Removes: nothing.
 

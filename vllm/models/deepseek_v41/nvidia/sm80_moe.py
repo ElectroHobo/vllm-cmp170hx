@@ -47,6 +47,7 @@ from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv, sm80_route
 from vllm.models.deepseek_v41.nvidia.sm80_attention import (
     large_round_once_all_reduce,
+    prefill_all_reduce,
     round_once_transport,
 )
 
@@ -246,6 +247,7 @@ def adopt_moe(ffn: nn.Module, config) -> None:
     if (
         envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
         or envs.VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE
+        or envs.VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE
     ):
         _adopt_layer_all_reduce(
             ffn, round_once=envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
@@ -296,7 +298,7 @@ class Sm80DeepseekV41MoE(upstream_model.DeepseekV4MoE):
         """The TP all-reduce of :meth:`forward_partial`'s output."""
         if self._round_once:
             return moe_all_reduce(out)
-        return tensor_model_parallel_all_reduce(out)
+        return prefill_all_reduce(out)
 
 
 def _adopt_layer_all_reduce(ffn: nn.Module, *, round_once: bool) -> None:

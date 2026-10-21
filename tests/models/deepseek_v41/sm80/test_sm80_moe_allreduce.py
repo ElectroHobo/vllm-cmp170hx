@@ -98,7 +98,7 @@ def test_layer_all_reduce_moves_the_final_all_reduce_into_the_layer(
 
     monkeypatch.setattr(dsv41_model.DeepseekV4MoE, "forward", upstream_forward)
     monkeypatch.setattr(sm80_moe, "moe_all_reduce", lambda t: t * 2)
-    monkeypatch.setattr(sm80_moe, "tensor_model_parallel_all_reduce", lambda t: t * 3)
+    monkeypatch.setattr(sm80_moe, "prefill_all_reduce", lambda t: t * 3)
     x = torch.ones(3, 8, dtype=BF16)
     ids = torch.arange(3)
     got = ffn(x, ids, "meta")

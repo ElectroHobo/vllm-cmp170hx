@@ -71,6 +71,7 @@ from vllm.sm80 import capture
 from vllm.sm80.kernels.exl3.quant import set_output_dtype
 from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len, prefill_step
 from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
+from vllm.sm80.distributed import ce_ring_all_reduce
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -1033,7 +1034,22 @@ def wo_b_all_reduce(
         out = large_round_once_all_reduce(partial)
         if out is not None:
             return out
-    return tensor_model_parallel_all_reduce(partial.float()).to(partial.dtype)
+    return prefill_all_reduce(partial.float()).to(partial.dtype)
+
+
+def prefill_all_reduce(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s TP all-reduce: through the copy-engine ring
+    (VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE, ``ce_ring_all_reduce.py``) when it
+    takes ``t`` and neither the host-staged nor the custom all-reduce does
+    (eager prefill-sized messages); otherwise
+    ``tensor_model_parallel_all_reduce``."""
+    ring = ce_ring_all_reduce.ce_ring()
+    if ring is not None and ring.takes(t):
+        comm = get_tp_group().device_communicator
+        host = getattr(comm, "hostshm_comm", None)
+        if not (host is not None and host.should_host_ar(t)) and not custom_all_reduce_takes(t):
+            return ring.all_reduce(t)
+    return tensor_model_parallel_all_reduce(t)
 
 
 def all_reduce_in_pieces(t: torch.Tensor, pieces: list[torch.Tensor]) -> torch.Tensor:

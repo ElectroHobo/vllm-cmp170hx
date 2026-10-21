@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE: bool = False
+    VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
@@ -927,6 +928,18 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vllm/models/deepseek_v41/nvidia/sm80_model.py and sm80_moe.py.
     "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: TP all-reduces of the FP32 wo_b partial and of the
+    # MoE output that the host-staged and custom all-reduce do not take (eager
+    # prefill-sized messages) run on a copy-engine ring instead of NCCL
+    # (vllm/sm80/distributed/ce_ring_all_reduce.py): copy-engine copies into
+    # the next rank's IPC scratch, one-block flag kernels and one add per
+    # reduce-scatter step. Device memory per rank: one scratch slot per ring
+    # step for a max_num_batched_tokens x hidden FP32 message (63 MiB at TP4,
+    # 2048 x 5120). The sum order is the ring's, not NCCL's. Default OFF.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_model.py and sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: run the decoder layers' delayed mHC (the fused
     # post + pre at every sublayer boundary and the pre-only entries) through

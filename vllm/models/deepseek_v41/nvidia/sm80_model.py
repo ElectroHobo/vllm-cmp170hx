@@ -323,6 +323,8 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             sm80_split_reduce.adopt_split_reduce(
                 islice(model.layers, model.start_layer, model.end_layer)
             )
+        if envs.VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE:
+            _init_ce_ring(model)
         replay = model.decoder_replay_layers
         if replay is not None:
             # Upstream bound the replay's KV write to the layer before its
@@ -343,6 +345,28 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_by_layer[self.end_layer] = hidden_states.mean(dim=1)
         return hidden_states
+
+
+def _init_ce_ring(model) -> None:
+    """VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE: build the TP group's copy-engine
+    ring (collective), sized for the largest FP32 ``wo_b`` sum of a step:
+    ``max_num_batched_tokens`` rows of the hidden size in FP32."""
+    from vllm.distributed.parallel_state import get_tp_group
+    from vllm.sm80.distributed.ce_ring_all_reduce import init_ce_ring
+
+    group = get_tp_group()
+    if group.world_size < 2:
+        return
+    rows = model.vllm_config.scheduler_config.max_num_batched_tokens
+    ring = init_ce_ring(group, rows * model.config.hidden_size * 4)
+    logger.info_once(
+        "DeepSeek-V4.1 sm_80: prefill-sized TP all-reduces run on the copy-engine "
+        "ring (VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE=1): messages up to %d bytes, "
+        "%.1f MiB of device memory per rank",
+        ring.capacity_bytes,
+        ring.device_bytes / 2**20,
+        scope="global",
+    )
 
 
 class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
