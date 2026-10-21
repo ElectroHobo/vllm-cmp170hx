@@ -26,6 +26,7 @@ The judged value is one output of the consumer call (``residual``, ``post``,
 picked row's chain run alone gives the chain's bits.
 """
 
+import collections
 import contextlib
 import hashlib
 from pathlib import Path
@@ -37,7 +38,10 @@ from tests.models.deepseek_v41.sm80 import fp64_cases as F
 # producer output -> consumer argument it is carried into
 LINKS = (("out_residual", "residual"), ("out_post", "post_layer_mix"),
          ("out_comb", "comb_res_mix"), ("out_pre", "pre_mix"))
-_CACHE: dict = {}
+# the judged values of the last pairs evaluated: a cell's cases (one per output)
+# pool the same pairs, at most 8
+_CACHE: collections.OrderedDict = collections.OrderedDict()
+_CACHED_PAIRS = 8
 
 
 def load_source(link: dict) -> dict:
@@ -104,8 +108,9 @@ def _fp64(p: dict, c: dict, chain=None) -> dict:
 
 def _evaluate(meta: dict, device) -> dict:
     key = (meta["producer"]["path"], meta["consumer"]["path"], str(device))
-    if key not in _CACHE:
-        _CACHE.clear()
+    if key in _CACHE:
+        _CACHE.move_to_end(key)
+    else:
         pt, ct = load_source(meta["producer"]), load_source(meta["consumer"])
         check_link(pt, ct)
         p, c = _args(pt), _args(ct)
@@ -117,9 +122,14 @@ def _evaluate(meta: dict, device) -> dict:
             return all(F.bits_equal(chain[2][o][i:i + 1], _chain(p, c, device, slice(i, i + 1), v2)[2][o])
                        for i in F.picks(n) for o in chain[2])
 
-        _CACHE[key] = dict(cand=cand, ref=ref, plain=_fp64(p, c), cand_rp=_fp64(p, c, cand),
-                           ref_rp=_fp64(p, c, ref), cand_alone=alone(True, cand),
+        def rp(chain):
+            return {k: v for k, v in _fp64(p, c, chain).items() if k != "residual"}
+
+        _CACHE[key] = dict(cand=cand[2], ref=ref[2], plain=_fp64(p, c), cand_rp=rp(cand),
+                           ref_rp=rp(ref), cand_alone=alone(True, cand),
                            ref_alone=alone(False, ref))
+        while len(_CACHE) > _CACHED_PAIRS:
+            _CACHE.popitem(last=False)
     return _CACHE[key]
 
 
@@ -129,7 +139,7 @@ def mhc_finish_consumer(a: dict, device, src) -> F.Call:
     if name not in F.MHC_OUTPUTS or mode not in ("", "rp") or (name, mode) == ("residual", "rp"):
         raise ValueError(f"mHC consumer output {output!r} is not one of {F.MHC_OUTPUTS} or <output>.rp")
     e = _evaluate(src.meta, device)
-    cand, ref = e["cand"][2][name], e["ref"][2][name]
+    cand, ref = e["cand"][name], e["ref"][name]
     if mode == "rp":
         exact, ref_exact = e["cand_rp"][name], e["ref_rp"][name]
     else:
