@@ -916,10 +916,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # slices, the all-reduces on a side stream, so one slice's all-reduce runs
     # beside the other slice's compute (sm80_split_reduce.py). Each slice's
     # message takes the path the whole message would; steps whose slices the
-    # host-staged or custom all-reduce would take run whole. Bits equal the
-    # unsplit step's where the per-row kernels and the all-reduce do not
-    # depend on the row count (the round-once paths do not; NCCL's ring sums
-    # an element in an order set by its place in the message). Default OFF:
+    # host-staged or custom all-reduce would take run whole. Not bit-equal to
+    # the unsplit step (NCCL's ring and the two-stage custom all-reduce both
+    # sum an element in an order set by its place in the message); judged by
+    # the V2 prefill dNLL check. Default OFF:
     # unset, every layer runs whole. Read in
     # vllm/models/deepseek_v41/nvidia/sm80_model.py and sm80_moe.py.
     "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE": lambda: bool(

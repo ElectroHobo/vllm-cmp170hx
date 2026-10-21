@@ -129,12 +129,13 @@ Tests (CPU, `CUDA_VISIBLE_DEVICES=""`):
 - `tests/models/deepseek_v41/sm80` with `tests/sm80/test_seams.py` and the
   guard tests: 650 passed, 357 skipped (GPU-only).
 
-Bits: equal to the unsplit step when the per-row kernels do not depend on the
-call's row count and the all-reduce is split-invariant. The cut keeps the MoE
-prefill kernel's 512-row chunks and Marlin's 64-row blocks; the round-once
-all-reduces are split-invariant, NCCL's ring is not (an element's sum order
-follows its place in the message), so with the default FP32/BF16 ring sums the
-bits may differ.
+Bits: not equal to the unsplit step. The cut keeps the MoE prefill kernel's
+512-row chunks and Marlin's 64-row blocks, but both all-reduce paths sum an
+element in an order set by its place in the message: NCCL's ring, and the
+two-stage custom all-reduce that carries the round-once `wo_b` pieces (rank
+ownership by position within the piece; a review case moves a sum by one BF16
+ulp). The split is judged by the V2 prefill dNLL check (B1's rounding job), not
+bitwise. On TP4 at 2048-row chunks only 1844-2048-row steps split.
 
 Known limits: the speed gain depends on how much the compute beside an NCCL
 all-reduce slows (unmeasured for these kernels); the two slices' FFN mHC

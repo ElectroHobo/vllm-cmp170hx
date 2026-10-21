@@ -30,10 +30,14 @@ slice's sum takes the path the whole message would
 step splits only when the host-staged and the custom all-reduce take neither
 slice: their messages stay whole on the main stream.
 
-Bits equal the unsplit step's when the per-row kernels' outputs do not depend
-on the call's row count and the all-reduce is split-invariant: the round-once
-paths are; NCCL's ring sums an element in an order set by its place in the
-message, so with the ring a slice's sums can differ in the last bit.
+A split step is not bit-equal to the unsplit one: both all-reduce paths sum
+an element in an order set by its place in the message. NCCL's ring does, and
+so does the custom all-reduce's two-stage kernel that carries the round-once
+``wo_b`` pieces (each rank owns a share of a piece by position, and splitting
+moves every element of slice B), so a sum can move by one BF16 ulp. Splitting
+is judged by the V2 prefill dNLL check, not bitwise. On TP4 at 2048-row
+chunks, steps split only at 1844-2048 rows (the custom all-reduce takes a
+whole 512-row slice, so shorter steps run whole).
 
 Eager steps only (never during CUDA graph capture or replay), target decoder
 layers (``DeepseekV4Model``), TP > 1.
