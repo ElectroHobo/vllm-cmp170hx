@@ -1426,3 +1426,73 @@ seams:
   why: the per-group input block tables and the stacked slot mappings are allocated once, so sm80_swa_meta_batch can learn their addresses from one step and launch on them in the next
   sha256: d7ae50c01b47a6193d06243d62ac0dff8bd27d5cb1bfe749e125ffa0b0614346
   signature: '(self, block_sizes: list[int], max_num_reqs: int, max_num_batched_tokens: int, max_num_blocks_per_group: list[int], device: torch.device, cp_size: int = 1, cp_rank: int = 0, cp_interleave: int = 1, slot_mapping_enabled: list[bool] | None = None, dcp_sharded: list[bool] | None = None)'
+
+- id: dsv41-recovery-engine-reset
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine.reset
+  why: parser_recovery.RecoveringParserEngine.adopt swaps the class of the engine ParserEngine.__init__ built (no __slots__, nothing else holds the class) and its reset override clears the held candidate after this reset
+  sha256: 5525dd77c49afd19577cb2b94998aeb793a3f65c74dad57ee90699a3185943f4
+  signature: '(self, initial_state: ''ParserState | None'' = None) -> ''None'''
+
+- id: dsv41-recovery-engine-finish
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine.finish
+  why: with a candidate held, RecoveringParserEngine.finish drains the scanner and lexer the way this does, restores the candidate as text, then calls this; it relies on flush_pending and flush returning nothing the second time
+  sha256: f5dd08110cd7e1c8e70efd00a54ab9a8b5d4c7c0c31ba9026feaf250512a1f28
+  signature: (self) -> 'list[SemanticEvent]'
+
+- id: dsv41-recovery-engine-on-terminal
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine._on_terminal
+  why: RecoveringParserEngine handles held candidates and provisional transitions before this and calls it for everything else; a transition must still reach _apply_transition and a terminal without one _emit_for_state, and the skip_tool_parsing projection must still emit tool openers in CONTENT as text
+  sha256: 3dc011d98ed5d36cec26b446359471d13f2f8a59ca8607057d7390a69f9a425a
+  signature: '(self, terminal: ''str'', value: ''str'', token_count: ''int'' = 0) -> ''list[SemanticEvent]'''
+
+- id: dsv41-recovery-engine-emit-for-state
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine._emit_for_state
+  why: every text the engine emits passes through it (feed fast path, _on_content, terminals without a transition), so the override buffers a held candidate's text there; the base returns the state's events without side effects outside TOOL_ARGS JSON buffering, which DSML does not use
+  sha256: fa6dc3e6b302e6b19aa0a81c77b6f1aba6ec24f1e75bc1d15d480609888700a6
+  signature: '(self, text: ''str'', token_count: ''int'' = 0) -> ''list[SemanticEvent]'''
+
+- id: dsv41-recovery-engine-apply-transition
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine._apply_transition
+  why: a held candidate runs its real transitions through this and buffers the returned events; it sets state, increments tool_index on TOOL_CALL_START and needs nothing but the Transition fields, so a RecoveryTransition subclass passes
+  sha256: 6629f571e44dae365908f6d0a8ee27333fd1a01f497e433a07d922b1ec58f34c
+  signature: '(self, transition: ''Transition'', value: ''str'', token_count: ''int'' = 0) -> ''list[SemanticEvent]'''
+
+- id: dsv41-recovery-parser-check-skip
+  kind: method
+  target: vllm.parser.engine.parser_engine:ParserEngine._check_skip_tool_parsing
+  why: each request entry point of the parser calls it with the request; the recovering V4.1 parser overrides it to take that request's tools for name validation and headless inference
+  sha256: 556599d84c5bc024b47eefee9b6dce1327ba567791ed0788c9f86cf73dd4a288
+  signature: '(self, request: ''ChatCompletionRequest | ResponsesRequest'') -> ''None'''
+
+- id: dsv41-recovery-parser-extract-name
+  kind: method
+  target: vllm.parser.engine.parser_engine:ParserEngine._try_extract_name
+  why: a call without TOOL_NAME events is named through it when its arguments arrive and when it ends; the recovering V4.1 parser falls back to the headless tool inference there
+  sha256: a11925e4916f5cab43c85ce5170999a2aac610c93e70a302014e2db9f1cf77f9
+  signature: '(self, idx: ''int'') -> ''str | None'''
+
+- id: dsv41-recovery-v4-parser-init
+  kind: method
+  target: vllm.parser.deepseek_v4:DeepSeekV4Parser.__init__
+  why: builds the engine from parser_config(thinking=...), which the recovering V4.1 parser replaces with its recovery config before adopting self._engine
+  sha256: 7b175e1d7ac1ca5d45fe5f18116072236e8fa24877a715ef781c4aed9f921d88
+  signature: '(self, tokenizer: ''TokenizerLike'', tools: ''list[Tool] | None'' = None, **kwargs) -> ''None'''
+
+- id: dsv41-recovery-v4-convert-args
+  kind: method
+  target: vllm.parser.deepseek_v4:DeepSeekV4Parser._convert_args
+  why: well-formed DSML arguments keep this conversion; the recovering V4.1 parser only replaces it for arguments carrying the XML idiom
+  sha256: 2519c74a64c5310dba2b9b230cee4344d48619999e97432585c506e15c3f488e
+  signature: '(self, raw_args: ''str'', partial: ''bool'') -> ''str'''
+
+- id: dsv41-recovery-v41-config
+  kind: function
+  target: vllm.parser.deepseek_v41:deepseek_v41_config
+  why: deepseek_v41_recovery extends this config by terminal name (TOOL_START, TOOL_END, INVOKE_NAME_END, INVOKE_END, PARAM_START, PARAM_CLOSE) and reuses its (TOOL_ARGS, INVOKE_END) transition
+  sha256: 3ad93c31920e9dec85f158a43781ea693e193feff9859cbcdc05922f3a1f638a
+  signature: '(thinking: bool = False) -> vllm.parser.engine.parser_engine_config.ParserEngineConfig'
