@@ -60,6 +60,43 @@ def test_score_histogram_and_both_selectors_are_bit_exact(source, masked, width)
         assert torch.equal(caches.candidates.cpu(), candidates)
 
 
+@pytest.mark.parametrize('source,masked', [(True, False), (False, False), (False, True)])
+def test_capacity_width_with_short_rows_is_bit_exact_on_poisoned_scratch(source, masked):
+    """The served shape: capacity width (max_model_len) far above the rows'
+    visible counts. Segments past a row's visible count are skipped by the
+    selectors and take the producer's fast path; poisoned scratch and a NaN
+    score spool must not change a byte of the scores, maxima or selections."""
+    width = 262144
+    g = torch.Generator().manual_seed(37)
+    q, w, visible, req, keys, table = _index_case(g, n=4, blocks=(width + 63) // 64)
+    visible[:] = torch.tensor([0, 5, 1033, 4097])
+    scores = core.index_scores_torch(q, w, visible, req, keys, table, width, 8)
+    candidates = torch.full((4, 2048), -1, dtype=torch.int32)
+    if masked:
+        candidates[:, :3] = torch.tensor([0, 2, 129])
+        expected_scores = core.mask_to_candidates(scores, candidates, 8)
+    else:
+        expected_scores = scores
+    cfg = config(compress_ratio=1, is_candidate_source=source, uses_candidates=masked)
+    batch = core.Sm80AttnBatch(visible.cuda() - 1, req.cuda(), torch.zeros(1, device='cuda'),
+        torch.where(visible > 0, 0, -1).cuda(), torch.empty(4, 0, dtype=torch.int32, device='cuda'),
+        idxk_block_table=table.cuda(), max_seq_len=width)
+    caches = core.Sm80AttnCaches(swa=torch.empty(0, device='cuda'), idxk=keys.cuda(),
+        topk=torch.empty((4, 512), dtype=torch.int32, device='cuda'), candidates=candidates.cuda())
+    ws = pipe.PipelineWorkspace(4, width, 1280, 'cuda')
+    ws.scores.fill_(float('nan'))
+    ws.maxima.fill_(float('nan'))
+    for name in ('hist', 'totals', 'counts', 'prefixes', 'state'):
+        getattr(ws.selection, name).fill_(-12345)
+    pipe.run_indexer(cfg, caches, batch, q.cuda(), w.cuda(), ws)
+    assert torch.equal(ws.scores.cpu(), expected_scores)
+    assert torch.equal(caches.topk.cpu(), core.topk_canonical(expected_scores, visible, 512))
+    if source:
+        assert torch.equal(caches.candidates.cpu(), core.select_candidate_blocks(scores, visible, 2048, 8))
+    else:
+        assert torch.equal(caches.candidates.cpu(), candidates)
+
+
 def test_score_producer_addresses_past_int32():
     g = torch.Generator().manual_seed(17)
     keys = _huge_view(3, 4, 128, 2**30 + 512)

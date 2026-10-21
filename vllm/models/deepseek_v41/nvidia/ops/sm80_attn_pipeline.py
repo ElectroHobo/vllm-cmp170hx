@@ -164,36 +164,49 @@ def _index_score_stats_kernel(q, w, nvis, req, cache, bt, candidates, scores,
     seg = tl.program_id(1)
     visible = tl.load(nvis + t)
     histogram = tl.zeros((256,), tl.int32)
-    for tile in range(B // 64):
-        cols = seg * B + tile * 64 + tl.arange(0, 64)
-        total = tl.full((64,), float('-inf'), tl.float32)
-        if seg * B + tile * 64 < visible:
-            total = score_tile(q, w, req, cache, bt, t, cols, visible,
-                qs, qh, ws, kb, ke, bts, E, H, D, HPR, 64)
-        if MASK:
-            # Candidate IDs are sorted and -1 padded. Binary search the
-            # sorted valid prefix using -1 as +infinity, without a mask spool.
-            block = cols // CB
-            lo = tl.full((64,), 0, tl.int32)
-            hi = tl.full((64,), CK, tl.int32)
-            for _ in range(SEARCH_STEPS):
-                mid = (lo + hi) // 2
-                value = tl.load(candidates + t * cs + mid, mid < CK, -1)
-                value = tl.where(value < 0, 2147483647, value)
-                less = value < block
-                lo = tl.where(less, mid + 1, lo)
-                hi = tl.where(less, hi, mid)
-            found = tl.load(candidates + t * cs + lo, lo < CK, -1) == block
-            total = tl.where((cols < visible) & ~found, -3.4028234663852886e38, total)
-        tl.store(scores + t * ss + cols, total, cols < width)
+    if seg * B >= visible:
+        # No visible column: the same -inf scores, block maxima and empty
+        # histogram the tile loop below writes, without scoring, candidate
+        # searches or histograms.
+        cols = seg * B + tl.arange(0, B)
+        tl.store(scores + t * ss + cols, tl.full((B,), float('-inf'), tl.float32),
+                 cols < width)
         if SOURCE:
-            block_ids = (seg * B + tile * 64) // CB + tl.arange(0, 64 // CB)
-            best = tl.max(tl.reshape(total, (64 // CB, CB)), 1)
-            best = tl.where(block_ids == (visible - 1) // CB, float('inf'), best)
+            block_ids = seg * B // CB + tl.arange(0, B // CB)
+            best = tl.where(block_ids == (visible - 1) // CB, float('inf'), float('-inf'))
             tl.store(maxima + t * ms + block_ids, best, block_ids < (width + CB - 1) // CB)
-        byte = (float_key(total) >> 24).to(tl.int32)
-        histogram += tl.histogram(tl.where((cols < width) & (cols < visible), byte, 256), 256)
-    tl.store(hist + (t * NS + seg) * 256 + tl.arange(0, 256), histogram)
+        tl.store(hist + (t * NS + seg) * 256 + tl.arange(0, 256), histogram)
+    else:
+        for tile in range(B // 64):
+            cols = seg * B + tile * 64 + tl.arange(0, 64)
+            total = tl.full((64,), float('-inf'), tl.float32)
+            if seg * B + tile * 64 < visible:
+                total = score_tile(q, w, req, cache, bt, t, cols, visible,
+                    qs, qh, ws, kb, ke, bts, E, H, D, HPR, 64)
+            if MASK:
+                # Candidate IDs are sorted and -1 padded. Binary search the
+                # sorted valid prefix using -1 as +infinity, without a mask spool.
+                block = cols // CB
+                lo = tl.full((64,), 0, tl.int32)
+                hi = tl.full((64,), CK, tl.int32)
+                for _ in range(SEARCH_STEPS):
+                    mid = (lo + hi) // 2
+                    value = tl.load(candidates + t * cs + mid, mid < CK, -1)
+                    value = tl.where(value < 0, 2147483647, value)
+                    less = value < block
+                    lo = tl.where(less, mid + 1, lo)
+                    hi = tl.where(less, hi, mid)
+                found = tl.load(candidates + t * cs + lo, lo < CK, -1) == block
+                total = tl.where((cols < visible) & ~found, -3.4028234663852886e38, total)
+            tl.store(scores + t * ss + cols, total, cols < width)
+            if SOURCE:
+                block_ids = (seg * B + tile * 64) // CB + tl.arange(0, 64 // CB)
+                best = tl.max(tl.reshape(total, (64 // CB, CB)), 1)
+                best = tl.where(block_ids == (visible - 1) // CB, float('inf'), best)
+                tl.store(maxima + t * ms + block_ids, best, block_ids < (width + CB - 1) // CB)
+            byte = (float_key(total) >> 24).to(tl.int32)
+            histogram += tl.histogram(tl.where((cols < width) & (cols < visible), byte, 256), 256)
+        tl.store(hist + (t * NS + seg) * 256 + tl.arange(0, 256), histogram)
 
 
 class PipelineWorkspace:

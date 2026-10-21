@@ -5,6 +5,11 @@
 Four byte passes find the exact FP32 cutoff. Segment counts and a prefix
 scatter emit ascending positions, taking the earliest equal scores. No heap,
 full-context sort, tensor-driven host loop or inter-CTA waiting is used.
+Every pass reads only the segments that hold a visible column of its row
+(``seg * SEGMENT < min(n_vis, width)``); the others hold no candidate, so
+their programs return at once and their scratch is never read. The grid
+keeps the capacity width (graph-safe); the memory traffic follows the
+row's visible count instead.
 The score spool remains live until BOTH token and candidate selectors finish.
 """
 import torch
@@ -39,24 +44,28 @@ def _radix_hist(scores, nvis, state, hist, width, ss: tl.constexpr,
                 NS: tl.constexpr, SHIFT: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     seg = tl.program_id(1)
-    col = seg * B + tl.arange(0, B)
-    valid = (col < width) & (col < tl.load(nvis + row))
-    x = tl.load(scores + row * ss + col, col < width, float('-inf'))
-    key = float_key(x)
-    prefix = tl.load(state + row * 3).to(tl.uint32)
-    if SHIFT < 24:
-        valid = valid & ((key >> (SHIFT + 8)) == (prefix >> (SHIFT + 8)))
-    byte = ((key >> SHIFT) & 255).to(tl.int32)
-    counts = tl.histogram(tl.where(valid, byte, 256), 256)
-    tl.store(hist + (row * NS + seg) * 256 + tl.arange(0, 256), counts)
+    visible = tl.minimum(tl.load(nvis + row), width)
+    if seg * B < visible:
+        col = seg * B + tl.arange(0, B)
+        valid = col < visible
+        x = tl.load(scores + row * ss + col, col < width, float('-inf'))
+        key = float_key(x)
+        prefix = tl.load(state + row * 3).to(tl.uint32)
+        if SHIFT < 24:
+            valid = valid & ((key >> (SHIFT + 8)) == (prefix >> (SHIFT + 8)))
+        byte = ((key >> SHIFT) & 255).to(tl.int32)
+        counts = tl.histogram(tl.where(valid, byte, 256), 256)
+        tl.store(hist + (row * NS + seg) * 256 + tl.arange(0, 256), counts)
 
 
 @triton.jit
-def _hist_reduce(hist, totals, NS: tl.constexpr, BS: tl.constexpr):
+def _hist_reduce(hist, totals, nvis, width, NS: tl.constexpr, BS: tl.constexpr,
+                 B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     byte = tl.program_id(1)
     seg = tl.arange(0, BS)
-    c = tl.load(hist + (row * NS + seg) * 256 + byte, seg < NS, 0)
+    used = (tl.minimum(tl.load(nvis + row), width) + B - 1) // B
+    c = tl.load(hist + (row * NS + seg) * 256 + byte, (seg < NS) & (seg < used), 0)
     tl.store(totals + row * 256 + byte, tl.sum(c, 0))
 
 
@@ -80,21 +89,27 @@ def _selection_counts(scores, nvis, state, counts, width, ss: tl.constexpr,
                       NS: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     seg = tl.program_id(1)
-    col = seg * B + tl.arange(0, B)
-    valid = (col < width) & (col < tl.load(nvis + row))
-    x = tl.load(scores + row * ss + col, col < width, float('-inf'))
-    key = float_key(x)
-    cutoff = tl.load(state + row * 3).to(tl.uint32)
-    tl.store(counts + (row * NS + seg) * 2, tl.sum((valid & (key > cutoff)).to(tl.int32), 0))
-    tl.store(counts + (row * NS + seg) * 2 + 1, tl.sum((valid & (key == cutoff)).to(tl.int32), 0))
+    visible = tl.minimum(tl.load(nvis + row), width)
+    if seg * B < visible:
+        col = seg * B + tl.arange(0, B)
+        valid = col < visible
+        x = tl.load(scores + row * ss + col, col < width, float('-inf'))
+        key = float_key(x)
+        cutoff = tl.load(state + row * 3).to(tl.uint32)
+        tl.store(counts + (row * NS + seg) * 2,
+                 tl.sum((valid & (key > cutoff)).to(tl.int32), 0))
+        tl.store(counts + (row * NS + seg) * 2 + 1,
+                 tl.sum((valid & (key == cutoff)).to(tl.int32), 0))
 
 
 @triton.jit
-def _selection_prefix(counts, prefixes, state, NS: tl.constexpr, BS: tl.constexpr):
+def _selection_prefix(counts, prefixes, state, nvis, width, NS: tl.constexpr,
+                      BS: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     seg = tl.arange(0, BS)
-    gt = tl.load(counts + (row * NS + seg) * 2, seg < NS, 0)
-    eq = tl.load(counts + (row * NS + seg) * 2 + 1, seg < NS, 0)
+    used = (seg < NS) & (seg < (tl.minimum(tl.load(nvis + row), width) + B - 1) // B)
+    gt = tl.load(counts + (row * NS + seg) * 2, used, 0)
+    eq = tl.load(counts + (row * NS + seg) * 2 + 1, used, 0)
     tl.store(prefixes + (row * NS + seg) * 2, tl.cumsum(gt, 0) - gt, seg < NS)
     tl.store(prefixes + (row * NS + seg) * 2 + 1, tl.cumsum(eq, 0) - eq, seg < NS)
 
@@ -105,19 +120,20 @@ def _selection_scatter(scores, nvis, state, prefixes, out, width,
                        K: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     seg = tl.program_id(1)
-    col = seg * B + tl.arange(0, B)
-    visible = tl.load(nvis + row)
-    valid = (col < width) & (col < visible)
-    x = tl.load(scores + row * ss + col, col < width, float('-inf'))
-    key = float_key(x)
-    cutoff = tl.load(state + row * 3).to(tl.uint32)
-    equal_budget = tl.load(state + row * 3 + 1)
-    gt_before = tl.load(prefixes + (row * NS + seg) * 2)
-    eq_before = tl.load(prefixes + (row * NS + seg) * 2 + 1)
-    equal = valid & (key == cutoff)
-    keep = valid & ((key > cutoff) | (equal & (eq_before + tl.cumsum(equal.to(tl.int32), 0) <= equal_budget)))
-    index = gt_before + tl.minimum(eq_before, equal_budget) + tl.cumsum(keep.to(tl.int32), 0) - 1
-    tl.store(out + row * os + index, col.to(tl.int32), keep & (index < K))
+    visible = tl.minimum(tl.load(nvis + row), width)
+    if seg * B < visible:
+        col = seg * B + tl.arange(0, B)
+        valid = col < visible
+        x = tl.load(scores + row * ss + col, col < width, float('-inf'))
+        key = float_key(x)
+        cutoff = tl.load(state + row * 3).to(tl.uint32)
+        equal_budget = tl.load(state + row * 3 + 1)
+        gt_before = tl.load(prefixes + (row * NS + seg) * 2)
+        eq_before = tl.load(prefixes + (row * NS + seg) * 2 + 1)
+        equal = valid & (key == cutoff)
+        keep = valid & ((key > cutoff) | (equal & (eq_before + tl.cumsum(equal.to(tl.int32), 0) <= equal_budget)))
+        index = gt_before + tl.minimum(eq_before, equal_budget) + tl.cumsum(keep.to(tl.int32), 0) - 1
+        tl.store(out + row * os + index, col.to(tl.int32), keep & (index < K))
 
 
 class SelectionWorkspace:
@@ -159,12 +175,12 @@ def select(scores, n_vis, out, workspace, *, first_histogram=False):
         if shift != 24 or not first_histogram:
             _radix_hist[(rows, ns)](scores, n_vis, workspace.state, workspace.hist,
                 width, scores.stride(0), ns, shift, SEGMENT)
-        _hist_reduce[(rows, 256)](workspace.hist, workspace.totals, ns,
-            triton.next_power_of_2(ns))
+        _hist_reduce[(rows, 256)](workspace.hist, workspace.totals, n_vis, width, ns,
+            triton.next_power_of_2(ns), SEGMENT)
         _radix_cutoff[(rows,)](workspace.totals, workspace.state, shift)
     _selection_counts[(rows, ns)](scores, n_vis, workspace.state, workspace.counts,
         width, scores.stride(0), ns, SEGMENT)
     _selection_prefix[(rows,)](workspace.counts, workspace.prefixes, workspace.state,
-        ns, triton.next_power_of_2(ns))
+        n_vis, width, ns, triton.next_power_of_2(ns), SEGMENT)
     _selection_scatter[(rows, ns)](scores, n_vis, workspace.state, workspace.prefixes,
         out, width, scores.stride(0), out.stride(0), ns, k, SEGMENT)
