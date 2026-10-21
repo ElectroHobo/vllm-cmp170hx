@@ -123,8 +123,12 @@ Tests:
   and default-off entries.
 
 Known limits: every card holds the other three shards of both Engram
-layers: 3 x 40.55 MB x 2 = 0.227 GiB per card less KV cache. A weight-cache
-load that skips processing leaves no replica; the first prefill step then
-raises. Prefill only: decode is unchanged by construction.
+layers: 3 x 40.55 MB x 2 = 0.227 GiB per card less KV cache. Pre-processed
+(weight-cache) loads still call the wrapper's post-load processing: the
+inner method returns at once and the wrapper gathers the already-processed
+shards, so they get the replica too. Refused: a step budget
+(`max_num_batched_tokens`) below `min_rows`, where no step could use the
+replica, and a hybrid capture, whose shard copies would each carry this
+rank's capture facts. Prefill only: decode is unchanged by construction.
 
 Removes: nothing; the sharded path stays for decode and for the flag off.

@@ -52,7 +52,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,314 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_prefetch.py` | 79 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_projection.py` | 18 |
-| `vllm/models/deepseek_v41/nvidia/sm80_engram_wkv.py` | 180 |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram_wkv.py` | 196 |
 | `vllm/models/deepseek_v41/nvidia/sm80_exl3.py` | 104 |
 | `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 470 |
 | `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 327 |
@@ -66,7 +66,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **19 files** | **7,066** |
+| **19 files** | **7,082** |
 
 ### `vllm/sm80/kernels/`
 
@@ -216,8 +216,8 @@ Files added elsewhere, grouped by top-level directory.
 | `CITATION.cff` | 7 |
 | `COMMUNITY_RECIPES.md` | 68 |
 | `NOTICE` | 9 |
-| `REVIEW.md` | 130 |
-| **4 files** | **214** |
+| `REVIEW.md` | 134 |
+| **4 files** | **218** |
 
 #### `.github/`
 
@@ -387,7 +387,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax.py` | 397 |
 | `tests/models/deepseek_v41/sm80/test_engram_early_gather.py` | 196 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,757 |
-| `tests/models/deepseek_v41/sm80/test_engram_wkv_replica.py` | 421 |
+| `tests/models/deepseek_v41/sm80/test_engram_wkv_replica.py` | 459 |
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica_gpu.py` | 113 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
 | `tests/models/deepseek_v41/sm80/test_fp32_outputs.py` | 379 |
@@ -525,7 +525,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **240 files** | **105,464** |
+| **240 files** | **105,502** |
 
 #### `tools/`
 
@@ -833,11 +833,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 182 |
-| Fork-added product lines | 59,789 |
+| Fork-added product lines | 59,805 |
 | Patched upstream files | 102 |
 | Patched upstream lines | +4,886 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 63,413 |
+| Product lines added (new files and patches) | 63,429 |
 | Fork environment variables (flags) | 139 |
 | Unreferenced fork definitions | 5 (42 lines) |

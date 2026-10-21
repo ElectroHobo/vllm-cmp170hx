@@ -31,6 +31,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearMethodBase
 
@@ -169,6 +170,21 @@ class ReplicatedPrefillWkv(ColumnParallelLinear):
 def adopt_replicated_wkv(model) -> None:
     """Replicate every local Engram layer's ``wkv`` for prefill steps."""
     min_rows = prefill_min_rows(model.vllm_config)
+    batched = model.vllm_config.scheduler_config.max_num_batched_tokens
+    if min_rows > batched:
+        # No step could take the replica: it would only cost memory.
+        raise ValueError(
+            f"replicated wkv: steps of {min_rows}+ rows (above every decode "
+            f"step and capture) exceed max_num_batched_tokens {batched}"
+        )
+    if envs.VLLM_SM80_CAPTURE_DIR and "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+        # Each shard copy carries this rank's capture facts: the capture would
+        # record the four shard GEMMs as this rank's.
+        raise ValueError(
+            "VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: the hybrid capture "
+            "records the sharded wkv GEMM, not the replica; capture with the "
+            "flag off"
+        )
     for layer in islice(model.layers, model.start_layer, model.end_layer):
         engram = getattr(layer, "engram", None)
         if engram is None:

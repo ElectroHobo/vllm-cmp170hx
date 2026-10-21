@@ -333,32 +333,70 @@ def test_adopt_refuses_other_layers(monkeypatch, kwargs, match):
         W.ReplicatedPrefillWkv.adopt(layer, MIN_ROWS)
 
 
-def _model(engram):
+def _model(engram, batched=2048):
     layer = SimpleNamespace(engram=engram)
     return SimpleNamespace(
         layers=[SimpleNamespace(engram=None), layer],
         start_layer=0,
         end_layer=2,
         vllm_config=SimpleNamespace(
-            scheduler_config=SimpleNamespace(max_num_seqs=8),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=8, max_num_batched_tokens=batched
+            ),
             speculative_config=SimpleNamespace(num_speculative_tokens=5),
             compilation_config=SimpleNamespace(max_cudagraph_capture_size=40),
         ),
     )
 
 
-def test_adopt_every_local_engram_wkv(monkeypatch):
+@pytest.fixture
+def no_capture(monkeypatch):
+    monkeypatch.delenv("VLLM_SM80_CAPTURE_DIR", raising=False)
+    monkeypatch.delenv("VLLM_SM80_CAPTURE_FAMILIES", raising=False)
+
+
+def _engram(monkeypatch):
     set_groups(monkeypatch, TP, 3)
     wkv = ColumnParallelLinear(
         K, N, bias=False, gather_output=True, return_bias=False, params_dtype=BF16
     )
-    engram = SimpleNamespace(
+    return SimpleNamespace(
         use_sequence_parallel=False, _batch=None,
         embed_tokens=SimpleNamespace(dp_size=1), wkv=wkv,
     )  # fmt: skip
+
+
+def test_adopt_every_local_engram_wkv(monkeypatch, no_capture):
+    engram = _engram(monkeypatch)
+    wkv = engram.wkv
     W.adopt_replicated_wkv(_model(engram))
     assert type(wkv) is W.ReplicatedPrefillWkv
     assert wkv.min_rows == MIN_ROWS and wkv.wkv_shards is None
+
+
+def test_adopt_refuses_a_replica_no_step_reaches(monkeypatch, no_capture):
+    """With a step budget below min_rows the replica would cost memory and
+    never run."""
+    engram = _engram(monkeypatch)
+    with pytest.raises(ValueError, match="max_num_batched_tokens 48"):
+        W.adopt_replicated_wkv(_model(engram, batched=MIN_ROWS - 1))
+    assert type(engram.wkv) is ColumnParallelLinear
+    W.adopt_replicated_wkv(_model(engram, batched=MIN_ROWS))
+    assert type(engram.wkv) is W.ReplicatedPrefillWkv
+
+
+def test_adopt_refuses_a_hybrid_capture(monkeypatch, no_capture):
+    """Every shard copy carries this rank's capture facts: a hybrid capture
+    would record four GEMMs as this rank's."""
+    engram = _engram(monkeypatch)
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", "/nonexistent/capture")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "attn,hybrid")
+    with pytest.raises(ValueError, match="hybrid capture"):
+        W.adopt_replicated_wkv(_model(engram))
+    assert type(engram.wkv) is ColumnParallelLinear
+    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "attn")
+    W.adopt_replicated_wkv(_model(engram))
+    assert type(engram.wkv) is W.ReplicatedPrefillWkv
 
 
 @pytest.mark.parametrize(
