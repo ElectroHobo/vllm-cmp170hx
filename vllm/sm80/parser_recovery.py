@@ -56,6 +56,9 @@ NameValidator = Callable[[str], bool]
 # Returns the declared tools whose parameters cover a headless candidate's
 # raw text so far.
 HeadlessCandidates = Callable[[str], Sequence[str]]
+# Returns the tool a complete headless candidate's raw text names, or None
+# when it names no tool; a headless candidate commits only with a tool.
+HeadlessTool = Callable[[str], str | None]
 # Makes the shape check of one held candidate. The check gets the held text
 # each time it grows while the arguments arrive; False restores the candidate.
 ShapeCheckFactory = Callable[[], Callable[[str], bool]]
@@ -66,6 +69,7 @@ class RecoveringParserEngine(StreamingParserEngine):
 
     name_validator: NameValidator
     headless_candidates: HeadlessCandidates | None
+    headless_tool: HeadlessTool | None
     args_terminals: frozenset[str]
     shape_check: ShapeCheckFactory | None
     recovered_tool_indexes: set[int]
@@ -76,6 +80,7 @@ class RecoveringParserEngine(StreamingParserEngine):
         engine: StreamingParserEngine,
         name_validator: NameValidator,
         headless_candidates: HeadlessCandidates | None = None,
+        headless_tool: HeadlessTool | None = None,
         args_terminals: Collection[str] = (),
         shape_check: ShapeCheckFactory | None = None,
     ) -> RecoveringParserEngine:
@@ -89,6 +94,7 @@ class RecoveringParserEngine(StreamingParserEngine):
         assert isinstance(engine, RecoveringParserEngine)
         engine.name_validator = name_validator
         engine.headless_candidates = headless_candidates
+        engine.headless_tool = headless_tool
         engine.args_terminals = frozenset(args_terminals)
         engine.shape_check = shape_check
         engine.recovered_tool_indexes = set()
@@ -201,7 +207,10 @@ class RecoveringParserEngine(StreamingParserEngine):
             self.state == ParserState.TOOL_ARGS
             and isinstance(transition, RecoveryTransition)
             and transition.commit
-            and (not self._hold_headless or len(self._headless_candidates()) == 1)
+            and (
+                not self._hold_headless
+                or (self.headless_tool and self.headless_tool(self._hold_raw))
+            )
         ):
             events = self._hold_events
             events.extend(self._apply_transition(transition, value, token_count))

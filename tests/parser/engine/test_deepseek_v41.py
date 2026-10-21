@@ -753,3 +753,22 @@ def test_long_recovered_call_still_parses(chunk_size):
     assert [(name, json.loads(args)) for name, args in calls] == [
         ("write", {"path": "a.txt", "content": body})
     ]
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_headless_fragment_missing_a_required_parameter_stays_text(chunk_size):
+    """Prose between parameters restores the call; the tail it leaves names a
+    tool by cover but lacks a parameter that tool requires, so it is text."""
+    text = (
+        'Ok.\n<invoke name="bash">\n'
+        '<parameter name="command">rm -rf build</parameter>\n'
+        'Then:\n<parameter name="i">clean</parameter>\n</invoke>'
+    )
+    tools = _BASH_TOOL + _WRITE_TOOLS + _WEATHER_TOOLS
+    if chunk_size is None:
+        _, content, calls = _parse(text, {"thinking": False}, tools)
+    else:
+        _, output = _stream_calls(text, tools, chunk_size)
+        content, calls = output.content, output.tool_calls
+    assert not calls
+    assert content == text

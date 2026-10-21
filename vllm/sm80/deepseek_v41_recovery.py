@@ -252,6 +252,7 @@ def recovering_parser(parser_cls: type[DeepSeekV4Parser]) -> type[DeepSeekV4Pars
                 self._engine,
                 name_validator=self._accept_recovered_name,
                 headless_candidates=self._covering_tools,
+                headless_tool=self._headless_tool,
                 args_terminals=_ARGS_TERMINALS,
                 shape_check=_CallShape,
             )
@@ -285,8 +286,18 @@ def recovering_parser(parser_cls: type[DeepSeekV4Parser]) -> type[DeepSeekV4Pars
             ]
 
         def _headless_tool(self, raw_args: str) -> str | None:
+            # The single declared tool whose parameters cover every parameter
+            # written, and only when every parameter it requires is there: a
+            # call missing one is a fragment (e.g. the tail of a call whose
+            # head was restored as text) and stays text.
             covering = self._covering_tools(raw_args)
-            return covering[0] if len(covering) == 1 else None
+            if len(covering) != 1:
+                return None
+            names = {m.group(1) for m in _PARAM_OPEN.finditer(raw_args)}
+            for tool_name, _, required in _tool_schemas(self._declared_tools):
+                if tool_name == covering[0] and set(required) <= names:
+                    return tool_name
+            return None
 
         def _recovered(self, idx: int) -> bool:
             return idx in self._recovery_engine.recovered_tool_indexes
