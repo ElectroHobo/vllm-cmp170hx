@@ -1000,11 +1000,17 @@ def round_once_transport() -> str:
 def large_round_once_all_reduce(t: torch.Tensor) -> torch.Tensor | None:
     """The round-once all-reduce of a message the TP group's fast paths do not
     take whole (the host-staged path and the custom all-reduce; prefill-sized
-    messages): with VLLM_ROUND_ONCE_ALLREDUCE_GROUPED over grouped NCCL
+    messages): on the copy-engine ring's owner sum when it is built
+    (VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE; the FP32 sum in rank order rounded
+    once, no SMs held during transfer), else with
+    VLLM_ROUND_ONCE_ALLREDUCE_GROUPED over grouped NCCL
     send/recv (the exact sum correctly rounded), else through the custom
     all-reduce in pieces (:func:`custom_all_reduce_pieces`, the FP32 sum in a
     fixed order rounded once). None when the chosen transport does not apply:
     the caller keeps its own path."""
+    ring = _ce_ring_for(t)
+    if ring is not None:
+        return ring.round_once(t)
     if envs.VLLM_ROUND_ONCE_ALLREDUCE_GROUPED:
         comm = get_tp_group().device_communicator
         host = getattr(comm, "hostshm_comm", None)
@@ -1043,13 +1049,23 @@ def prefill_all_reduce(t: torch.Tensor) -> torch.Tensor:
     takes ``t`` and neither the host-staged nor the custom all-reduce does
     (eager prefill-sized messages); otherwise
     ``tensor_model_parallel_all_reduce``."""
-    ring = ce_ring_all_reduce.ce_ring()
-    if ring is not None and ring.takes(t):
-        comm = get_tp_group().device_communicator
-        host = getattr(comm, "hostshm_comm", None)
-        if not (host is not None and host.should_host_ar(t)) and not custom_all_reduce_takes(t):
-            return ring.all_reduce(t)
+    ring = _ce_ring_for(t)
+    if ring is not None:
+        return ring.all_reduce(t)
     return tensor_model_parallel_all_reduce(t)
+
+
+def _ce_ring_for(t: torch.Tensor):
+    """The copy-engine ring when it is built and takes ``t`` and neither the
+    host-staged nor the custom all-reduce does; else None."""
+    ring = ce_ring_all_reduce.ce_ring()
+    if ring is None or not ring.takes(t):
+        return None
+    comm = get_tp_group().device_communicator
+    host = getattr(comm, "hostshm_comm", None)
+    if (host is not None and host.should_host_ar(t)) or custom_all_reduce_takes(t):
+        return None
+    return ring
 
 
 def all_reduce_in_pieces(t: torch.Tensor, pieces: list[torch.Tensor]) -> torch.Tensor:

@@ -44,7 +44,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | Path | Lines |
 |---|---:|
 | `vllm/models/deepseek_v41/nvidia/hybrid_capture.py` | 364 |
-| `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 1,084 |
+| `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 1,100 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 978 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_prefetch.py` | 79 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_projection.py` | 18 |
@@ -60,7 +60,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **17 files** | **5,938** |
+| **17 files** | **5,954** |
 
 ### `vllm/sm80/kernels/`
 
@@ -136,7 +136,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/dev_ab.py` | 1,333 |
 | `vllm/sm80/dev_ab_batch.py` | 367 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
-| `vllm/sm80/distributed/ce_ring_all_reduce.py` | 305 |
+| `vllm/sm80/distributed/ce_ring_all_reduce.py` | 406 |
 | `vllm/sm80/distributed/communicator.py` | 356 |
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
@@ -178,7 +178,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **49 files** | **13,780** |
+| **49 files** | **13,881** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -207,8 +207,8 @@ Files added elsewhere, grouped by top-level directory.
 | `CITATION.cff` | 7 |
 | `COMMUNITY_RECIPES.md` | 68 |
 | `NOTICE` | 9 |
-| `REVIEW.md` | 80 |
-| **4 files** | **164** |
+| `REVIEW.md` | 92 |
+| **4 files** | **176** |
 
 #### `.github/`
 
@@ -389,7 +389,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_attn_fused.py` | 212 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attn_fused_gpu.py` | 279 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attn_pipeline_gpu.py` | 385 |
-| `tests/models/deepseek_v41/sm80/test_sm80_ce_allreduce_dispatch.py` | 97 |
+| `tests/models/deepseek_v41/sm80/test_sm80_ce_allreduce_dispatch.py` | 126 |
 | `tests/models/deepseek_v41/sm80/test_sm80_decoder_replay.py` | 37 |
 | `tests/models/deepseek_v41/sm80/test_sm80_index_topk.py` | 98 |
 | `tests/models/deepseek_v41/sm80/test_sm80_index_topk_gpu.py` | 139 |
@@ -437,7 +437,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/round_once_allreduce_bits.py` | 207 |
 | `tests/sm80/round_once_unchecked.py` | 46 |
 | `tests/sm80/seams.yaml` | 1,386 |
-| `tests/sm80/test_ce_ring_all_reduce.py` | 219 |
+| `tests/sm80/test_ce_ring_all_reduce.py` | 289 |
 | `tests/sm80/test_dev_ab.py` | 565 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
 | `tests/sm80/test_dev_ab_batch.py` | 330 |
@@ -499,7 +499,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **223 files** | **99,614** |
+| **223 files** | **99,713** |
 
 #### `tools/`
 
@@ -779,7 +779,8 @@ Functions, methods and classes in fork-added product files whose name occurs now
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 914 | `forward_layer` | 19 | yes |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 260 | `engram_telemetry` | 4 | yes |
 | `vllm/sm80/dev_ab.py` | 1319 | `get_ab_arm` | 4 | yes |
-| **3 definitions** | | | **27** | |
+| `vllm/sm80/distributed/ce_ring_all_reduce.py` | 98 | `emulate_owner` | 7 | yes |
+| **4 definitions** | | | **34** | |
 
 ## 5. Health numbers
 
@@ -788,11 +789,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 173 |
-| Fork-added product lines | 55,225 |
+| Fork-added product lines | 55,342 |
 | Patched upstream files | 97 |
 | Patched upstream lines | +4,183 / -803 |
 | Patched upstream product files | 75 |
 | Patched upstream product lines | +3,611 / -253 |
-| Product lines added (new files and patches) | 58,836 |
+| Product lines added (new files and patches) | 58,953 |
 | Fork environment variables (flags) | 127 |
-| Unreferenced fork definitions | 3 (27 lines) |
+| Unreferenced fork definitions | 4 (34 lines) |

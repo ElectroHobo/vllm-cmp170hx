@@ -1,81 +1,93 @@
 # Copy-engine ring all-reduce for DeepSeek-V4.1 prefill sums
 
-Intent: with `VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE=1`, the TP sums of the
-FP32 `wo_b` partial and of the MoE output that the host-staged and custom
-all-reduce do not take (eager prefill-sized messages) run on a copy-engine
-ring instead of NCCL. NCCL's ring moves the bytes with SM kernels that stay
-resident for the whole transfer, and the compute beside them (the prefill
-split reduction's overlap) slows 2-3x; copy-engine copies do not occupy SMs.
-The design follows b12x's PCIe DMA all-reduce (Apache-2.0): reduce-scatter +
-all-gather ring, `cudaMemcpyAsync` into the next rank's IPC scratch,
-one-block flag kernels, one add per reduce-scatter step. Default off; decode,
-graph capture and messages the custom all-reduce takes are unchanged.
+Intent: with `VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE=1`, the prefill-sized TP
+sums that the host-staged and custom all-reduce do not take move by
+copy-engine copies instead of SM kernels (NCCL's ring, or the custom
+all-reduce in pieces). Both keep SMs busy for the whole transfer, and the
+compute beside them (the prefill split reduction's overlap) slows 2-3x.
+Two algorithms share one scratch and flag block:
+- `ring_ops` (after b12x's PCIe DMA all-reduce, Apache-2.0): reduce-scatter +
+  all-gather ring, one add per step in the message dtype. It carries the FP32
+  `wo_b` sum and the MoE sum (runner path).
+- `round_once_ops` (owner sum): every rank copies shard j to rank j, rank j
+  sums the world partials in FP32 in rank order and rounds once, then copies
+  the result to every rank. Same bytes as the ring. It carries the round-once
+  contract (`VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE`, and
+  `VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE` when on) in place of the
+  custom all-reduce in pieces, which split-reduce's 1024-row slices took
+  (two pieces of < 8 MiB each), leaving two of the three overlap windows per
+  layer beside SM all-reduce kernels.
+Default off; decode, graph capture and messages the custom all-reduce takes
+whole are unchanged.
 
 Files:
 - `vllm/sm80/distributed/ce_ring_all_reduce.py` (new): `ring_steps`,
-  `emulate` (the host's bits of the ring), `ring_ops` (one call's copies,
-  flag stores, flag waits and adds on a backend), the device backend (Triton
-  system-scope release flag store, system-scope acquire flag wait bounded by
-  `WAIT_TIMEOUT_NS`, elementwise add; `cudaMemcpyAsync` through the loaded
-  CUDA runtime), `CeRingAllReduce` (IPC scratch: one slot per ring step for a
+  `emulate` / `emulate_owner` (host bits of each algorithm), `ring_ops`,
+  `round_once_ops`, the device backend (Triton system-scope release flag
+  store, system-scope acquire flag wait bounded by `WAIT_TIMEOUT_NS`,
+  elementwise add, FP32 owner sum of up to eight partials;
+  `cudaMemcpyAsync` through the loaded CUDA runtime), `CeRingAllReduce`
+  (`all_reduce`, `round_once`; IPC scratch: 2(world-1) slots for a
   `max_num_batched_tokens` x hidden FP32 message, plus a flag block;
   collective construction), `init_ce_ring` / `ce_ring`.
 - `vllm/sm80/distributed/step_errors.py`: the sticky error word is
   bit-coded (1 round-once span, 2 copy-engine ring wait timeout); the raised
   message names every set bit.
-- `sm80_attention.py`: `prefill_all_reduce` (the ring when it takes the
-  message and neither the host-staged nor the custom all-reduce does, else
-  `tensor_model_parallel_all_reduce`); the FP32 `wo_b` sum goes through it.
+- `sm80_attention.py`: `_ce_ring_for` (the ring when it is built, takes the
+  message, and neither the host-staged nor the custom all-reduce does);
+  `prefill_all_reduce` uses its ring path, `large_round_once_all_reduce` its
+  owner sum (before the grouped and pieces transports); the FP32 `wo_b` sum
+  goes through `prefill_all_reduce`.
 - `sm80_moe.py`: the layer-reduced MoE's runner-path sum goes through
   `prefill_all_reduce`; the switch adopts the layer-reduced MoE.
 - `sm80_model.py`: the backbone adoption builds the ring under the switch.
 - `vllm/sm80/envs.py`: the switch. `FORK.md` regenerated.
 
-Protocol per call (epoch = call count, the same on every rank): store the
-epoch into the previous rank's ready flag, wait for this rank's; then per ring
+Protocol. Ring, per call (epoch = call count, the same on every rank): store
+the epoch into the previous rank's ready flag, wait for this rank's; per ring
 step copy the send shard into the next rank's slot, store its step flag, wait
-for this rank's step flag, add (reduce-scatter: `out = input + slot`) or copy
-(all-gather). Flags are monotonic, slots are per step, the ready flag keeps a
-rank from writing a slot its neighbour may still read. Flag stores are
-`st.release.sys` (a peer reads them over PCIe after the slot's copy-engine
-writes); waits load with `ld.acquire.sys`. A wait that exceeds 60 s ORs bit 2
-into the producing stream's sticky error word and returns, so ranks whose
-collectives fall out of step fail that step at its output copy instead of
-hanging; it never traps.
+for this rank's step flag, add or copy. Owner sum: store the epoch into every
+sender's ready flag for this receiver and wait for every receiver's; copy each
+shard to its owner's slot (indexed by sender offset) and store its flag; wait
+for every sender's flag and sum; copy the result to every peer's gather slot
+and store its flag; wait for every owner's flag and copy the shard out.
+Flags are monotonic epochs shared by both algorithms, so calls of either kind
+interleave; a rank writes into a peer's slot only after that peer's ready
+store for the call, which follows its reads of the previous call on its
+stream. Flag stores are `st.release.sys`; waits load with `ld.acquire.sys`;
+a wait that exceeds 60 s ORs bit 2 into the producing stream's sticky error
+word and returns (the step fails at its output copy; no hang, no trap).
 
-Bits: each element is summed in its owner's ring order in the message dtype
-(FP32 for `wo_b`, BF16 per add for the MoE, as NCCL's BF16 ring); every rank
-gets the same bits, `emulate` reproduces them. The order differs from NCCL's,
-so outputs change against the NCCL build (V6).
+Bits: the ring sums each element in its owner's ring order in the message
+dtype (FP32 for `wo_b`, BF16 per add for the MoE, as NCCL's BF16 ring). The
+owner sum adds the partials in FP32 in rank order and rounds once, the
+round-once switches' contract; its bits do not depend on how the message is
+split. Both give every rank the same bits; the order differs from NCCL's and
+from the custom all-reduce's, so outputs change against those builds (V6).
 
-Tests (CPU): `tests/sm80/test_ce_ring_all_reduce.py`: schedule properties
-(world 2/3/4/8), emulation against the FP64 sum, `ring_ops` for every rank on
-a host memory model over three back-to-back calls (world 2 and 4, FP32 and
-BF16): emulated bits on every rank and every copy's bytes checked where they
-land; ready-before-write ordering; host tensors refused; the flag kernels
-compiled for sm_80 on the host: system-scope release store, system-scope
-acquire load, a %globaltimer-bounded wait that ORs into the error word and
-has no trap (these three fail on the previous head); the error word's
-messages. Dispatch:
-`tests/models/deepseek_v41/sm80/test_sm80_ce_allreduce_dispatch.py`. With
-`tests/models/deepseek_v41/sm80`, `tests/sm80/test_seams.py`, the step-error
-and round-once tests: 717 passed, 403 skipped (GPU-only).
+Tests (CPU): `tests/sm80/test_ce_ring_all_reduce.py`: ring schedule
+properties; emulations against the FP64 sum; `ring_ops` for every rank on a
+host memory model over three back-to-back calls; owner-sum and ring calls
+interleaved on one scratch, flag block and epoch sequence (world 2/3/4/8,
+FP32 and BF16): each call's emulated bits on every rank, every copy's bytes
+checked where they land; owner-sum split invariance; ready-before-write for
+both algorithms; the kernels compiled for sm_80 on the host (system-scope
+release/acquire flags, a bounded wait that ORs into the error word with no
+trap, the owner sum's FP32 accumulation and one BF16 rounding); the error
+word's messages. Dispatch:
+`tests/models/deepseek_v41/sm80/test_sm80_ce_allreduce_dispatch.py`
+(including the BF16 `wo_b` large path to the owner sum). The owner-sum tests
+fail on the previous head (14 failed).
 
-Four-card evidence so far (check r1, 10-21): 88 calls bit-exact on all ranks
-against `emulate` (FP32 and BF16, 16-2048 rows, default and side stream,
-soak), FP32 41.9 MB 9.89 ms vs NCCL 10.91 ms, a BF16 GEMM slowed 0.84x
-beside the ring vs 1.86x beside NCCL. The run then hung in the Marlin phase:
-its harness computed the number of back-to-back ring calls per rank from that
-rank's own timings, so ranks issued different call counts and a flag wait
-never saw its epoch. The harness now agrees counts across ranks and has a
-per-phase watchdog; the engine-side bound above turns any such desync into a
-reported step failure.
+Four-card evidence (ring only, check r3, 10-21): 88 calls bit-exact on all
+ranks; FP32 41.9 MB 9.93 ms vs NCCL 10.93 ms; a persistent Marlin W4A16 GEMM
+0.86x beside the ring and its flag waits vs 2.29x beside NCCL, a BF16 GEMM
+0.87x vs 1.98x. The owner sum has no four-card run yet.
 
 Known limits: one stream, one piece per step (no copy/add pipelining); the
-flag wait spins one block while a peer copy is in flight (Marlin beside it is
-still unmeasured); 63 MiB of device memory per rank at TP4 with 2048-row
-steps; decode sums are unaffected by construction (custom all-reduce sizes,
-graphs). Four-card bits and timing are outside pytest.
+owner sum's copies run one after another on that stream; 63 MiB of device
+memory per rank at TP4 with 2048-row steps; decode sums are unaffected by
+construction (custom all-reduce sizes, graphs).
 
 Removes: nothing.
 

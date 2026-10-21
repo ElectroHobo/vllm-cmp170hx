@@ -89,7 +89,66 @@ def _ready_slot(world: int) -> int:
 
 
 def flag_bytes(world: int) -> int:
-    return (_ready_slot(world) + 1) * FLAG_STRIDE_BYTES
+    # Ring: one flag per step plus its ready flag. Owner sum (round_once_ops):
+    # the same step flags (reduce-scatter, then all-gather, indexed by the
+    # sender's offset) plus one ready flag per receiver, after the ring's.
+    return (_ready_slot(world) + world) * FLAG_STRIDE_BYTES
+
+
+def emulate_owner(inputs: list[torch.Tensor]) -> torch.Tensor:
+    """:func:`round_once_ops`' result for per-rank ``inputs``: every element
+    summed in FP32 in rank order, rounded once to the input dtype."""
+    acc = inputs[0].float()
+    for t in inputs[1:]:
+        acc = acc + t.float()
+    return acc.to(inputs[0].dtype)
+
+
+def _slot_index(world: int, sender: int, receiver: int) -> int:
+    """The receiver-side slot (and flag) index of ``sender``'s shard."""
+    return (sender - receiver) % world - 1
+
+
+def round_once_ops(backend, world: int, rank: int, epoch: int, inp: int, out: int,
+                   shard_bytes: int, shard_numel: int, dtype: torch.dtype,
+                   scratch: list[int], flags: list[int], slot_bytes: int) -> Iterator[None]:
+    """One owner-sum call: every rank copies shard ``j`` to rank ``j``'s slot
+    for it (copy engine), rank ``j`` sums the ``world`` partials of shard ``j``
+    in FP32 in rank order and rounds once, then copies the result to every
+    other rank (copy engine). Same bytes as the ring; the sum depends only on
+    the element's partials, so a message split anywhere gets the same bits.
+    Slots and flags 0..world-2 carry the reduce-scatter, world-1..2world-3 the
+    all-gather; the ready flags follow the ring's."""
+    ready0 = (_ready_slot(world) + 1) * FLAG_STRIDE_BYTES
+    peers = [(rank + o) % world for o in range(1, world)]
+    for q in peers:  # my slots in q's buffer: q has freed them
+        backend.set_flag(flags[q] + ready0 + _slot_index(world, q, rank) * FLAG_STRIDE_BYTES, epoch)
+    for q in peers:
+        yield from backend.wait_flag(
+            flags[rank] + ready0 + _slot_index(world, rank, q) * FLAG_STRIDE_BYTES, epoch)
+    for q in peers:
+        k = _slot_index(world, rank, q)
+        backend.copy(scratch[q] + k * slot_bytes, inp + q * shard_bytes, shard_bytes)
+        backend.set_flag(flags[q] + k * FLAG_STRIDE_BYTES, epoch)
+    parts = []
+    for s in range(world):
+        if s == rank:
+            parts.append(inp + rank * shard_bytes)
+            continue
+        k = _slot_index(world, s, rank)
+        yield from backend.wait_flag(flags[rank] + k * FLAG_STRIDE_BYTES, epoch)
+        parts.append(scratch[rank] + k * slot_bytes)
+    mine = out + rank * shard_bytes
+    backend.sum_round(mine, parts, shard_numel, dtype)
+    gather = world - 1
+    for q in peers:
+        k = gather + _slot_index(world, rank, q)
+        backend.copy(scratch[q] + k * slot_bytes, mine, shard_bytes)
+        backend.set_flag(flags[q] + k * FLAG_STRIDE_BYTES, epoch)
+    for s in peers:
+        k = gather + _slot_index(world, s, rank)
+        yield from backend.wait_flag(flags[rank] + k * FLAG_STRIDE_BYTES, epoch)
+        backend.copy(out + s * shard_bytes, scratch[rank] + k * slot_bytes, shard_bytes)
 
 
 def ring_ops(backend, world: int, rank: int, epoch: int, inp: int, out: int,
@@ -184,7 +243,30 @@ def _kernels():
         b = tl.load(b_ptr + offs, mask=mask)
         tl.store(dst_ptr + offs, (a.to(tl.float32) + b.to(tl.float32)).to(a.dtype), mask=mask)
 
-    return set_flag, wait_flag, add
+    @triton.jit
+    def sum_round(dst_ptr, p0, p1, p2, p3, p4, p5, p6, p7, n, W: tl.constexpr,
+                  BLOCK: tl.constexpr):
+        # FP32 sum of W partials in rank order, rounded once to dst's dtype.
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        acc = tl.load(p0 + offs, mask=mask).to(tl.float32)
+        if W > 1:
+            acc = acc + tl.load(p1 + offs, mask=mask).to(tl.float32)
+        if W > 2:
+            acc = acc + tl.load(p2 + offs, mask=mask).to(tl.float32)
+        if W > 3:
+            acc = acc + tl.load(p3 + offs, mask=mask).to(tl.float32)
+        if W > 4:
+            acc = acc + tl.load(p4 + offs, mask=mask).to(tl.float32)
+        if W > 5:
+            acc = acc + tl.load(p5 + offs, mask=mask).to(tl.float32)
+        if W > 6:
+            acc = acc + tl.load(p6 + offs, mask=mask).to(tl.float32)
+        if W > 7:
+            acc = acc + tl.load(p7 + offs, mask=mask).to(tl.float32)
+        tl.store(dst_ptr + offs, acc.to(dst_ptr.dtype.element_ty), mask=mask)
+
+    return set_flag, wait_flag, add, sum_round
 
 
 class DeviceBackend:
@@ -194,7 +276,7 @@ class DeviceBackend:
 
     def __init__(self, memcpy_async: Callable[[int, int, int, int], None], kernels,
                  error: torch.Tensor, timeout_ns: int = WAIT_TIMEOUT_NS):
-        self._memcpy, (self._set, self._wait, self._add) = memcpy_async, kernels
+        self._memcpy, (self._set, self._wait, self._add, self._sum) = memcpy_async, kernels
         self.stream = torch.cuda.current_stream().cuda_stream
         self._error, self._timeout_ns = error, timeout_ns
 
@@ -213,6 +295,13 @@ class DeviceBackend:
     def add(self, dst: int, a: int, b: int, n: int, dtype: torch.dtype) -> None:
         grid = (triton_cdiv(n, self.ADD_BLOCK),)
         self._add[grid](_Ptr(dst, dtype), _Ptr(a, dtype), _Ptr(b, dtype), n, BLOCK=self.ADD_BLOCK)
+
+    def sum_round(self, dst: int, parts: list[int], n: int, dtype: torch.dtype) -> None:
+        if not 1 <= len(parts) <= 8:
+            raise ValueError("the owner sum takes 1 to 8 partials")
+        ptrs = [_Ptr(p, dtype) for p in parts] + [_Ptr(parts[0], dtype)] * (8 - len(parts))
+        grid = (triton_cdiv(n, self.ADD_BLOCK),)
+        self._sum[grid](_Ptr(dst, dtype), *ptrs, n, W=len(parts), BLOCK=self.ADD_BLOCK)
 
 
 def triton_cdiv(a: int, b: int) -> int:
@@ -276,16 +365,28 @@ class CeRingAllReduce:
         return 0 < nbytes <= self.capacity_bytes and nbytes % (16 * self.world) == 0
 
     def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
-        """The sum of every rank's ``t``, queued on the current stream."""
+        """The sum of every rank's ``t`` around the ring (each add in ``t``'s
+        dtype), queued on the current stream."""
+        return self._run(ring_ops, t)
+
+    def round_once(self, t: torch.Tensor) -> torch.Tensor:
+        """The sum of every rank's ``t``, each element summed in FP32 in rank
+        order and rounded once (:func:`round_once_ops`), queued on the current
+        stream. The same bits for any split of the message."""
+        if self.world > 8:
+            raise ValueError("the owner sum takes at most eight ranks")
+        return self._run(round_once_ops, t)
+
+    def _run(self, ops, t: torch.Tensor) -> torch.Tensor:
+        from vllm.sm80.distributed.step_errors import error_buffer
+
         out = torch.empty_like(t)
         self.epoch += 1
         shard_numel = t.numel() // self.world
-        from vllm.sm80.distributed.step_errors import error_buffer
-
         backend = DeviceBackend(self._memcpy, self._kernels, error_buffer(t.device))
-        for _ in ring_ops(backend, self.world, self.rank, self.epoch, t.data_ptr(), out.data_ptr(),
-                          shard_numel * t.element_size(), shard_numel, t.dtype,
-                          self.scratch, self.flags, self.slot_bytes):
+        for _ in ops(backend, self.world, self.rank, self.epoch, t.data_ptr(), out.data_ptr(),
+                     shard_numel * t.element_size(), shard_numel, t.dtype,
+                     self.scratch, self.flags, self.slot_bytes):
             raise RuntimeError("a device wait yielded")
         return out
 

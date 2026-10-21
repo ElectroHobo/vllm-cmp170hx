@@ -30,6 +30,10 @@ class _Ring:
         self.calls.append((t.dtype, tuple(t.shape)))
         return t * 4
 
+    def round_once(self, t):
+        self.calls.append(("round_once", t.dtype, tuple(t.shape)))
+        return t * 5
+
 
 @pytest.mark.parametrize(
     "case,ring_on,ring_takes,host,custom,to_ring",
@@ -54,6 +58,31 @@ def test_prefill_all_reduce_dispatch(monkeypatch, case, ring_on, ring_takes, hos
     got = sm80.prefill_all_reduce(t)
     assert torch.equal(got, t * (4 if to_ring else 3))
     assert bool(ring.calls) == to_ring and bool(nccl) != to_ring
+
+
+@pytest.mark.parametrize(
+    "case,ring_on,custom,owner",
+    [("ring_on", True, False, True), ("ring_off", False, False, False),
+     ("custom_takes", True, True, False)],
+)
+def test_wo_b_bf16_large_path_uses_the_owner_sum(monkeypatch, case, ring_on, custom, owner) -> None:
+    """With the ring built, a BF16 wo_b partial too large for the custom all-reduce whole goes to
+    the ring's owner sum (round once), not the custom all-reduce in pieces."""
+    ring = _Ring(True)
+    monkeypatch.setattr(ce, "_RING", ring if ring_on else None)
+    ca = _PieceCustomAllreduce(1 << 30 if custom else 1024)
+    comm = _piece_comm(ca)
+    monkeypatch.setattr(sm80, "get_tp_group", lambda: SimpleNamespace(device_communicator=comm))
+    monkeypatch.setattr(sm80, "tensor_model_parallel_all_reduce", lambda t: t * 3)
+    monkeypatch.delenv("VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", raising=False)
+    partial = torch.ones(40, 64, dtype=BF16)
+    got = sm80.wo_b_all_reduce(partial, False, True)
+    assert bool(ring.calls) == owner
+    if owner:
+        assert ring.calls == [("round_once", BF16, (40, 64))]
+        assert torch.equal(got, partial * 5)
+    elif not custom:
+        assert len(ca.pieces) > 1 and torch.equal(got, (partial.float() * 4).to(BF16))
 
 
 def test_wo_b_fp32_path_goes_through_prefill_all_reduce(monkeypatch) -> None:
