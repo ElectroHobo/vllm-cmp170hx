@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_HOSTFN_READ: bool = False
     VLLM_ENGRAM_PLACEMENT: str = "ssd"
     VLLM_ENGRAM_ROW_CACHE_GIB: float = 1.0
+    VLLM_ENGRAM_ROW_CACHE_PRELOAD: bool = False
     VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
@@ -1122,6 +1123,16 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # cache (every row is read from the file). Unused by "ram".
     "VLLM_ENGRAM_ROW_CACHE_GIB": lambda: float(
         os.getenv("VLLM_ENGRAM_ROW_CACHE_GIB", "1")
+    ),
+    # Fill the host row cache of the sm_80 Engram SSD placement at startup:
+    # one sequential pass over each rank's value extent per table, read past
+    # the page cache, stores rows in empty cache ways only and stops once
+    # every way holds a row (vllm/models/deepseek_v41/nvidia/sm80_engram.py).
+    # Startup reads up to the whole extent (~24.6 GB per table and rank of
+    # DeepSeek V4.1 Flash at TP4); the fetch counters do not count the
+    # stored rows. Unused by "ram" and by a zero cache. Off by default.
+    "VLLM_ENGRAM_ROW_CACHE_PRELOAD": lambda: bool(
+        int(os.getenv("VLLM_ENGRAM_ROW_CACHE_PRELOAD", "0"))
     ),
     # Diagnostic: log the counters of each sm_80 Engram table (rows, cache
     # hits and misses, page-cache and storage bytes, host read and wait

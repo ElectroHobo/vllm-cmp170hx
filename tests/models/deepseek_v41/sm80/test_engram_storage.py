@@ -426,6 +426,172 @@ def test_cache_bound(tables):
             store.close()
 
 
+# ---------------------------------------------------------------------------
+# Row-cache preload
+# ---------------------------------------------------------------------------
+
+
+def _set_of(local: int, num_sets: int) -> int:
+    """The native cache's set of a local row (Fibonacci hashing)."""
+    return (((local * 0x9E3779B97F4A7C15) % (1 << 64)) >> 32) % num_sets
+
+
+def _preload_model(rows: int, num_sets: int, ways: int = 8):
+    """The local rows a preload stores, by set (each set keeps its first
+    `ways` rows in file order), and how many rows it reads before the cache
+    is full (None: it never fills)."""
+    sets: dict[int, list[int]] = {}
+    stored = 0
+    for local in range(rows):
+        kept = sets.setdefault(_set_of(local, num_sets), [])
+        if len(kept) < ways:
+            kept.append(local)
+            stored += 1
+            if stored == num_sets * ways:
+                return sets, local + 1
+    return sets, None
+
+
+def _buffered_preload(monkeypatch):
+    monkeypatch.setattr(
+        sm80_engram,
+        "_open_preload",
+        lambda path: (os.open(path, os.O_RDONLY | os.O_CLOEXEC), False),
+    )
+
+
+@pytest.mark.parametrize("direct", [True, False])
+def test_preload_stores_file_rows_until_full(tables, monkeypatch, direct):
+    """A cache smaller than the share: every set takes its first rows in file
+    order, the bytes are the file's, the pass stops once the cache is full
+    and no counter moves."""
+    if not direct:
+        _buffered_preload(monkeypatch)
+    files = tables.small
+    # Chunks start off the direct-read alignment.
+    assert files.values_offset % sm80_engram._DIRECT_ALIGN
+    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 1, TP)
+    num_sets, chunk = 16, 8192
+    store = _store(files, lo, hi, cache_bytes=num_sets * 8 * (DIM + 16))
+    try:
+        sets, full_at = _preload_model(hi - lo, num_sets)
+        assert full_at is not None and full_at < hi - lo
+        stored, read, used_direct = store.preload(chunk_bytes=chunk)
+        assert used_direct is direct
+        assert stored == num_sets * 8
+        chunks = -(-full_at // (chunk // DIM))
+        assert chunks * chunk <= read <= chunks * (chunk + sm80_engram._DIRECT_ALIGN)
+        assert not any(store.counters().values())
+        ids = np.sort(np.concatenate([np.asarray(v) for v in sets.values()])) + lo
+        values, scales = _fetch(store, ids)
+        want_values, want_scales = _expected(files, SMALL_LAYER, ids, lo, hi)
+        np.testing.assert_array_equal(values, want_values)
+        np.testing.assert_array_equal(scales, want_scales)
+        counts = store.counters()
+        assert counts["cache_hits"] == len(ids)
+        assert counts["cache_misses"] == counts["cache_inserts"] == 0
+        assert counts["cache_evictions"] == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("direct", [True, False])
+def test_preload_of_a_cache_larger_than_the_share(tables, monkeypatch, direct):
+    """Every owned row is stored once, the whole extent is read, the other
+    ways stay empty and every owned row is then a hit."""
+    if not direct:
+        _buffered_preload(monkeypatch)
+    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 3, TP)
+    store = _store(tables.small, lo, hi, cache_bytes=1 << 20)
+    try:
+        assert store.fetcher.cache_rows() > hi - lo
+        stored, read, _ = store.preload(chunk_bytes=4096)
+        assert stored == hi - lo
+        assert (hi - lo) * DIM <= read
+        assert not any(store.counters().values())
+        ids = np.arange(lo, hi)
+        values, _ = _fetch(store, ids)
+        np.testing.assert_array_equal(
+            values, _expected(tables.small, SMALL_LAYER, ids, lo, hi)[0]
+        )
+        counts = store.counters()
+        assert counts["cache_hits"] == hi - lo and counts["cache_misses"] == 0
+    finally:
+        store.close()
+
+
+def test_demand_rows_evict_preloaded_rows_first(tables):
+    """Preloaded rows are older than any demand row: a set's demand inserts
+    replace its preloaded rows before one another."""
+    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 2, TP)
+    num_sets = 16
+    store = _store(tables.small, lo, hi, cache_bytes=num_sets * 8 * (DIM + 16))
+    try:
+        sets, _ = _preload_model(hi - lo, num_sets)
+        assert store.preload(chunk_bytes=8192)[0] == num_sets * 8
+        target = _set_of(0, num_sets)
+        others = [
+            local
+            for local in range(hi - lo)
+            if _set_of(local, num_sets) == target and local not in sets[target]
+        ]
+        demand = others[:8]
+        assert len(demand) == 8
+        for local in demand:
+            _fetch(store, [lo + local])
+            # The first demand row is never the one evicted.
+            _fetch(store, [lo + demand[0]])
+        counts = store.counters()
+        assert counts["cache_misses"] == 8 and counts["cache_evictions"] == 8
+        assert counts["cache_hits"] == 8
+        # The set now holds exactly the demand rows.
+        before = store.counters()["cache_hits"]
+        values, _ = _fetch(store, lo + np.asarray(demand))
+        assert store.counters()["cache_hits"] - before == 8
+        np.testing.assert_array_equal(
+            values,
+            _expected(tables.small, SMALL_LAYER, lo + np.asarray(demand), lo, hi)[0],
+        )
+        _fetch(store, [lo + sets[target][0]])
+        assert store.counters()["cache_misses"] == 9
+    finally:
+        store.close()
+
+
+def test_preload_runs_only_before_fetches(tables):
+    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 0, TP)
+    store = _store(tables.small, lo, hi)
+    try:
+        _fetch(store, [lo])
+        with pytest.raises(RuntimeError, match="preloaded before any fetch"):
+            store.preload()
+    finally:
+        store.close()
+    for placement, cache_bytes in (("ssd", 0), ("ram", 1 << 20)):
+        store = _store(tables.small, lo, hi, cache_bytes, placement)
+        try:
+            assert store.preload() == (0, 0, True)
+        finally:
+            store.close()
+
+
+def test_preload_flag_and_log(tables, monkeypatch):
+    from vllm import envs
+
+    monkeypatch.delenv("VLLM_ENGRAM_ROW_CACHE_PRELOAD", raising=False)
+    assert envs.VLLM_ENGRAM_ROW_CACHE_PRELOAD is False
+    monkeypatch.setenv("VLLM_ENGRAM_ROW_CACHE_PRELOAD", "1")
+    assert envs.VLLM_ENGRAM_ROW_CACHE_PRELOAD is True
+    _, _, lo, hi = engram_owner_range(SMALL_HEADS, 1, TP)
+    store = _store(tables.small, lo, hi, cache_bytes=1 << 20)
+    try:
+        line = sm80_engram.preload_row_cache(store)
+        assert line.startswith(f", preloaded {hi - lo} of ")
+        assert "direct reads in " in line
+    finally:
+        store.close()
+
+
 def test_page_cache_classification(tables):
     _, _, lo, hi = engram_owner_range(SMALL_HEADS, 3, TP)
     store = _store(tables.small, lo, hi, cache_bytes=0)

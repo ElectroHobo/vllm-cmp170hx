@@ -748,6 +748,53 @@ class EngramHostFetch : public torch::CustomClassHolder {
     return now_ns() - start;
   }
 
+  // Stores rows [count, row_bytes], the values of local rows first to
+  // first + count - 1, in the empty ways of their sets, before any fetch;
+  // returns how many it stored. It never evicts and leaves the counters
+  // alone. The stored rows share one stamp, older than any later hit or
+  // insert, so demand inserts take them right after the empty ways.
+  int64_t preload(torch::Tensor rows, int64_t first) {
+    FetchState& s = *state_;
+    std::lock_guard<std::mutex> lock(s.mutex);
+    check_cpu(rows, "preload rows");
+    const int64_t row_bytes = s.row_bytes;
+    const int64_t count = rows.numel() / row_bytes;
+    TORCH_CHECK(rows.numel() % row_bytes == 0 && 0 <= first &&
+                    first <= s.owner_hi - s.owner_lo - count,
+                "Engram preload rows exceed the owned rows");
+    TORCH_CHECK(s.next == 0 && s.fixed_jobs.empty() && !s.fixed_queued.load(),
+                "The Engram row cache is preloaded before any fetch");
+    RowCache& cache = s.cache;
+    if (cache.num_sets == 0) return 0;
+    cache.clock = 1;
+    const uint8_t* data = static_cast<const uint8_t*>(rows.data_ptr());
+    const int64_t ways = cache.ways;
+    // Rows ahead whose set tags are prefetched: sets are spread at random.
+    constexpr int64_t kAhead = 16;
+    int64_t stored = 0;
+    for (int64_t i = 0; i < count; ++i) {
+      if (i + kAhead < count) {
+        __builtin_prefetch(
+            cache.tags.data() + cache.set_of(first + i + kAhead) * ways);
+      }
+      const int64_t row = first + i;
+      const int64_t base = cache.set_of(row) * ways;
+      for (int64_t w = 0; w < ways; ++w) {
+        int64_t& tag = cache.tags[base + w];
+        if (tag == row) break;
+        if (tag < 0) {
+          tag = row;
+          cache.stamps[base + w] = cache.clock;
+          std::memcpy(cache.data + (base + w) * row_bytes,
+                      data + i * row_bytes, row_bytes);
+          ++stored;
+          break;
+        }
+      }
+    }
+    return stored;
+  }
+
  private:
   FetchJob& claim(int64_t count) {
     FetchState& s = *state_;
@@ -785,6 +832,7 @@ void register_engram_host_fetch(torch::Library& m) {
       .def("cache_rows", &EngramHostFetch::cache_rows)
       .def("cache_bytes", &EngramHostFetch::cache_bytes)
       .def("prefault", &EngramHostFetch::prefault)
+      .def("preload", &EngramHostFetch::preload)
       .def("add_fixed", &EngramHostFetch::add_fixed)
       .def("enqueue_fixed", &EngramHostFetch::enqueue_fixed)
       .def("run_fixed", &EngramHostFetch::run_fixed)

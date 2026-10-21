@@ -15,8 +15,9 @@ shards them, i.e. one contiguous row range ``[vocab_start, vocab_end)``:
 - its scales are read once into host memory (pinned when CUDA is present);
 - its values stay in the file (placement ``ssd``) and are read on demand at
   absolute int64 byte offsets through a bounded set-associative LRU host row
-  cache, pre-faulted at startup, or are copied into pinned host memory
-  (placement ``ram``, the comparison path);
+  cache, pre-faulted at startup and optionally filled there by one
+  sequential pass over the file (``VLLM_ENGRAM_ROW_CACHE_PRELOAD``), or are
+  copied into pinned host memory (placement ``ram``, the comparison path);
 - a lookup stages the requested rows' values and scales in pinned host
   memory, copies them to the device and dequantizes them there exactly as
   the reference (``ops/sm80_engram_dequant.py``).
@@ -61,13 +62,16 @@ raise.
 """
 
 import atexit
+import errno
 import functools
 import json
+import mmap
 import os
 import struct
 import time
 import weakref
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -91,6 +95,10 @@ CACHE_WAYS = 8
 HOST_FETCH_SLOTS = 4
 # Chunk of the sequential startup reads (scales, ram placement).
 _LOAD_CHUNK_BYTES = 256 << 20
+# Chunk of the row-cache preload's sequential reads, and the offset and
+# length alignment of its direct reads.
+_PRELOAD_CHUNK_BYTES = 32 << 20
+_DIRECT_ALIGN = 4096
 _MAX_HEADER_BYTES = 100 << 20
 GiB = 1 << 30
 # EngramHostFetch.counters(), in order (csrc/exl3/engram_fetch.cpp).
@@ -272,6 +280,29 @@ def _host_empty(shape: tuple[int, ...], dtype: torch.dtype, pin: bool) -> torch.
     return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin)
 
 
+def _open_preload(path: str) -> tuple[int, bool]:
+    """A descriptor for the row-cache preload and whether its reads bypass
+    the page cache: O_DIRECT, or buffered where the file system refuses
+    O_DIRECT."""
+    try:
+        return os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECT), True
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+    return os.open(path, os.O_RDONLY | os.O_CLOEXEC), False
+
+
+def _read_at_least(fd: int, view: memoryview, offset: int, need: int) -> None:
+    """Read from ``offset`` into ``view`` until at least ``need`` bytes are
+    in; a direct read ends short only at the end of the file."""
+    done = 0
+    while done < need:
+        count = os.preadv(fd, [view[done:]], offset + done)
+        if count == 0:
+            raise EOFError(f"Truncated Engram data at byte {offset + done}")
+        done += count
+
+
 class EngramRowStore:
     """One rank's rows of one Engram table on the host, fetched by the
     native ``EngramHostFetch`` into this store's staging.
@@ -425,6 +456,71 @@ class EngramRowStore:
     def prefault(self) -> int:
         """Touch every page of the row cache; return the time in ns."""
         return self.fetcher.prefault()
+
+    def preload(self, chunk_bytes: int = _PRELOAD_CHUNK_BYTES) -> tuple[int, int, bool]:
+        """Fill the empty row-cache ways from one sequential pass over the
+        owned value extent, before any fetch, stopping once every way holds
+        a row. Returns (rows stored, bytes read, whether the reads bypassed
+        the page cache).
+
+        A row goes to the first empty way of its set, in file order, so a
+        cache smaller than the extent holds an even spread of it. The reads
+        use O_DIRECT; where the file system refuses it they are buffered and
+        each chunk's pages are dropped from the page cache after it is read,
+        including pages that were resident before. The next chunk is read
+        while the native call stores the current one. The fetch counters do
+        not change.
+        """
+        capacity = self.fetcher.cache_rows()
+        rows = self.owner_hi - self.owner_lo
+        if not capacity or not rows:
+            return 0, 0, True
+        if (
+            chunk_bytes <= 0
+            or chunk_bytes % _DIRECT_ALIGN
+            or chunk_bytes % self.row_bytes
+        ):
+            raise ValueError("Engram preload chunks hold whole rows and aligned blocks")
+        chunk_rows = chunk_bytes // self.row_bytes
+        # Aligned reads of a chunk's rows take at most one block more.
+        buffers = [mmap.mmap(-1, chunk_bytes + _DIRECT_ALIGN) for _ in range(2)]
+        fd, direct = _open_preload(self.path)
+
+        def read(buffer: mmap.mmap, lo: int) -> tuple[int, int, int, int]:
+            hi = min(lo + chunk_rows, rows)
+            start = self.extent_offset + lo * self.row_bytes
+            end = start + (hi - lo) * self.row_bytes
+            first = start - start % _DIRECT_ALIGN
+            length = -(-(end - first) // _DIRECT_ALIGN) * _DIRECT_ALIGN
+            _read_at_least(fd, memoryview(buffer)[:length], first, end - first)
+            if not direct:
+                os.posix_fadvise(fd, first, length, os.POSIX_FADV_DONTNEED)
+            return lo, hi, start - first, length
+
+        stored = read_bytes = 0
+        try:
+            with ThreadPoolExecutor(1) as pool:
+                pending = pool.submit(read, buffers[0], 0)
+                turn = 0
+                while pending is not None:
+                    lo, hi, skip, length = pending.result()
+                    pending = None
+                    if hi < rows:
+                        pending = pool.submit(read, buffers[1 - turn], hi)
+                    read_bytes += length
+                    chunk = torch.frombuffer(
+                        buffers[turn],
+                        dtype=torch.uint8,
+                        count=(hi - lo) * self.row_bytes,
+                        offset=skip,
+                    )
+                    stored += self.fetcher.preload(chunk, lo)
+                    turn = 1 - turn
+                    if stored == capacity:
+                        break
+        finally:
+            os.close(fd)
+        return stored, read_bytes, direct
 
     def fetch(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Fetch global row ids on this thread; return views of the staged
@@ -866,6 +962,20 @@ def captures_full_graphs(mode) -> bool:
     return mode is not None and mode.has_full_cudagraphs()
 
 
+def preload_row_cache(store: EngramRowStore) -> str:
+    """Fill a store's row cache from its file (:meth:`EngramRowStore.preload`);
+    return the startup log's account of it."""
+    start = time.perf_counter_ns()
+    stored, read, direct = store.preload()
+    seconds = (time.perf_counter_ns() - start) / 1e9
+    rows = store.fetcher.cache_rows()
+    return (
+        f", preloaded {stored} of {rows} rows "
+        f"({100.0 * stored / max(rows, 1):.1f}%) from {read / GiB:.2f} GiB "
+        f"{'direct' if direct else 'buffered'} reads in {seconds:.2f} s"
+    )
+
+
 def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbedding:
     """The sm_80 Engram table of one Engram layer of the current model."""
     from vllm import envs
@@ -919,13 +1029,16 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         # Engine shutdown does not close modules: log the totals at exit.
         atexit.register(table.log_telemetry, "at exit")
     prefault_ns = table.store.prefault()
+    preloaded = ""
+    if placement == "ssd" and envs.VLLM_ENGRAM_ROW_CACHE_PRELOAD:
+        preloaded = preload_row_cache(table.store)
     resident, total = table.page_cache_residency()
     if placement == "ram":
         values = f"resident {table.store.table.nbytes / GiB:.2f} GiB"
     else:
         values = (
             f"row cache {table.store.cache_bytes / GiB:.2f} GiB, pre-faulted "
-            f"in {prefault_ns / 1e9:.2f} s"
+            f"in {prefault_ns / 1e9:.2f} s{preloaded}"
         )
     logger.info(
         "sm_80 Engram layer %d (%s): placement=%s rows [%d, %d) heads [%d, %d); "
