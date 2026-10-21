@@ -1,0 +1,328 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CPU contracts for the draft side of VLLM_DSPARK_ROW_MASK
+(dspark_row_mask_conf.py).
+
+The publish kernel runs in the Triton interpreter (a subprocess with
+``TRITON_INTERPRET=1``), driven through the mixin's ``_sample_sequential``
+over the plain and the per-width drafter: each request's confidences land at
+its request-state slot, graph padding requests write nothing, columns past a
+narrower draft width are zero, and the drafted tokens are untouched.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm.sm80.envs import FORK_ENV_VARS
+from vllm.sm80.spec_decode import dspark_confidence as dump_module
+from vllm.sm80.spec_decode import dspark_row_mask as state_module
+from vllm.sm80.spec_decode import dspark_row_mask_conf as conf_module
+from vllm.sm80.spec_decode import dspark_width as width_module
+from vllm.sm80.spec_decode.zero_draft import draft_context_only
+from vllm.v1.worker.gpu.spec_decode.dspark import speculator as upstream
+
+pytestmark = pytest.mark.cpu_test
+
+ROOT = Path(__file__).resolve().parents[3]
+MAX_REQS, MAX_TOKENS, MAX_DRAFT = 8, 64, 5
+
+
+def _config():
+    spec = SimpleNamespace(
+        num_speculative_tokens=MAX_DRAFT,
+        num_speculative_tokens_per_batch_size=[(1, 3, 5), (4, 8, 3)],
+        adaptive_k_config=None,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        uses_dynamic_speculative_decoding=lambda: True,
+    )
+    return SimpleNamespace(
+        speculative_config=spec, scheduler_config=SimpleNamespace(max_num_seqs=8)
+    )
+
+
+def _init_cpu(self, config, device):
+    self.vllm_config = config
+    self.device = device
+    self.max_num_reqs = MAX_REQS
+    self.max_num_tokens = MAX_TOKENS
+    self.max_width = self.width = self.num_speculative_steps = MAX_DRAFT
+    self.draft_token_confidence_probs = torch.full((MAX_REQS, MAX_DRAFT), -1.0)
+    self.use_confidence_head = False
+    self.dp_size = 1
+
+
+def _head():
+    return SimpleNamespace(proj=SimpleNamespace(weight=torch.ones(1, 8)))
+
+
+def _cost_table(path: Path) -> str:
+    path.write_text(json.dumps({
+        "schema": "dspark-row-mask-costs/1",
+        "max_draft": MAX_DRAFT,
+        "by_batch": {"1": [1, 2, 3, 4, 5, 6], "8": [2, 3, 4, 5, 6, 7]},
+    }))
+    return str(path)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state():
+    state_module._reset_for_tests()
+    yield
+    state_module._reset_for_tests()
+
+
+@pytest.fixture
+def make(monkeypatch, tmp_path):
+    monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", _init_cpu)
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", "")
+    monkeypatch.setattr(
+        width_module.envs, "VLLM_DSPARK_ROW_MASK", _cost_table(tmp_path / "c.json")
+    )
+
+    def build(head=_head):
+        monkeypatch.setattr(
+            upstream.DSparkSpeculator,
+            "load_draft_model",
+            lambda self, target, names: SimpleNamespace(
+                model=SimpleNamespace(confidence_head=head())
+            ),
+            raising=False,
+        )
+        return width_module.create_dspark_speculator(_config(), torch.device("cpu"))
+
+    return build
+
+
+def test_switch_off_keeps_the_class_and_creates_no_state(monkeypatch):
+    monkeypatch.delenv("VLLM_DSPARK_ROW_MASK", raising=False)
+    assert FORK_ENV_VARS["VLLM_DSPARK_ROW_MASK"]() == ""
+    monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", _init_cpu)
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", "")
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ROW_MASK", "")
+    monkeypatch.setattr(
+        upstream.DSparkSpeculator,
+        "load_draft_model",
+        lambda self, target, names: SimpleNamespace(
+            model=SimpleNamespace(confidence_head=_head())
+        ),
+        raising=False,
+    )
+    drafter = width_module.create_dspark_speculator(_config(), torch.device("cpu"))
+    assert type(drafter) is upstream.DSparkSpeculator
+    drafter.load_draft_model(None, set())
+    assert drafter.use_confidence_head is False
+    assert state_module.get_row_mask_state() is None
+
+
+def test_switch_wraps_the_plain_and_the_per_width_drafter(make):
+    drafter = make()
+    assert isinstance(drafter, conf_module.RowMaskConfidenceMixin)
+    assert isinstance(drafter, upstream.DSparkSpeculator)
+    cls = conf_module.row_mask_class(width_module.PerKDSparkSpeculator)
+    assert issubclass(cls, width_module.PerKDSparkSpeculator)
+    assert cls.__mro__[1] is conf_module.RowMaskConfidenceMixin
+
+
+def test_composes_with_the_confidence_dump(make, monkeypatch, tmp_path):
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", str(tmp_path))
+    monkeypatch.setenv("VLLM_DSPARK_CONFIDENCE_DUMP", str(tmp_path))
+    drafter = make()
+    assert isinstance(drafter, conf_module.RowMaskConfidenceMixin)
+    assert isinstance(drafter, dump_module.ConfidenceDumpMixin)
+    drafter.load_draft_model(None, set())
+    assert drafter.use_confidence_head is True
+    assert state_module.get_row_mask_state() is drafter._row_mask
+    drafter._confidence_dump.close()
+
+
+def test_load_turns_the_head_on_and_creates_the_state(make):
+    drafter = make()
+    assert drafter.use_confidence_head is False
+    assert state_module.get_row_mask_state() is None
+    drafter.load_draft_model(None, set())
+    assert drafter.use_confidence_head is True
+    state = state_module.get_row_mask_state()
+    assert state is drafter._row_mask
+    assert (state.max_num_reqs, state.max_num_tokens, state.max_draft) == (
+        MAX_REQS, MAX_TOKENS, MAX_DRAFT
+    )
+    assert tuple(state.conf_by_slot.shape) == (MAX_REQS, MAX_DRAFT)
+
+
+def test_load_refuses_a_drafter_without_a_head(make):
+    drafter = make(head=lambda: None)
+    with pytest.raises(ValueError, match="no confidence head"):
+        drafter.load_draft_model(None, set())
+    assert state_module.get_row_mask_state() is None
+
+
+def _propose(drafter, slots, num_speculative_tokens):
+    batch = SimpleNamespace(
+        num_reqs=len(slots), idx_mapping=torch.tensor(slots, dtype=torch.int64)
+    )
+    t = torch.ones(len(slots), dtype=torch.int32)
+    return drafter.propose(
+        batch, {}, {}, None, None, t, t, None, None, None, None,
+        num_speculative_tokens=num_speculative_tokens,
+    )
+
+
+def test_a_step_that_drafts_nothing_resets_its_slots(make, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        upstream.DSparkSpeculator,
+        "propose",
+        lambda self, batch, *a, **k: calls.append(batch.num_reqs) or "drafts",
+        raising=False,
+    )
+    drafter = make()
+    drafter.load_draft_model(None, set())
+    conf = drafter._row_mask.conf_by_slot
+    stale = torch.arange(MAX_REQS * MAX_DRAFT, dtype=torch.float32).view(
+        MAX_REQS, MAX_DRAFT
+    ) / 100
+    conf.copy_(stale)
+    # A drafting step leaves the publish to the draft step itself.
+    assert _propose(drafter, [6, 2], 3) == "drafts"
+    assert _propose(drafter, [6, 2], None) == "drafts"
+    assert torch.equal(conf, stale)
+    # Under data parallelism a zero-draft step still drafts.
+    drafter.dp_size = 2
+    assert _propose(drafter, [6, 2], 0) == "drafts"
+    assert torch.equal(conf, stale)
+    drafter.dp_size = 1
+    assert _propose(drafter, [6, 2], 0) == "drafts"
+    want = stale.clone()
+    want[[6, 2]] = 1.0
+    assert torch.equal(conf, want)
+    # The width passed positionally.
+    t = torch.ones(1, dtype=torch.int32)
+    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([4]))
+    assert drafter.propose(
+        batch, {}, {}, None, None, t, t, None, None, None, None,
+        None, False, False, None, False, 0,
+    ) == "drafts"
+    want[4] = 1.0
+    assert torch.equal(conf, want)
+    assert calls == [2, 2, 2, 2, 1]
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("num_speculative_tokens", [0, 3, None])
+def test_drafts_nothing_matches_the_zero_draft_return(dp_size, num_speculative_tokens):
+    spec = SimpleNamespace(dp_size=dp_size, _precompute_context_kv=lambda s, e: None)
+    assert conf_module.drafts_nothing(spec, num_speculative_tokens) == (
+        draft_context_only(spec, num_speculative_tokens, 4)
+    )
+
+
+def kernel_cases() -> dict:
+    """Run in the Triton interpreter; returns plain lists for the asserts."""
+    assert os.environ.get("TRITON_INTERPRET") == "1"
+    cpu = torch.device("cpu")
+    out: dict = {}
+
+    def sample(self, num_reqs, head_hidden):
+        # Stands for the head: (requests, width) block of the current view.
+        width = self.num_speculative_steps
+        self.draft_tokens[:num_reqs, :width] = self.next_tokens[:num_reqs, :width]
+        self.draft_token_confidence_probs[:num_reqs] = self.next_conf[:num_reqs, :width]
+
+    upstream.DSparkSpeculator._sample_sequential = sample
+
+    def drafter(base):
+        cls = conf_module.row_mask_class(base)
+        d = cls.__new__(cls)
+        d._row_mask = state_module.RowMaskState(MAX_REQS, MAX_TOKENS, MAX_DRAFT, cpu)
+        full = torch.full((MAX_REQS, MAX_DRAFT), -1.0)
+        d.draft_token_confidence_probs = full
+        d.draft_tokens = torch.zeros(MAX_REQS, MAX_DRAFT, dtype=torch.int64)
+        d.max_width = MAX_DRAFT
+        d.sample_idx_mapping = torch.full((MAX_REQS * MAX_DRAFT,), -1, dtype=torch.int64)
+        if base is width_module.PerKDSparkSpeculator:
+            d._confidence_by_width = {w: full[:, :w] for w in (3, MAX_DRAFT)}
+        return d
+
+    def step(d, slots, width, padded):
+        # prepare_dflash_inputs' layout: per request `width` sample rows
+        # holding its slot, -1 from the batch's end to max_num_reqs.
+        d.width = d.num_speculative_steps = width
+        d.sample_idx_mapping.fill_(-1)
+        for r, s in enumerate(slots):
+            d.sample_idx_mapping[r * width : (r + 1) * width] = s
+        g = torch.Generator().manual_seed(len(slots) * 10 + width)
+        d.next_conf = torch.rand(MAX_REQS, MAX_DRAFT, generator=g) + 0.5
+        d.next_conf[len(slots):] = 9.0  # what padding rows of the graph compute
+        d.next_tokens = torch.randint(0, 1000, (MAX_REQS, MAX_DRAFT), generator=g)
+        d._sample_sequential(padded, None)
+        assert d.draft_token_confidence_probs.shape == (MAX_REQS, MAX_DRAFT)
+        return {
+            "conf_by_slot": d._row_mask.conf_by_slot.tolist(),
+            "head": d.next_conf[:, :width].tolist(),
+            "drafts": d.draft_tokens[:padded, :width].tolist(),
+            "want_drafts": d.next_tokens[:padded, :width].tolist(),
+        }
+
+    plain = drafter(upstream.DSparkSpeculator)
+    plain._row_mask.conf_by_slot[4] = 0.25  # a slot outside the batch
+    out["plain"] = step(plain, [6, 1, 3], MAX_DRAFT, padded=4)
+
+    per_k = drafter(width_module.PerKDSparkSpeculator)
+    out["per_k_wide"] = step(per_k, [0, 5, 2, 7], MAX_DRAFT, padded=4)
+    out["per_k_narrow"] = step(per_k, [5, 2], 3, padded=4)
+    return out
+
+
+@pytest.fixture(scope="module")
+def kernels():
+    env = dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES="")
+    code = (
+        "import json; from tests.v1.spec_decode.test_dspark_row_mask_conf "
+        "import kernel_cases as f; print('RESULT ' + json.dumps(f()))"
+    )
+    done = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                          capture_output=True, text=True, timeout=1800)
+    assert done.returncode == 0, done.stderr[-4000:]
+    line = [ln for ln in done.stdout.splitlines() if ln.startswith("RESULT ")][-1]
+    return json.loads(line[len("RESULT "):])
+
+
+def test_each_request_publishes_at_its_slot(kernels):
+    case = kernels["plain"]
+    conf, head = case["conf_by_slot"], case["head"]
+    for r, slot in enumerate([6, 1, 3]):
+        assert conf[slot] == pytest.approx(head[r])
+
+
+def test_padding_requests_write_no_slot(kernels):
+    conf = kernels["plain"]["conf_by_slot"]
+    for slot in (0, 2, 5, 7):
+        assert conf[slot] == [1.0] * MAX_DRAFT
+    assert conf[4] == [0.25] * MAX_DRAFT
+    assert all(v != 9.0 for row in conf for v in row)
+
+
+def test_a_narrower_width_zero_fills_the_rest(kernels):
+    wide, narrow = kernels["per_k_wide"], kernels["per_k_narrow"]
+    for r, slot in enumerate([0, 5, 2, 7]):
+        assert wide["conf_by_slot"][slot] == pytest.approx(wide["head"][r])
+    conf = narrow["conf_by_slot"]
+    for r, slot in enumerate([5, 2]):
+        assert conf[slot] == pytest.approx(narrow["head"][r] + [0.0, 0.0])
+    # Slots outside the narrow batch keep the wide step's rows.
+    for slot, r in ((0, 0), (7, 3)):
+        assert conf[slot] == pytest.approx(wide["head"][r])
+
+
+def test_drafted_tokens_are_unchanged(kernels):
+    for case in kernels.values():
+        assert case["drafts"] == case["want_drafts"]

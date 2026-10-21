@@ -37,6 +37,10 @@ def create_dspark_speculator(
         from vllm.sm80.spec_decode.dspark_confidence import confidence_dump_class
 
         cls = confidence_dump_class(cls)
+    if envs.VLLM_DSPARK_ROW_MASK:
+        from vllm.sm80.spec_decode.dspark_row_mask_conf import row_mask_class
+
+        cls = row_mask_class(cls)
     return cls(vllm_config, device)
 
 
