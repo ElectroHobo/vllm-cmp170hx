@@ -85,6 +85,35 @@ def test_nan_rows_rank_nan_first_like_torch(experts, top_k):
     assert torch.equal(gw[3:].view(torch.int32), ww[3:].view(torch.int32))
 
 
+@pytest.mark.parametrize("experts,top_k", ROUTERS)
+def test_row_mask_with_nan_rows(experts, top_k):
+    # The row mask (VLLM_DSPARK_ROW_MASK) on finite and NaN rows: masked rows
+    # take id -1 and weight +0.0 whatever their logits; live rows, NaN ones
+    # included, keep the unmasked kernel's bytes.
+    logits, bias, bias_vl, input_ids = cuda_case(12, experts, 9)
+    logits[0, 7] = float("nan")
+    logits[2, :] = float("nan")
+    logits[5, 3] = float("nan")
+    logits[7, :] = float("nan")
+    live = torch.ones(16, dtype=torch.int8, device="cuda")
+    live[torch.tensor([1, 2, 3, 7, 11])] = 0
+    call = lambda row_live: route_fused(  # noqa: E731
+        logits, bias, top_k, bias_vl=bias_vl, input_ids=input_ids,
+        sentinel_lo=SENTINEL, sentinel_hi=SENTINEL + IMAGE_IDS,
+        routed_scaling_factor=1.5, row_live=row_live,
+    )
+    plain_w, plain_i = call(None)
+    w, i = call(live)
+    keep = live[:12].bool()
+    assert torch.equal(i[keep], plain_i[keep])
+    assert torch.equal(w[keep].view(torch.int32), plain_w[keep].view(torch.int32))
+    assert bool((i[~keep] == -1).all())
+    assert torch.equal(w[~keep].view(torch.int32), torch.zeros_like(w[~keep]).view(torch.int32))
+    # An all-live mask is the unmasked kernel, byte for byte.
+    w1, i1 = call(torch.ones(16, dtype=torch.int8, device="cuda"))
+    assert torch.equal(i1, plain_i) and torch.equal(w1.view(torch.int32), plain_w.view(torch.int32))
+
+
 def test_row_sum_model_is_torch_sum_on_cuda():
     g = torch.Generator().manual_seed(5)
     for k in range(1, 17):
