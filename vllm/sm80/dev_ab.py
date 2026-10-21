@@ -461,8 +461,11 @@ _SELECT_ENV = "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH"
 
 
 def _select_unavailable(runner) -> str | None:
-    if not any(m._sm80_attn_pipeline_eligible for m in _pipeline_layers(runner)):
-        return "no loaded DeepSeek attention pipeline implementation is eligible"
+    # select() runs only inside the enabled pipeline (run_indexer): with the
+    # pipeline off both arms would launch the same kernels.
+    if not any(m._sm80_attn_pipeline_eligible and m._sm80_attn_pipeline_enabled
+               for m in _pipeline_layers(runner)):
+        return "no loaded DeepSeek attention pipeline is enabled"
     return None
 
 

@@ -241,3 +241,22 @@ def test_switch_default_and_gate(monkeypatch):
     assert topk.one_launch(6, topk.PART, 1 << 20, topk.SelectionWorkspace(6, topk.PART, "cpu"))
     assert topk.SelectionWorkspace.bytes(48, 262144) == sum(
         t.numel() * t.element_size() for t in vars(ws).values() if isinstance(t, torch.Tensor))
+
+
+def test_the_switch_needs_an_enabled_pipeline(monkeypatch):
+    """select() runs only in the enabled pipeline's run_indexer, so a switch
+    armed on eligible but disabled layers would screen two identical arms."""
+    from types import SimpleNamespace
+
+    from vllm.sm80 import dev_ab
+
+    def layers(eligible, enabled):
+        return [SimpleNamespace(_sm80_attn_pipeline_eligible=eligible,
+                                _sm80_attn_pipeline_enabled=enabled)]
+
+    monkeypatch.setattr(dev_ab, "_pipeline_layers", lambda runner: layers(True, False))
+    assert "enabled" in dev_ab._select_unavailable(None)
+    monkeypatch.setattr(dev_ab, "_pipeline_layers", lambda runner: layers(False, False))
+    assert dev_ab._select_unavailable(None) is not None
+    monkeypatch.setattr(dev_ab, "_pipeline_layers", lambda runner: layers(True, True))
+    assert dev_ab._select_unavailable(None) is None
