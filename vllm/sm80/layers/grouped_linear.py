@@ -13,6 +13,12 @@ becomes a sub-layer that the method processes and applies on its own, and
 group by group. Any linear method whose parameters are sharded along the
 output rows (``output_dim`` 0: dense, block-scaled or per-row-scaled
 weights) works unchanged.
+
+By default each group's input rows are copied to a contiguous tensor before
+the method applies them. An adopter whose method reads a row-strided input
+(Marlin takes ``A.stride(0)`` as its row stride) passes ``strided_input`` and
+the method gets each group's rows as a view of the input instead: the same
+values and the same GEMM, without the copy.
 """
 
 import torch
@@ -30,20 +36,26 @@ _LAYER_ATTRS = (
 
 
 class GroupedLinearMethod(LinearMethodBase):
-    def __init__(self, inner: LinearMethodBase, groups: int):
+    def __init__(
+        self, inner: LinearMethodBase, groups: int, strided_input: bool = False
+    ):
         self.inner = inner
         self.groups = groups
+        # Hand the inner method each group's rows as a view of the input (row
+        # stride groups * input) instead of a contiguous copy.
+        self.strided_input = strided_input
 
     @classmethod
-    def adopt(cls, layer: nn.Module, groups: int) -> None:
+    def adopt(cls, layer: nn.Module, groups: int, strided_input: bool = False) -> None:
         """Run the already-built ``layer`` (its weights created by its own
-        method) as ``groups`` groups."""
+        method) as ``groups`` groups; ``strided_input`` only when that method
+        reads a row-strided input."""
         if layer.output_size_per_partition % groups:
             raise ValueError(
                 f"{layer.output_size_per_partition} outputs do not split into "
                 f"{groups} groups"
             )
-        layer.quant_method = cls(layer.quant_method, groups)
+        layer.quant_method = cls(layer.quant_method, groups, strided_input)
 
     def create_weights(self, *args, **kwargs):
         raise TypeError("GroupedLinearMethod adopts a layer whose weights exist")
@@ -82,6 +94,14 @@ class GroupedLinearMethod(LinearMethodBase):
         """``x`` [tokens, groups, input] -> [tokens, groups * output]."""
         if x.dim() != 3 or x.shape[1] != self.groups:
             raise ValueError(f"Grouped input must be [tokens, {self.groups}, input]")
+        if self.strided_input:
+            return torch.cat(
+                [
+                    self.inner.apply(sub, x[:, group])
+                    for group, sub in enumerate(layer.grouped)
+                ],
+                dim=-1,
+            )
         return torch.cat(
             [
                 self.inner.apply(sub, x[:, group].contiguous())

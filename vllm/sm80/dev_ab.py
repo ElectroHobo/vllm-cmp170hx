@@ -665,6 +665,36 @@ def _dense_prefill_apply(runner, on: bool) -> None:
     dense_prefill_tc.active = on
 
 
+def _wo_a_methods(runner):
+    """The grouped wo_a methods of the target's and the drafter's sm_80
+    DeepSeek-V4.1 attention layers."""
+    from vllm.models.deepseek_v41.nvidia.sm80_attention import (
+        DeepseekV41Sm80Attention,
+    )
+    from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
+
+    seen = set()
+    for module in _model_modules(runner):
+        if not isinstance(module, DeepseekV41Sm80Attention):
+            continue
+        method = getattr(getattr(module, "wo_a", None), "quant_method", None)
+        if isinstance(method, GroupedLinearMethod) and id(method) not in seen:
+            seen.add(id(method))
+            yield method
+
+
+def _wo_a_unavailable(runner) -> str | None:
+    if not any(True for _ in _wo_a_methods(runner)):
+        return "the served target/drafter has no grouped DeepSeek-V4.1 wo_a"
+    return None
+
+
+def _wo_a_apply(runner, on: bool) -> None:
+    _set_env("VLLM_DEEPSEEK_V41_WO_A_STRIDED", on)
+    for method in _wo_a_methods(runner):
+        method.strided_input = on
+
+
 SWITCHES: dict[str, Switch] = {
     s.name: s
     for s in (
@@ -686,6 +716,12 @@ SWITCHES: dict[str, Switch] = {
             "dsv41_gate_gemv", "VLLM_DEEPSEEK_V41_GATE_GEMV", True, False,
             _gate_gemv_unavailable,
             lambda runner: any(g.gemv for g in _gemv_gates(runner)), _gate_gemv_apply,
+        ),
+        Switch(
+            "dsv41_wo_a_strided", "VLLM_DEEPSEEK_V41_WO_A_STRIDED", True, True,
+            _wo_a_unavailable,
+            lambda runner: any(m.strided_input for m in _wo_a_methods(runner)),
+            _wo_a_apply,
         ),
         Switch(
             "exl3_dense_prefill_tc", "VLLM_EXL3_DENSE_PREFILL_TC", True, False,

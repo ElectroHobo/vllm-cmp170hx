@@ -360,6 +360,33 @@ def test_grouped_wo_a_is_the_official_block_diagonal_einsum(monkeypatch):
     torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("strided", ["0", "1"])
+def test_wo_a_strided_switch_reaches_every_grouped_wo_a(
+    monkeypatch,
+    meta_platform,  # noqa: F811
+    hybrid_on,
+    hybrid,
+    strided,
+):
+    """VLLM_DEEPSEEK_V41_WO_A_STRIDED sets how every grouped wo_a of the
+    target and the drafter takes its groups' rows (TP4: 2 local groups)."""
+    from vllm.sm80 import plugin
+    from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
+
+    plugin._register_exl3()
+    monkeypatch.setenv("VLLM_DEEPSEEK_V41_WO_A_STRIDED", strided)
+    construct.set_groups(monkeypatch, 4, 0)
+    construct.stub_engram_tables(monkeypatch, 4)
+    methods = []
+    for config in construct.vllm_configs(str(hybrid[0]), 4):
+        model = construct.build_model(config)
+        methods += [m.quant_method for n, m in model.named_modules()
+                    if n.endswith(".wo_a")]  # fmt: skip
+    assert methods and all(type(m) is GroupedLinearMethod for m in methods)
+    assert {m.groups for m in methods} == {2}
+    assert {m.strided_input for m in methods} == {strided == "1"}
+
+
 @pytest.mark.parametrize("device", ["meta", "cuda"])
 def test_out_dtype_linear_keeps_the_fp32_sum(device):
     """FP32 output of BF16 x and weight (torch.mm out_dtype, a CUDA kernel;

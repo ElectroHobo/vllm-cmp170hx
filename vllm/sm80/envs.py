@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
+    VLLM_DEEPSEEK_V41_WO_A_STRIDED: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
@@ -961,6 +962,15 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
     "VLLM_DEEPSEEK_V41_GATE_GEMV": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the grouped FP8 wo_a (one Marlin GEMM per
+    # group) reads each group's rows of the attention output in place, as a
+    # row-strided view (Marlin's A row stride), instead of copying them to a
+    # contiguous tensor first: two copy kernels fewer per layer, the same
+    # GEMMs on the same values, so the same bytes. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_WO_A_STRIDED": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_A_STRIDED", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the attention core of decode, speculative verify
     # and draft steps (the norms and window row of prepare_layer, the query

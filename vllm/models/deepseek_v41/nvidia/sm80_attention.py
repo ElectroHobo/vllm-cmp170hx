@@ -324,8 +324,14 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         ):
             # A quantized dense wo_a (an FP8 one in a hybrid checkpoint) runs
             # its groups as separate GEMMs of its own method (no batched
-            # kernel on sm_80; _o_proj calls apply_grouped).
-            GroupedLinearMethod.adopt(self.wo_a, self.n_local_groups)
+            # kernel on sm_80; _o_proj calls apply_grouped). Its Marlin
+            # W8A16 GEMM reads a row-strided A, so with
+            # VLLM_DEEPSEEK_V41_WO_A_STRIDED the groups' rows go in as views.
+            GroupedLinearMethod.adopt(
+                self.wo_a,
+                self.n_local_groups,
+                strided_input=envs.VLLM_DEEPSEEK_V41_WO_A_STRIDED,
+            )
         tp_size = self.n_heads // self.n_local_heads
         index_n_heads = getattr(config, "index_n_heads", 0)
         cand_source = self.candidate_source_layer
