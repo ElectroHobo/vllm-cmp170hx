@@ -216,7 +216,28 @@ def _subrequest(a, request):
     return b, start, end
 
 
+# The last replayed calls: fp64_cases runs every output of one captured call
+# (up to six coupled sources) in a row on the same loaded arguments, and the
+# replay does not depend on the output judged.
+_REPLAYED: dict[int, tuple] = {}
+
+
 def pipeline_outputs(a, device, src):
+    hit = _REPLAYED.get(id(a))
+    if hit is None or hit[0] is not a:
+        try:
+            result = _pipeline_outputs(a, device, src)
+        except ValueError as exc:
+            result = exc
+        hit = _REPLAYED[id(a)] = (a, result)
+        while len(_REPLAYED) > 8:
+            del _REPLAYED[next(iter(_REPLAYED))]
+    if isinstance(hit[1], ValueError):
+        raise hit[1]
+    return hit[1]
+
+
+def _pipeline_outputs(a, device, src):
     if device.type != 'cuda':
         raise ValueError('coupled pipeline replay requires CUDA and actual loaded linears')
     cand, objects = _execute(a, src, device, True)

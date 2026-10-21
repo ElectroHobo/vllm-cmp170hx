@@ -862,3 +862,32 @@ def test_cuda_paths_on_the_synthetic_cases(tmp_path, cases):
             else:
                 assert e["cand_mean"] <= 1.10 * e["ref_mean"], (cid, e)
                 assert e["cand_max"] <= 1.25 * e["ref_max"], (cid, e)
+
+
+def test_call_order_keeps_a_call_together_and_alternates_strata():
+    def case(i, sources, phase, rank):
+        return {"id": f"c{i}", "family": "attn_pipeline", "phase": phase, "context": "short",
+                "drafter": False, "rank": rank, "captured_sources": sources}
+    cases = [case(0, ["a"], "verify", 0), case(1, ["b", "c"], "verify", 0), case(2, ["d"], "decode", 1),
+             case(3, ["a"], "verify", 0), case(4, ["b", "c"], "verify", 0), case(5, ["d"], "decode", 1)]
+    assert [c["id"] for c in F.call_order(cases)] == ["c2", "c5", "c0", "c3", "c1", "c4"]
+
+
+def test_the_outputs_of_one_call_replay_it_once(monkeypatch):
+    from . import attn_pipeline_cases as P
+    calls = []
+    def replay(a, device, src):
+        calls.append(id(a))
+        if a.get("bad"):
+            raise ValueError("nonfinite pipeline comp")
+        return "outputs"
+    monkeypatch.setattr(P, "_pipeline_outputs", replay)
+    monkeypatch.setattr(P, "_REPLAYED", {})
+    good, bad = {}, {"bad": True}
+    for _ in range(3):
+        assert P.pipeline_outputs(good, CPU, None) == "outputs"
+        with pytest.raises(ValueError, match="nonfinite"):
+            P.pipeline_outputs(bad, CPU, None)
+    assert calls == [id(good), id(bad)]
+    assert P.pipeline_outputs(dict(good), CPU, None) == "outputs"
+    assert len(calls) == 3

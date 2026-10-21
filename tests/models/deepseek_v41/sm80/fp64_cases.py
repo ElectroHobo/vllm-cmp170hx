@@ -1058,6 +1058,44 @@ POINTS = {
 # ---------------------------------------------------------------- driver
 
 
+# Families whose outputs of one captured call are replayed once (the replay
+# caches its last arguments by identity): their cases share the loaded source.
+REPLAYED_ONCE = {"attn_pipeline", "attn_wo_a_consumer"}
+_LOADED: dict[str, dict] = {}
+
+
+def _load(path: str, case_family: str) -> dict:
+    if case_family not in REPLAYED_ONCE:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    if path not in _LOADED:
+        _LOADED[path] = torch.load(path, map_location="cpu", weights_only=True)
+    return _LOADED[path]
+
+
+def call_order(cases: list[dict]) -> list[dict]:
+    """The cases with the outputs of one captured call in a row, and the calls
+    round-robin over their strata (family, phase, context, drafter, rank), so
+    a run stopped early has judged every stratum evenly. Files of other
+    families keep their order."""
+    if not all(c.get("family") in REPLAYED_ONCE for c in cases):
+        return cases
+    calls: dict[tuple, list[dict]] = {}
+    for case in cases:
+        calls.setdefault(tuple(case.get("captured_sources") or ()), []).append(case)
+    strata: dict[tuple, list[list[dict]]] = {}
+    for group in calls.values():
+        c = group[0]
+        key = tuple(str(c.get(k)) for k in ("family", "phase", "context", "drafter", "rank"))
+        strata.setdefault(key, []).append(group)
+    queues = [strata[k] for k in sorted(strata)]
+    ordered = []
+    for i in range(max((len(q) for q in queues), default=0)):
+        for q in queues:
+            if i < len(q):
+                ordered.extend(q[i])
+    return ordered
+
+
 def case_row(
     case: dict, device: torch.device, checkpoint: dict, family_output: str | None = None
 ) -> dict:
@@ -1075,6 +1113,8 @@ def case_row(
     families = set()
     if len(set(sources)) != len(sources):
         raise ValueError("duplicate captured source path")
+    for stale in [p for p in _LOADED if p not in sources]:
+        del _LOADED[stale]
     for path in sources:
         expected_hash = (case.get("captured_sha256") or {}).get(path)
         if expected_hash is not None:
@@ -1084,7 +1124,7 @@ def case_row(
                 actual_hash = hashlib.file_digest(source_file, "sha256").hexdigest()
             if actual_hash != expected_hash:
                 raise ValueError(f"{path}: captured source hash changed")
-        obj = torch.load(path, map_location="cpu", weights_only=True)
+        obj = _load(path, case_family)
         if obj.get("schema") != SOURCE_SCHEMA:
             raise ValueError(f"{path}: schema {obj.get('schema')!r} is not {SOURCE_SCHEMA}")
         family = obj.get("family")
@@ -1161,7 +1201,7 @@ def run(cases: Path, out: Path, device: torch.device) -> int:
         checkpoint = doc.get("checkpoint") or {}
         family_output = str(doc.get("family") or "").partition(":")[2] or None
         failed = []
-        for case in doc.get("cases") or []:
+        for case in call_order(doc.get("cases") or []):
             try:
                 row = case_row(case, device, checkpoint, family_output)
             except Exception as exc:  # noqa: BLE001 - reported, the other cases still run

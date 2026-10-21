@@ -91,7 +91,8 @@ def official_parts(checkpoint, facts):
     return weight, scale, exact
 
 
-@functools.lru_cache(maxsize=1)
+# One coupled attention call loads four projections (wq_b, index_wq_b, wk, wo_a) of its layer.
+@functools.lru_cache(maxsize=8)
 def prepared(checkpoint, encoded, device):
     from vllm.config.quantization import QuantSpec
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
