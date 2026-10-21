@@ -29,13 +29,13 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_topk.py` | 186 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 496 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_route.py` | 192 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_route.py` | 202 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_sparse_attn.py` | 180 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue.py` | 538 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **15 files** | **6,918** |
+| **15 files** | **6,928** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -206,8 +206,8 @@ Files added elsewhere, grouped by top-level directory.
 | `CITATION.cff` | 7 |
 | `COMMUNITY_RECIPES.md` | 68 |
 | `NOTICE` | 9 |
-| `REVIEW.md` | 145 |
-| **4 files** | **229** |
+| `REVIEW.md` | 146 |
+| **4 files** | **230** |
 
 #### `.github/`
 
@@ -398,8 +398,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
 | `tests/models/deepseek_v41/sm80/test_sm80_moe_allreduce.py` | 207 |
 | `tests/models/deepseek_v41/sm80/test_sm80_pipeline_lifecycle.py` | 126 |
-| `tests/models/deepseek_v41/sm80/test_sm80_route_fused.py` | 258 |
-| `tests/models/deepseek_v41/sm80/test_sm80_route_fused_gpu.py` | 100 |
+| `tests/models/deepseek_v41/sm80/test_sm80_route_fused.py` | 297 |
+| `tests/models/deepseek_v41/sm80/test_sm80_route_fused_gpu.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_sm80_split_reduce.py` | 390 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
 | `tests/models/deepseek_v41/sm80/test_wo_b_allreduce_bits_gpu.py` | 120 |
@@ -496,7 +496,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 557 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **221 files** | **99,061** |
+| **221 files** | **99,117** |
 
 #### `tools/`
 
@@ -784,11 +784,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 172 |
-| Fork-added product lines | 54,824 |
+| Fork-added product lines | 54,834 |
 | Patched upstream files | 97 |
 | Patched upstream lines | +4,183 / -803 |
 | Patched upstream product files | 75 |
 | Patched upstream product lines | +3,611 / -253 |
-| Product lines added (new files and patches) | 58,435 |
+| Product lines added (new files and patches) | 58,445 |
 | Fork environment variables (flags) | 126 |
 | Unreferenced fork definitions | 3 (27 lines) |

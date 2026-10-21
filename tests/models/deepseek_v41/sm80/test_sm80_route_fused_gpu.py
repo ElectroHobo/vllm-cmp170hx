@@ -68,6 +68,23 @@ def test_bytes_equal_the_torch_path(experts, top_k, images, renorm):
         assert torch.equal(gw.view(torch.int32), ww.view(torch.int32)), tokens
 
 
+@pytest.mark.parametrize("experts,top_k", ROUTERS)
+def test_nan_rows_rank_nan_first_like_torch(experts, top_k):
+    logits, bias, bias_vl, input_ids = cuda_case(8, experts, 5)
+    logits[0, 7] = float("nan")
+    logits[1, 3] = float("nan")
+    logits[1, experts - 1] = float("nan")
+    logits[2, :] = float("nan")
+    (gw, gi), (ww, wi) = both(logits, bias, bias_vl, input_ids, top_k, False, True)
+    assert bool(((gi >= 0) & (gi < experts)).all())
+    assert torch.equal(torch.isnan(gw), torch.isnan(ww))
+    # One NaN: torch and the kernel take it first, then the same finite ids.
+    assert torch.equal(gi[0], wi[0])
+    # Finite rows keep the torch path's bytes.
+    assert torch.equal(gi[3:], wi[3:])
+    assert torch.equal(gw[3:].view(torch.int32), ww[3:].view(torch.int32))
+
+
 def test_row_sum_model_is_torch_sum_on_cuda():
     g = torch.Generator().manual_seed(5)
     for k in range(1, 17):

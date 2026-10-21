@@ -149,6 +149,21 @@ def interpreted_results() -> dict:
                                                     want_w.view(np.int32))),
                 ids_equal=bool(np.array_equal(got_i.numpy(), want_i)),
             )
+    # NaN gate logits: one NaN expert, and a whole NaN row. torch.topk ranks
+    # NaN above every number, so the NaN expert comes first and every id stays
+    # below the expert count; the weights of such a row are NaN.
+    for experts, top_k in ROUTERS:
+        logits, bias, _, _ = make_case(3, experts, 91)
+        logits[0, 7] = float("nan")
+        logits[1, :] = float("nan")
+        got_w, got_i = route_fused(logits, bias, top_k, routed_scaling_factor=1.5)
+        out[f"nan/{experts}x{top_k}"] = dict(
+            in_range=bool(((got_i >= 0) & (got_i < experts)).all()),
+            nan_first=int(got_i[0, 0]) == 7,
+            nan_rows=bool(torch.isnan(got_w[:2]).all()),
+            all_nan_distinct=len(set(got_i[1].tolist())) == top_k,
+            finite_row=bool(torch.isfinite(got_w[2]).all()),
+        )
     # The order matters: some row of k values sums differently sequentially.
     rng = np.random.default_rng(0)
     differs = {}
@@ -192,6 +207,30 @@ def test_interpreted_kernel_is_the_cuda_arithmetic_bitwise(interpreted):
         assert c["weights_bitwise"], key
     # A sequential sum would differ from the CUDA order on some rows.
     assert all(n > 0 for n in interpreted["order_sensitive"].values()), interpreted
+
+
+def test_nan_logits_keep_expert_ids_in_range(interpreted):
+    cases = {k: v for k, v in interpreted.items() if k.startswith("nan/")}
+    assert len(cases) == len(ROUTERS)
+    for key, c in cases.items():
+        assert all(c.values()), (key, c)
+
+
+def test_row_sum_model_is_the_installed_torch_reduction():
+    """The row-sum order (:func:`torch_cuda_row_sum`) was read from torch's
+    ``ATen/native/cuda/Reduce.cuh``; pin the two statements it rests on in the
+    installed torch's header: accumulators combined in order, and the warp fold
+    with decreasing offsets. A torch upgrade that changes either fails here
+    (the GPU half checks the model against ``torch.sum`` on CUDA)."""
+    import os
+
+    header = os.path.join(os.path.dirname(torch.__file__),
+                          "include/ATen/native/cuda/Reduce.cuh")
+    src = open(header).read()
+    assert "value_list[0][j] = ops.combine(value_list[0][j], value_list[i][j]);" in src
+    assert "for (int offset = dim_x >> 1; offset > 0; offset >>= 1) {" in src
+    assert "#if defined(USE_ROCM)\n    for (int offset = 1; offset < dim_x; offset <<= 1) {" in src
+    assert "dim0 >= 128 && iter.num_reduce_dims() == 1" in src
 
 
 def test_row_sum_model_matches_the_documented_order():

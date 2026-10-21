@@ -28,7 +28,9 @@ through the same FP32 operations in the same order as the torch path:
 The outputs are therefore the torch path's bytes for finite logits, except
 where torch's own result is unspecified: the order of equal biased scores
 within the top-k (torch's sort is not stable) and which of several equal
-scores at the k-th place is kept. One program per token; the experts of a
+scores at the k-th place is kept. A NaN biased score ranks above every number,
+as in torch.topk (NaNs lowest expert first), so a NaN row keeps in-range
+expert ids and NaN weights instead of selecting past the experts. One program per token; the experts of a
 row fit one block.
 """
 
@@ -118,8 +120,16 @@ def _route_kernel(
     weights = tl.zeros([2 * W], dtype=tl.float32)
     ids = tl.zeros([2 * W], dtype=tl.int32)
     for j in tl.static_range(K):
-        top = tl.max(biased, 0)
+        # torch.topk ranks NaN above every number; tl.max skips NaN, so a NaN
+        # is taken first here (lowest expert first), keeping the ids in range
+        # and the row's weights NaN as torch's are. Finite rows take the
+        # largest value, lowest expert first, as before.
+        is_nan = biased != biased
+        first_nan = tl.min(tl.where(is_nan, offs, BLOCK_E), 0)
+        top = tl.max(tl.where(is_nan, float("-inf"), biased), 0)
         pick = tl.min(tl.where(biased == top, offs, BLOCK_E), 0)
+        pick = tl.where(first_nan < BLOCK_E, first_nan, pick)
+        pick = tl.minimum(pick, num_experts - 1)
         chosen = offs == pick
         weights = tl.where(lane == j, tl.sum(tl.where(chosen, scores, 0.0), 0), weights)
         ids = tl.where(lane == j, pick, ids)

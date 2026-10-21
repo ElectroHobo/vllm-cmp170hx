@@ -19,7 +19,8 @@ libdevice `exp`/`log1p` compiled without flush-to-zero, `sqrt_rn`, `div_rn`,
 and the row sum in the order of torch's CUDA reduction kernel for a short
 contiguous row; the outputs are the torch path's bytes for finite logits
 (the order of exactly equal biased scores aside, which torch leaves open).
-`gate_temp != 1` is refused. Files: `ops/sm80_route.py` (new),
+`gate_temp != 1` is refused. A NaN biased score ranks first, as in
+`torch.topk`, so a NaN row keeps in-range expert ids and NaN weights. Files: `ops/sm80_route.py` (new),
 `sm80_moe.py` (router attribute and dispatch), `vllm/sm80/envs.py`,
 `vllm/sm80/dev_ab.py` (switch `dsv41_fused_route`). Tests:
 `test_sm80_route_fused.py` (interpreter vs torch, bitwise vs a NumPy model of
