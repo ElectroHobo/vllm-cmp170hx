@@ -19,7 +19,10 @@ num_speculative_tokens tokens per request in decode steps; this rule would
 call those steps prefill, so it does not cover such drafters. For them,
 ``max_decode_step_rows`` bounds the rows a decode step's forward passes can
 carry: a kernel that serves only calls of more rows than that bound never
-serves a decode step, whatever this rule says.
+serves a decode step, whatever this rule says. A block drafter (DFlash,
+DSpark) runs its block in a forward pass of its own, so its bound is the
+larger of the target's verify rows and the drafter's block rows, not their
+sum.
 
 Without a forward context, without attention metadata (profiling runs and
 piecewise CUDA-graph capture), or with per-microbatch metadata (a list,
@@ -41,16 +44,26 @@ def max_decode_query_len(vllm_config) -> int:
     return 1 + vllm_config.num_speculative_tokens
 
 
+# Drafters whose block runs in a forward pass separate from the target's.
+BLOCK_DRAFTERS = ("dflash", "dspark")
+
+
 def max_decode_step_rows(vllm_config) -> int:
     """Most rows one forward pass of a decode step can carry, target or
     drafter: for every batch size b up to max_num_seqs, b requests, each with
     the sampled token, its k drafts under verification and at most k slots of
     a parallel drafter, where k is the batch-size schedule's value for b
     (num_speculative_tokens_per_batch_size) or, without a schedule or with
-    adaptive k, num_speculative_tokens."""
+    adaptive k, num_speculative_tokens. A block drafter's forward pass is
+    separate: b requests of 1 + num_speculative_tokens rows at most (the
+    block drafts the full width; DSpark's block is one row narrower), and the
+    target's b * (1 + k), whichever is larger."""
     max_seqs = vllm_config.scheduler_config.max_num_seqs
     speculative = vllm_config.speculative_config
     k = 0 if speculative is None else speculative.num_speculative_tokens
+    if getattr(speculative, "method", None) in BLOCK_DRAFTERS and k > 0:
+        # Schedule values never exceed k, so the drafter's block bounds both.
+        return max_seqs * (1 + k)
     by_batch = [k] * (max_seqs + 1)
     schedule = getattr(speculative, "num_speculative_tokens_per_batch_size", None)
     if schedule and k > 0 and getattr(speculative, "adaptive_k", None) is None:

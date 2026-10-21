@@ -181,16 +181,17 @@ def test_gate_opens_only_on_the_validated_configuration():
     layouts = "not one of (2, 1), (4, 1)"
     assert f"(1, 1), {layouts}" in tc.closed_reason((8, 0), 74, _config(tp=1))
     assert f"(2, 2), {layouts}" in tc.closed_reason((8, 0), 74, _config(pp=2))
-    # Drafters whose decode steps schedule more than 1 + k tokens per request
-    # and can carry more than 64 rows: 16 requests x (1 + 3 + 3).
-    reason = tc.closed_reason((8, 0), 74, _config(method="dflash"))
-    assert "'dflash'" in reason and "carry 112 rows" in reason
+    # A drafter whose decode steps schedule more than 1 + k tokens per request
+    # and can carry more than 64 rows. A block drafter (DFlash, DSpark) runs
+    # its block in a forward pass of its own: 17 requests x (1 + 3) = 68.
+    reason = tc.closed_reason((8, 0), 74, _config(method="dflash", max_num_seqs=17))
+    assert "'dflash'" in reason and "carry 68 rows" in reason
     reason = tc.closed_reason((8, 0), 74, _config(parallel_drafting=True))
     assert "parallel drafting True" in reason
-    # A parallel drafter whose decode steps never carry more than 64 rows: the
-    # row floor keeps them on today's kernels, so the gate opens. The
-    # batch-size schedule drafts k = 5 for 1-3 requests and none for 4-8:
-    # 3 x (1 + 5 + 5) = 33 rows.
+    # A block drafter whose forward passes never carry more than 64 rows: the
+    # row floor keeps them on today's kernels, so the gate opens. 8 requests
+    # x (1 + 5) = 48 rows with or without the batch-size schedule, and 8 x
+    # (1 + 7) = 64 at seven drafts.
     dspark = dict(
         tp=4,
         method="dspark",
@@ -200,9 +201,10 @@ def test_gate_opens_only_on_the_validated_configuration():
         schedule=[[1, 3, 5], [4, 8, 0]],
     )
     assert tc.closed_reason((8, 0), 74, _config(**dspark)) is None
-    # Without the schedule every batch size drafts 5: 8 x 11 = 88 rows.
-    reason = tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None)))
-    assert "'dspark'" in reason and "carry 88 rows" in reason
+    assert tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None))) is None
+    assert tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None, k=7))) is None
+    reason = tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None, k=8)))
+    assert "'dspark'" in reason and "carry 72 rows" in reason
 
 
 def test_only_validated_matrices_are_taken():
