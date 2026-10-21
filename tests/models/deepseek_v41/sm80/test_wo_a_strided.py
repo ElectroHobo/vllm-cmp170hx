@@ -246,7 +246,9 @@ def test_marlin_strided_rows_are_the_copy_path_bytes(monkeypatch, groups):
     layer = _marlin_wo_a(monkeypatch, groups, rank_out, k)
     method = layer.quant_method
     generator = torch.Generator(device="cuda").manual_seed(7)
-    for rows in range(1, 49):
+    # Decode/verify sizes, then prefill sizes past Marlin's second launch
+    # (65+ rows: A_ptr advanced by lda) and its parallel row slices (128+).
+    for rows in [*range(1, 49), 64, 65, 127, 128, 200, 1000, 2048, 8192, 8193]:
         x = torch.randn(rows, groups * k, generator=generator, device="cuda").to(BF16)
         x = x.view(rows, groups, k)
         method.strided_input = False
