@@ -75,6 +75,7 @@ def _eager(monkeypatch, mode=CUDAGraphMode.NONE, capturing=False, max_size=1024)
         lambda: SimpleNamespace(cudagraph_runtime_mode=mode),
     )
     monkeypatch.setattr(split.capture, "active", False)
+    monkeypatch.setattr(split, "_workspace_locked", lambda: True)
     ca = _PieceCustomAllreduce(max_size)
     return ca
 
@@ -98,12 +99,14 @@ def _tp(monkeypatch, ca, host_takes=False):
         ("kernel_capture", None),
         ("too_few_rows", None),
         ("cpu", None),
+        ("workspace_unlocked", None),
     ],
 )
 def test_split_point(monkeypatch, case, cut) -> None:
     """An eager step splits when both slices are too large for the host-staged
     and the custom all-reduce; graph capture or replay, the kernel capture,
-    MegaMoE metadata and short steps run whole."""
+    MegaMoE metadata, short steps and the profile/warm-up runs (workspace not
+    yet locked) run whole."""
     ca = _eager(
         monkeypatch,
         mode=CUDAGraphMode.FULL if case == "graph_replay" else CUDAGraphMode.NONE,
@@ -114,10 +117,70 @@ def test_split_point(monkeypatch, case, cut) -> None:
     _tp(monkeypatch, ca, host_takes=case == "host_takes_a_slice")
     if case == "kernel_capture":
         monkeypatch.setattr(split.capture, "active", True)
+    if case == "workspace_unlocked":
+        monkeypatch.setattr(split, "_workspace_locked", lambda: False)
     rows = 1000 if case == "too_few_rows" else 2044
     x = torch.zeros(rows, 64, dtype=BF16) if case == "cpu" else _CudaLike(rows, 64)
     meta = object() if case == "mega_gate" else None
     assert split.split_point(x, meta) == cut
+
+
+HIDDEN_WS = 5120
+# The EXL3 routed experts' workspace2: a fixed BF16 buffer sized for the row
+# chunk (quant.py workspace_shapes); its size does not depend on the call.
+WS2_ELEMENTS = 1 << 20
+
+
+def _moe_call(rows: int) -> None:
+    """The routed-experts call's workspace request, as modular_kernel
+    _allocate_buffers makes it for the EXL3 experts: fused output (M, K) and
+    workspace2, in BF16."""
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    current_workspace_manager().get_simultaneous(
+        ((rows * HIDDEN_WS,), BF16), ((2 * WS2_ELEMENTS,), BF16)
+    )
+
+
+def _layer_moe_calls(rows: int) -> None:
+    """The MoE calls one split-reduce layer makes for a step of ``rows``."""
+    cut = split.split_point(_CudaLike(rows, HIDDEN_WS), None)
+    for part in ((rows,) if cut is None else (cut, rows - cut)):
+        _moe_call(part)
+
+
+@pytest.mark.parametrize("profile_splits", [True, False])
+def test_locked_workspace_holds_every_later_step(monkeypatch, profile_splits) -> None:
+    """The profile run (2048 rows) sizes the workspace, then it locks. A later
+    step of 1056 rows runs whole because the custom all-reduce takes its
+    512/544-row slices. If the profile run splits (the gate ignoring the
+    lock: ``profile_splits``), its two 1024-row calls size the workspace for
+    1024 rows only and that step hits the served refusal ("Workspace is locked
+    but allocation from ... _allocate_buffers requires ..."). With the gate,
+    the profile run is whole and every later step fits."""
+    from vllm.v1.worker import workspace as ws
+
+    _eager(monkeypatch)
+    if not profile_splits:
+        monkeypatch.setattr(
+            split, "_workspace_locked", lambda: ws.current_workspace_manager().is_locked()
+        )
+    # The custom all-reduce takes slices below 8 MiB, as served.
+    _tp(monkeypatch, _PieceCustomAllreduce(8 << 20))
+    ws.init_workspace_manager(torch.device("cpu"))
+    try:
+        _layer_moe_calls(2048)  # the profile run
+        ws.lock_workspace()
+        assert split.split_point(_CudaLike(2048, HIDDEN_WS), None) == 1024
+        assert split.split_point(_CudaLike(1056, HIDDEN_WS), None) is None
+        if profile_splits:
+            with pytest.raises(AssertionError, match="Workspace is locked but allocation"):
+                _layer_moe_calls(1056)
+            return
+        for rows in (2048, 2044, 1056, 1639, 1024, 128, 6):
+            _layer_moe_calls(rows)
+    finally:
+        ws.reset_workspace_manager()
 
 
 # --- a decoder layer on CPU -------------------------------------------------

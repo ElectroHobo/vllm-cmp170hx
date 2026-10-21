@@ -97,11 +97,27 @@ def _whole_path_takes(t: torch.Tensor) -> bool:
     return sm80_attention.custom_all_reduce_takes(t)
 
 
+def _workspace_locked() -> bool:
+    """Whether the worker's scratch workspace is locked: true only after the
+    profile and warm-up runs. Those runs must call every layer whole, so the
+    workspace (sized by the largest call they make, then locked) holds the
+    largest MoE call any later step makes, split or not: a step's slices are
+    never larger than the whole calls the profile run made."""
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    return is_workspace_manager_initialized() and current_workspace_manager().is_locked()
+
+
 def split_point(x: torch.Tensor, mega_gate_metadata) -> int | None:
     """Where an adopted layer splits this call's rows (``x``: the attention
     input), or None to run the call whole. Every rank decides the same: the
     inputs are the step's row count and the TP group's settings."""
     if not x.is_cuda or mega_gate_metadata is not None or capture.active:
+        return None
+    if not _workspace_locked():
         return None
     if torch.cuda.is_current_stream_capturing():
         return None
