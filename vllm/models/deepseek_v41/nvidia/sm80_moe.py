@@ -193,8 +193,13 @@ def adopt_moe(ffn: nn.Module, config) -> None:
                 "%s; these MoE layers keep their kernels in prefill steps.",
                 reason,
             )
-    if envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE:
-        _adopt_round_once_all_reduce(ffn)
+    if (
+        envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
+        or envs.VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE
+    ):
+        _adopt_layer_all_reduce(
+            ffn, round_once=envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
+        )
 
 
 def moe_all_reduce(out: torch.Tensor) -> torch.Tensor:
@@ -209,7 +214,13 @@ def moe_all_reduce(out: torch.Tensor) -> torch.Tensor:
 
 class Sm80DeepseekV41MoE(upstream_model.DeepseekV4MoE):
     """The upstream DSv4.1 MoE with its runner's final all-reduce moved here
-    (``skip_final_all_reduce``) as :func:`moe_all_reduce`."""
+    (``skip_final_all_reduce``): :meth:`forward` is :meth:`reduce` of
+    :meth:`forward_partial`, so a caller may run the two apart (the prefill
+    split reduction, ``sm80_split_reduce.py``)."""
+
+    # VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: :func:`moe_all_reduce`;
+    # otherwise the runner's own all-reduce.
+    _round_once: bool = False
 
     def forward(
         self,
@@ -217,13 +228,32 @@ class Sm80DeepseekV41MoE(upstream_model.DeepseekV4MoE):
         input_ids: torch.Tensor | None = None,
         mega_gate_metadata=None,
     ) -> torch.Tensor:
-        out = super().forward(hidden_states, input_ids, mega_gate_metadata)
-        return moe_all_reduce(out)
+        return self.reduce(
+            self.forward_partial(hidden_states, input_ids, mega_gate_metadata)
+        )
+
+    def forward_partial(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        mega_gate_metadata=None,
+    ) -> torch.Tensor:
+        """This rank's MoE output (routed experts plus the shared-expert
+        shard), not yet all-reduced. Each row depends only on its own input."""
+        return super().forward(hidden_states, input_ids, mega_gate_metadata)
+
+    def reduce(self, out: torch.Tensor) -> torch.Tensor:
+        """The TP all-reduce of :meth:`forward_partial`'s output."""
+        if self._round_once:
+            return moe_all_reduce(out)
+        return tensor_model_parallel_all_reduce(out)
 
 
-def _adopt_round_once_all_reduce(ffn: nn.Module) -> None:
-    """VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: the layer, not the runner,
-    all-reduces the MoE output, where the runner would."""
+def _adopt_layer_all_reduce(ffn: nn.Module, *, round_once: bool) -> None:
+    """The layer, not the runner, all-reduces the MoE output, where the runner
+    would: rounded once with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
+    (``round_once``), else through the runner's all-reduce
+    (VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE alone)."""
     if type(ffn) is not upstream_model.DeepseekV4MoE:
         raise TypeError(f"Unexpected DeepSeek-V4.1 MoE: {type(ffn).__name__}")
     moe_config = ffn.experts.moe_config
@@ -233,11 +263,13 @@ def _adopt_round_once_all_reduce(ffn: nn.Module) -> None:
         return
     moe_config.skip_final_all_reduce = True
     ffn.__class__ = Sm80DeepseekV41MoE
-    logger.info_once(
-        "DeepSeek-V4.1 sm_80: MoE outputs too large for the custom all-reduce "
-        "whole are all-reduced with one rounding per element on eager steps, "
-        "over %s (VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE=1; set 0 for the "
-        "runner's all-reduce)",
-        round_once_transport(),
-        scope="global",
-    )
+    ffn._round_once = round_once
+    if round_once:
+        logger.info_once(
+            "DeepSeek-V4.1 sm_80: MoE outputs too large for the custom all-reduce "
+            "whole are all-reduced with one rounding per element on eager steps, "
+            "over %s (VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE=1; set 0 for the "
+            "runner's all-reduce)",
+            round_once_transport(),
+            scope="global",
+        )

@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
+    VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
@@ -909,6 +910,20 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
     "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: in eager steps of at least 1024 rows, run each
+    # target decoder layer's wo_b, FFN and both TP all-reduces in two row
+    # slices, the all-reduces on a side stream, so one slice's all-reduce runs
+    # beside the other slice's compute (sm80_split_reduce.py). Each slice's
+    # message takes the path the whole message would; steps whose slices the
+    # host-staged or custom all-reduce would take run whole. Bits equal the
+    # unsplit step's where the per-row kernels and the all-reduce do not
+    # depend on the row count (the round-once paths do not; NCCL's ring sums
+    # an element in an order set by its place in the message). Default OFF:
+    # unset, every layer runs whole. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_model.py and sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: run the decoder layers' delayed mHC (the fused
     # post + pre at every sublayer boundary and the pre-only entries) through

@@ -52,6 +52,7 @@ from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
 from vllm.sm80 import capture
 from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
+from vllm.models.deepseek_v41.nvidia import sm80_split_reduce
 from vllm.models.deepseek_v41.nvidia.sm80_moe import adopt_moe
 from vllm.sm80.kernels.exl3.quant import Exl3HeadLogitsProcessor
 
@@ -89,7 +90,12 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
     takes the repeated embedding (its coefficients from the whole stream),
     an Engram layer injects into the previous layer's post, every other
     boundary is the previous sublayer's post fused with the next delayed pre.
+    With ``_split_reduce`` (VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE) an eager
+    step of enough rows runs everything after the attention in two row slices
+    (``sm80_split_reduce.py``).
     """
+
+    _split_reduce: bool = False
 
     @classmethod
     def adopt(cls, layer: upstream_model.DeepseekV4DecoderLayer, config) -> None:
@@ -184,6 +190,17 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
             )
             if capture_previous_aux:
                 previous_aux = aux
+
+        cut = (
+            sm80_split_reduce.split_point(x, mega_gate_metadata)
+            if self._split_reduce
+            else None
+        )
+        if cut is not None:
+            x, residual, post_mix, res_mix, ffn_pre = sm80_split_reduce.post_attention(
+                self, positions, x, cut, residual, post_mix, res_mix, attn_pre, input_ids
+            )
+            return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
         x = self.attn(positions, x, None)
 
@@ -302,6 +319,10 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             from .sm80_engram_prefetch import adopt_early_engram
 
             adopt_early_engram(model)
+        if envs.VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE:
+            sm80_split_reduce.adopt_split_reduce(
+                islice(model.layers, model.start_layer, model.end_layer)
+            )
         replay = model.decoder_replay_layers
         if replay is not None:
             # Upstream bound the replay's KV write to the layer before its

@@ -77,9 +77,16 @@ def _bare_moe(tp_size=4, ep_size=4, sequence_parallel=False, skip=False):
     return ffn
 
 
-def test_round_once_moves_the_final_all_reduce_into_the_layer(monkeypatch) -> None:
+@pytest.mark.parametrize("round_once", [True, False])
+def test_layer_all_reduce_moves_the_final_all_reduce_into_the_layer(
+    monkeypatch, round_once
+) -> None:
+    """The adopted MoE's forward is its reduce of its forward_partial: the
+    round-once all-reduce with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE,
+    else the runner's own all-reduce (VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE
+    alone)."""
     ffn = _bare_moe()
-    sm80_moe._adopt_round_once_all_reduce(ffn)
+    sm80_moe._adopt_layer_all_reduce(ffn, round_once=round_once)
     assert type(ffn) is sm80_moe.Sm80DeepseekV41MoE
     assert ffn.experts.moe_config.skip_final_all_reduce is True
 
@@ -91,34 +98,37 @@ def test_round_once_moves_the_final_all_reduce_into_the_layer(monkeypatch) -> No
 
     monkeypatch.setattr(dsv41_model.DeepseekV4MoE, "forward", upstream_forward)
     monkeypatch.setattr(sm80_moe, "moe_all_reduce", lambda t: t * 2)
+    monkeypatch.setattr(sm80_moe, "tensor_model_parallel_all_reduce", lambda t: t * 3)
     x = torch.ones(3, 8, dtype=BF16)
     ids = torch.arange(3)
     got = ffn(x, ids, "meta")
     assert calls == [((3, 8), ids, "meta")]
-    assert torch.equal(got, (x + 1) * 2)
+    assert torch.equal(got, (x + 1) * (2 if round_once else 3))
+    assert torch.equal(ffn.forward_partial(x, ids), x + 1)
+    assert torch.equal(ffn.reduce(x), x * (2 if round_once else 3))
 
 
-def test_round_once_leaves_single_rank_layers(monkeypatch) -> None:
+def test_layer_all_reduce_leaves_single_rank_layers(monkeypatch) -> None:
     ffn = _bare_moe(tp_size=1, ep_size=1)
-    sm80_moe._adopt_round_once_all_reduce(ffn)
+    sm80_moe._adopt_layer_all_reduce(ffn, round_once=True)
     assert type(ffn) is dsv41_model.DeepseekV4MoE
     assert ffn.experts.moe_config.skip_final_all_reduce is False
 
 
 @pytest.mark.parametrize("kw", [{"sequence_parallel": True}, {"skip": True}])
-def test_round_once_refuses_layers_the_runner_does_not_reduce(kw) -> None:
+def test_layer_all_reduce_refuses_layers_the_runner_does_not_reduce(kw) -> None:
     with pytest.raises(ValueError):
-        sm80_moe._adopt_round_once_all_reduce(_bare_moe(**kw))
+        sm80_moe._adopt_layer_all_reduce(_bare_moe(**kw), round_once=True)
 
 
-def test_round_once_refuses_other_moe_classes() -> None:
+def test_layer_all_reduce_refuses_other_moe_classes() -> None:
     class Other(dsv41_model.DeepseekV4MoE):
         pass
 
     ffn = _bare_moe()
     ffn.__class__ = Other
     with pytest.raises(TypeError):
-        sm80_moe._adopt_round_once_all_reduce(ffn)
+        sm80_moe._adopt_layer_all_reduce(ffn, round_once=False)
 
 
 def test_moe_round_once_allreduce_default_off(monkeypatch) -> None:

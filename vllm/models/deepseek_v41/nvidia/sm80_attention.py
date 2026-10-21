@@ -626,6 +626,13 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        return self._o_proj(self.attend(positions, hidden_states), positions)
+
+    def attend(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """The input projections and the attention region of :meth:`forward`:
+        the ``wo_a`` input (see :meth:`forward_mqa`), one row per token."""
         attn_out = torch.empty(
             (hidden_states.shape[0], self.n_local_heads, self.head_dim),
             dtype=hidden_states.dtype,
@@ -633,7 +640,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         )
         qr_kv, kv_score, index_weights = self._sm80_projections(hidden_states)
         self._sm80_attention(qr_kv, kv_score, index_weights, positions, attn_out)
-        return self._o_proj(attn_out, positions)
+        return attn_out
 
     @eager_break_during_capture
     def _sm80_attention(
@@ -767,19 +774,34 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         for messages too large for it whole,
         VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE; see
         :func:`wo_b_all_reduce`)."""
+        if not self.reduces_wo_b():
+            return self._wo_b_proj(self._wo_a_proj(attn_out))
+        return self.reduce_wo_b(self.wo_b_partial(attn_out))
+
+    def _wo_a_proj(self, attn_out: torch.Tensor) -> torch.Tensor:
         T = attn_out.shape[0]
         o = attn_out.view(T, self.n_local_groups, -1)
         wo_a = self.wo_a
         apply_grouped = getattr(wo_a.quant_method, "apply_grouped", None)
         if apply_grouped is not None:
-            z = apply_grouped(wo_a, o)
-        else:
-            w = wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            z = torch.einsum("tgd,grd->tgr", o, w).flatten(1)
+            return apply_grouped(wo_a, o)
+        w = wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        return torch.einsum("tgd,grd->tgr", o, w).flatten(1)
+
+    def reduces_wo_b(self) -> bool:
+        """Whether :meth:`_o_proj` all-reduces this rank's ``wo_b`` partial
+        through :meth:`reduce_wo_b` (TP, no fused GEMM + reduce-scatter)."""
         wo_b = self.wo_b
-        if self.gemm_rs is not None or not wo_b.reduce_results or wo_b.tp_size == 1:
-            return self._wo_b_proj(z)
-        partial = wo_b.quant_method.apply(wo_b, z, None)
+        return self.gemm_rs is None and wo_b.reduce_results and wo_b.tp_size > 1
+
+    def wo_b_partial(self, attn_out: torch.Tensor) -> torch.Tensor:
+        """This rank's ``wo_b`` partial of ``attn_out`` (``wo_a`` then
+        ``wo_b``, not yet all-reduced); each row depends only on its own."""
+        wo_b = self.wo_b
+        return wo_b.quant_method.apply(wo_b, self._wo_a_proj(attn_out), None)
+
+    def reduce_wo_b(self, partial: torch.Tensor) -> torch.Tensor:
+        """The TP all-reduce of :meth:`wo_b_partial`'s output."""
         return wo_b_all_reduce(
             partial, self._wo_b_bf16_allreduce, self._wo_b_bf16_pieces
         )

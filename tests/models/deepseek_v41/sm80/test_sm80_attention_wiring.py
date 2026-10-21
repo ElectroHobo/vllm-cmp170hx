@@ -430,6 +430,38 @@ def test_o_proj_passes_the_pieces_switch(monkeypatch) -> None:
     assert calls == [(False, True)]
 
 
+@pytest.mark.parametrize(
+    "tp_size,reduce_results,gemm_rs,reduces",
+    [(4, True, None, True), (1, True, None, False), (4, False, None, False),
+     (4, True, object(), False)],
+)
+def test_o_proj_is_reduce_of_wo_b_partial_by_rows(
+    monkeypatch, tp_size, reduce_results, gemm_rs, reduces
+) -> None:
+    """``reduces_wo_b`` says when ``_o_proj`` all-reduces; then ``_o_proj`` is
+    ``reduce_wo_b(wo_b_partial(.))``, and both are row-wise, so row slices
+    reduced apart concatenate to the whole (the prefill split reduction)."""
+    monkeypatch.setattr(sm80, "tensor_model_parallel_all_reduce", lambda t: t * 3)
+    g = torch.Generator().manual_seed(2)
+    T, G, R, D, H = 6, 2, 8, 16, 5
+    layer = _bare_layer(
+        n_local_groups=G, o_lora_rank=R, gemm_rs=gemm_rs,
+        wo_a=_Linear((torch.randn(G * R, D, generator=g) / 4).to(BF16)),
+        wo_b=_Linear((torch.randn(H, G * R, generator=g) / 4).to(BF16),
+                     reduce_results=reduce_results, tp_size=tp_size),
+        _wo_b_bf16_allreduce=False, _wo_b_bf16_pieces=False,
+    )
+    assert layer.reduces_wo_b() is reduces
+    if not reduces:
+        return
+    attn_out = torch.randn(T, G, D, generator=g).to(BF16)
+    whole = layer._o_proj(attn_out, torch.arange(T))
+    assert torch.equal(whole, layer.reduce_wo_b(layer.wo_b_partial(attn_out)))
+    halves = [layer.reduce_wo_b(layer.wo_b_partial(attn_out[s]))
+              for s in (slice(0, 2), slice(2, T))]
+    assert torch.equal(torch.cat(halves), whole)
+
+
 def test_wo_b_bf16_prefill_allreduce_default_off(monkeypatch) -> None:
     import vllm.envs as envs
 
