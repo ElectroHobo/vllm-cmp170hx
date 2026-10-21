@@ -44,6 +44,7 @@ from vllm.sm80.kernels.exl3.hybrid import (
 from vllm.sm80.kernels.exl3.layout import Exl3Layout, exl3_layout
 from vllm.sm80.kernels.exl3.override import apply_override
 from vllm.sm80.kernels.exl3.placement import apply_placement
+from vllm.sm80.kernels.exl3 import replicas as expert_replicas
 from vllm.sm80.kernels.exl3.utils import (
     Exl3Manifest,
     PackedMatrix,
@@ -802,6 +803,19 @@ class Exl3GroupedLinearMethod(Exl3LinearMethod):
 
 
 class Exl3MoEMethod(FusedMoEMethodBase):
+    # VLLM_EXL3_EXPERT_REPLICAS: this layer's replicas (create_weights) and
+    # the resident bytes their copies add; None and 0 when off.
+    replicas = None
+    replica_bytes = 0
+
+    @property
+    def home_experts(self) -> int:
+        """Local slots of the experts whose home is this rank (the operator
+        gates check these); replica copies follow them."""
+        if self.replicas is None:
+            return self.local_experts
+        return self.local_experts - len(self.replicas.copies)
+
     def __init__(self, config, prefix, moe):
         super().__init__(moe)
         self.config = config
@@ -838,6 +852,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise ValueError("EXL3 MoE requires BF16 and routing weights after down")
         assert self.config.manifest is not None
         apply_placement(layer, self.config, self.prefix)
+        # VLLM_EXL3_EXPERT_REPLICAS: copies of this layer's replicated experts
+        # whose home is another rank, in slots after the home slots.
+        self.replicas = expert_replicas.plan_layer(layer, self.config, self.prefix)
+        if self.replicas is not None:
+            num_experts += len(self.replicas.copies)
         self.intermediate_size = intermediate_size_per_partition
         self.local_experts = num_experts
         self.hidden_size = hidden_size
@@ -847,6 +866,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         local_matrices = []
         for expert in range(layer.global_num_experts):
             local = layer._map_global_expert_id_to_local_expert_id(expert)
+            if local < 0 and self.replicas is not None:
+                local = self.replicas.local[expert]
             for role in ("gate_proj", "up_proj", "down_proj"):
                 prefix = self.config.layout.expert_matrix(
                     self.config, self.prefix, expert, role
@@ -886,6 +907,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if any(len(expert) != 3 for expert in weights):
             raise ValueError("EXL3 expert assignment is incomplete or duplicated")
         layer.exl3_experts = nn.ModuleList(nn.ModuleList(w) for w in weights)
+        if self.replicas is not None:
+            added = sum(
+                p.nbytes
+                for expert in weights[self.home_experts :]
+                for weight in expert
+                for p in (weight.trellis, weight.suh, weight.svh)
+            )
+            self.replica_bytes = added
+            expert_replicas.log_layer(self.prefix, self.replicas, added)
 
     def get_fused_moe_quant_config(self, layer):
         return FusedMoEQuantConfig.make()
@@ -938,6 +968,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         else:
             layer.register_buffer("exl3_expert_map", layer.expert_map)
+        # The operator gates check the home slots; replica slots repeat
+        # matrices of the same layer.
+        gate_metadata = metadata[: self.home_experts]
+        replica_map = None
+        if self.replicas is not None:
+            if any(meta not in gate_metadata for meta in metadata[self.home_experts :]):
+                raise ValueError("EXL3 expert replicas differ from the layer's experts")
+            if layer.exl3_expert_map.dtype not in (torch.int32, torch.int64):
+                raise ValueError("EXL3 expert replicas need an integer expert map")
+            replica_map = expert_replicas.ReplicaMap(
+                self.replicas, device, layer.exl3_expert_map.dtype
+            )
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         prepare = maybe_make_prepare_finalize(
             moe=self.moe,
@@ -958,17 +1000,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         moe_v2_rows = moe_v2_bits_x2 = 0
         if envs.VLLM_EXL3_MOE_V2:
             moe_v2_rows, moe_v2_bits_x2, workspace = self._moe_v2(
-                layer, metadata, max_rows, workspace
+                layer, gate_metadata, max_rows, workspace
             )
         prefill_decode_len = 0
         if envs.VLLM_EXL3_MOE_PREFILL_TC:
             prefill_decode_len, workspace = self._moe_prefill(
-                layer, metadata, max_rows, workspace
+                layer, gate_metadata, max_rows, workspace
             )
         prefill_v2_bits_x2 = prefill_v2_decode_len = 0
         if self.prefill_v2:
             prefill_v2_bits_x2, prefill_v2_decode_len, workspace = (
-                self._moe_prefill_v2(layer, metadata, max_rows, workspace)
+                self._moe_prefill_v2(layer, gate_metadata, max_rows, workspace)
             )
         if moe_out_rows < max_rows:
             logger.info_once(
@@ -994,6 +1036,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             prefill_v2_bits_x2=prefill_v2_bits_x2,
             prefill_v2_decode_len=prefill_v2_decode_len,
             swiglu_limit=self.swiglu_limit,
+            replica_map=replica_map,
         )
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
 
@@ -1010,7 +1053,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.hidden_size,
             self.intermediate_size,
             layer.top_k,
-            self.local_experts,
+            self.home_experts,
             layer.global_num_experts,
             metadata,
         )
@@ -1070,7 +1113,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.hidden_size,
             self.intermediate_size,
             layer.top_k,
-            self.local_experts,
+            self.home_experts,
             layer.global_num_experts,
             metadata,
         )
@@ -1148,7 +1191,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.hidden_size,
             self.intermediate_size,
             layer.top_k,
-            self.local_experts,
+            self.home_experts,
             layer.global_num_experts,
             metadata,
         )
@@ -1226,6 +1269,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
 
 class Exl3Experts(mk.FusedMoEExpertsModular):
+    # VLLM_EXL3_EXPERT_REPLICAS: calls of 1..replicas.MAX_ROWS rows take the
+    # per-call expert map that picks one owner rank per replicated expert
+    # (replicas.py); None: the static expert map always.
+    replica_map = None
+
     def __init__(
         self,
         moe,
@@ -1241,6 +1289,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         prefill_v2_bits_x2=0,
         prefill_v2_decode_len=0,
         swiglu_limit=0.0,
+        replica_map=None,
     ):
         super().__init__(moe, quant)
         self.intermediate_size = intermediate_size
@@ -1266,6 +1315,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.prefill_v2_decode_len = prefill_v2_decode_len
         # SwiGLU clamp the native operators apply (0: none).
         self.swiglu_limit = swiglu_limit
+        self.replica_map = replica_map
 
     @staticmethod
     def activation_format():
@@ -1360,6 +1410,8 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             operator = self._prefill_operator(rows, operator)
         if self.prefill_v2_bits_x2:
             operator = self._prefill_v2_operator(rows, operator)
+        if self.replica_map is not None and 0 < rows <= expert_replicas.MAX_ROWS:
+            expert_map = self.replica_map(topk_ids)
         # Row-indexed arguments; moe_out takes at most moe_out_rows of them per
         # launch. It computes every row from its own input and routes alone, so
         # row chunks give the bits of the whole call.

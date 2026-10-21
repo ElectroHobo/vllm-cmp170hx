@@ -105,6 +105,36 @@ Validate reduction error and downstream routing before enabling. Equal-sized
 expert permutations add no resident weight or workspace memory; heterogeneous
 experts require a separate per-rank byte ledger despite equal slot counts.
 
+## Replicated hot experts
+
+`VLLM_EXL3_EXPERT_REPLICAS` defaults to the empty string (disabled). Set it to
+a JSON file and set `VLLM_EXL3_EXPERT_REPLICAS_SHA256` to that file's SHA256.
+The schema is `{"version":1,"ep_size":4,"layers":{"layers.1.ffn.experts":[17,5,203]}}`:
+per **checkpoint** expert prefix, the replicated experts, hottest first. Every
+rank then also holds a copy of each listed expert whose home is another rank,
+in local slots after its home slots.
+
+In a MoE call of 1 to 64 rows, each listed expert the call uses gets exactly
+one owner rank, chosen by the same rule on every rank from the call's top-k
+ids. The rule first counts each rank's distinct used experts that are not
+listed. The target is the larger of the busiest count and the call's distinct
+experts divided evenly over the ranks. Listed experts are then taken in plan
+order: one stays home while its home rank is below the target; otherwise it
+goes to the rank with the fewest experts so far. A small kernel writes the
+call's expert map from that rule before the routed-expert operator runs.
+Larger calls keep ordinary placement. Router ids, weights and top-k order are
+unchanged, and so is each expert's arithmetic. **Which rank's partial sum
+carries an expert changes** whenever an expert leaves its home, so final MoE
+bits need not match ordinary placement.
+
+Replicas add resident weight memory: one whole expert per listed expert that
+is not already local, per layer. vLLM's memory profile takes them out of the
+KV cache pool, and the startup log reports the bytes per layer. Supported with
+whole-expert EP at a power-of-two EP size and the linear expert placement, and
+not with data parallelism, EPLB, all-to-all dispatch, fused shared experts or
+`VLLM_EXL3_EXPERT_PLACEMENT`. Unknown checkpoint prefixes or experts and digest
+mismatches fail at startup.
+
 ## Third-party material
 
 Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.

@@ -135,6 +135,8 @@ if TYPE_CHECKING:
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
     VLLM_EXL3_EXPERT_PLACEMENT: str = ""
     VLLM_EXL3_EXPERT_PLACEMENT_SHA256: str = ""
+    VLLM_EXL3_EXPERT_REPLICAS: str = ""
+    VLLM_EXL3_EXPERT_REPLICAS_SHA256: str = ""
     VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
     VLLM_SM80_CAPTURE_DIR: str = ""
     VLLM_SM80_CAPTURE_FAMILIES: str = "dense,moe,attn"
@@ -1188,6 +1190,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_EXL3_EXPERT_PLACEMENT_SHA256": lambda: os.getenv(
         "VLLM_EXL3_EXPERT_PLACEMENT_SHA256", ""
+    ),
+    # SHA-pinned replicated hot routed experts under whole-expert EP
+    # (vllm/sm80/kernels/exl3/replicas.py); empty is disabled.
+    "VLLM_EXL3_EXPERT_REPLICAS": lambda: os.getenv(
+        "VLLM_EXL3_EXPERT_REPLICAS", ""
+    ),
+    "VLLM_EXL3_EXPERT_REPLICAS_SHA256": lambda: os.getenv(
+        "VLLM_EXL3_EXPERT_REPLICAS_SHA256", ""
     ),
 
     # EXL3 routed experts: moe_out runs MoE calls of more than this many rows

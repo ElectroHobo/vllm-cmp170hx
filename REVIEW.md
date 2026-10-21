@@ -127,3 +127,52 @@ refuses a misaligned one: its row stride and group offset must be multiples
 of 8 elements; DeepSeek-V4.1's group input is 4096).
 
 Removes: nothing (the copy path stays the default).
+
+# Replicated hot routed experts
+
+Intent: cut the all-reduce wait for the busiest EP rank in decode MoE calls.
+That wait is routed-expert count imbalance: about 30 µs per extra distinct
+expert per target layer. `VLLM_EXL3_EXPERT_REPLICAS` (a SHA-pinned plan, empty
+by default) copies each layer's listed hot experts onto every rank. Per MoE
+call of 1..64 rows, one owner rank per used listed expert computes its
+assignments. Rule and limits are in the `replicas.py` docstring and in
+`docs/features/quantization/exl3.md` ("Replicated hot experts").
+
+Files:
+- `vllm/sm80/kernels/exl3/replicas.py` (new): plan, layout, owner rule, its
+  reference, and the Triton per-call map kernel.
+- `vllm/sm80/kernels/exl3/quant.py`: replica slots after the home slots in
+  `create_weights`; the operator gates check the home slots; `Exl3Experts`
+  takes the per-call map for calls of 1..64 rows.
+- `vllm/sm80/envs.py`: the switch and its digest.
+- `docs/features/quantization/exl3.md`.
+- `tests/kernels/quantization/test_exl3_replicas.py` (new).
+
+No upstream-owned file changes. No native change: the kernels already size
+local experts from the pointer table and global experts from the map length,
+and the map length does not change.
+
+Numerics: order-changing. Expert arithmetic, router ids, weights and top-k
+order are unchanged, but an expert that leaves its home rank lands in another
+rank's partial sum, so the reduction order differs (V6 or V2's rounding
+check). A call whose used experts are already balanced keeps ordinary
+placement exactly.
+
+Tests (CPU):
+- plan validation and refusals;
+- the owner rule: exactly one rank per assignment, the same owners on every
+  rank, slots holding the right expert, never busier than ordinary placement,
+  balanced calls unchanged;
+- exact rank sums equal to ordinary placement for integer-valued experts;
+- the real loader holding each copy's checkpoint bytes, and the replica byte
+  ledger;
+- the experts' dispatch by row count;
+- the kernel against the reference in the Triton interpreter.
+
+Known limits:
+- The kernel's GPU run, graph replay and its per-layer launch cost (about
+  3–5 µs per MoE layer [EST]) are unmeasured.
+- Owner choice counts distinct experts, not row tiles.
+- Replica bytes come out of the KV pool.
+
+Removes: nothing.
