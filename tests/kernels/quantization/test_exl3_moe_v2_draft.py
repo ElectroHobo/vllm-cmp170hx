@@ -400,7 +400,7 @@ class _DraftExperts(h5120._Experts):
     def __init__(self, parts, sets_of, device, cache, intermediate, local):
         super().__init__(parts, sets_of, BITS_X2, device, cache)
         self.intermediate = intermediate
-        self.local = local
+        self.local_experts = local
         self.meta = torch.tensor(
             _meta(intermediate=intermediate, local=local),
             dtype=torch.int64,
@@ -467,7 +467,7 @@ def row_tile_floor():
 
 def _workspace(size_fn, experts, rows, device):
     return torch.full(
-        (size_fn(rows, HIDDEN, experts.intermediate, TOPK, experts.local),),
+        (size_fn(rows, HIDDEN, experts.intermediate, TOPK, experts.local_experts),),
         float("nan"),
         device=device,
     )
@@ -538,7 +538,7 @@ def _routes(scenario, rows, generator, local=LOCAL):
 
 def _case(experts, scenario, rows, seed, scale=1.0):
     generator = torch.Generator().manual_seed(seed)
-    ids, weights = _routes(scenario, rows, generator, experts.local)
+    ids, weights = _routes(scenario, rows, generator, experts.local_experts)
     x = (torch.randn(rows, HIDDEN, generator=generator) * scale).to(torch.bfloat16)
     return x.cuda(), ids.cuda(), weights.cuda()
 
@@ -688,7 +688,7 @@ def test_draft_graph_replay_is_bitwise_eager_without_allocations(synthetic, rows
         synthetic.pointers,
         synthetic.meta,
         synthetic.expert_map,
-        list(range(synthetic.local)),
+        list(range(synthetic.local_experts)),
         HIDDEN,
         synthetic.intermediate,
         TOPK,
