@@ -293,6 +293,31 @@ def _argmax_apply(runner, on: bool) -> None:
     speculator = _speculator(runner)
     speculator.use_local_argmax_reduction = on
     speculator._validate_local_argmax_reduction()
+
+
+_TARGET_ARGMAX_ENV = "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX"
+
+
+def _target_argmax_unavailable(runner) -> str | None:
+    from vllm.sm80.worker import target_argmax
+
+    return target_argmax.refusal(runner)
+
+
+def _target_argmax_current(runner) -> bool:
+    from vllm.sm80.worker import target_argmax
+
+    return target_argmax.enabled(runner)
+
+
+def _target_argmax_apply(runner, on: bool) -> None:
+    """Eager sampling only (no graph holds it); the on arm compiles the slot
+    kernels here, on one dummy row, so its first greedy step does not."""
+    from vllm.sm80.worker import target_argmax
+
+    target_argmax.set_enabled(runner, on)
+    _set_env(_TARGET_ARGMAX_ENV, on)
+    target_argmax.warm(runner)
 _QWEN4_MODEL_MODULE = "vllm.models.qwen4_exp.nvidia.model"
 # Every GateLinear attribute that set_out_dtype writes.
 _ROUTER_GATE_ATTRS = (
@@ -969,6 +994,11 @@ SWITCHES: dict[str, Switch] = {
             "speculative_config.use_local_argmax_reduction",
             True, True,
             _argmax_unavailable, _argmax_current, _argmax_apply,
+        ),
+        Switch(
+            "dsv41_target_shard_argmax", _TARGET_ARGMAX_ENV, False, True,
+            _target_argmax_unavailable, _target_argmax_current,
+            _target_argmax_apply,
         ),
         Switch(
             "qwen4_router_fp32", "VLLM_QWEN4_ROUTER_FP32", True, False,

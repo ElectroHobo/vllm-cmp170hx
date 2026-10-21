@@ -129,7 +129,10 @@ def _reset_module_state(monkeypatch):
 
 def _setup(monkeypatch, dev: FakeDevice, cap: Capture) -> tuple[Any, dict]:
     """The fork V2 runner whose profiling and real captures play ``cap`` on
-    ``dev``."""
+    ``dev``, with the flag set (without it the runner's captures are
+    upstream's)."""
+    if not cudagraph_mem.enabled():
+        monkeypatch.setenv(FLAG, "1")
     monkeypatch.setattr(cudagraph_mem, "_free", lambda: dev.free)
     monkeypatch.setattr(cudagraph_mem, "_reserved", lambda: dev.reserved)
     monkeypatch.setattr(cudagraph_mem, "_segments", lambda: list(dev.segments))
@@ -224,6 +227,7 @@ def test_levels(monkeypatch):
 @pytest.mark.parametrize("flag", ["0", "1", "2"])
 def test_select_worker(monkeypatch, flag):
     monkeypatch.setenv(FLAG, flag)
+    monkeypatch.delenv("VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX", raising=False)
     parallel = SimpleNamespace(worker_cls=cudagraph_mem.UPSTREAM_WORKER)
     cudagraph_mem.select_worker(parallel)
     expected = cudagraph_mem.WORKER if flag != "0" else cudagraph_mem.UPSTREAM_WORKER
@@ -237,6 +241,7 @@ def test_select_worker(monkeypatch, flag):
 
 def test_select_worker_keeps_a_custom_worker(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
+    monkeypatch.delenv("VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX", raising=False)
     parallel = SimpleNamespace(worker_cls="my.Worker")
     cudagraph_mem.select_worker(parallel)
     assert parallel.worker_cls == "my.Worker"

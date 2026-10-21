@@ -19,7 +19,8 @@ where the fork needs it:
   (``vllm.sm80.distributed.communicator``) while a fork all-reduce switch is
   set, else upstream's.
 - ``check_and_update_config``: upstream's, then with
-  ``VLLM_CUDAGRAPH_ESTIMATE_SPLIT=1`` the fork GPU worker
+  ``VLLM_CUDAGRAPH_ESTIMATE_SPLIT=1`` or
+  ``VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX=1`` the fork GPU worker
   (``vllm.sm80.worker.graph_mem_worker``) in place of upstream's.
 - ``check_and_update_config``: upstream's, then, with ``VLLM_DEV_AB_SWITCH``
   set, the development A/B setter's worker extension

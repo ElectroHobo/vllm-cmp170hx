@@ -1517,3 +1517,59 @@ seams:
   why: kernel_block_table is allocated 3-D (one per microbatch builder), which is how sm80_swa_meta_batch tells it from the runner's 2-D input block tables
   sha256: 90a29ab48fde025f624d5bbc41ffb5ec5327088ebe512156c055086b2fcea7a3
   signature: '(self, vllm_config, device, kernel_block_size: int | None = None, num_metadata_builders: int = 1)'
+
+- id: dsv41-target-sampler-call
+  kind: method
+  target: vllm.v1.worker.gpu.sample.sampler:Sampler.__call__
+  why: with every request of the step greedy, no logprobs, no NaN count, no sampling mask and no trace replay of logprobs, the sampled token of a row is the greedy argmax of what Sampler.sample makes of the logits; vllm/sm80/worker/target_argmax.py hands it rows holding 0.0 at torch.argmax of the gathered row and -inf elsewhere, and must sample the same tokens
+  sha256: 120e3dcb0fc3f1792eefa36eb2e7beefb370ebe36da393b46766683779e3d694
+  signature: '(self, logits: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch) -> vllm.v1.worker.gpu.sample.output.SamplerOutput'
+
+- id: dsv41-target-sampler-apply-params
+  kind: method
+  target: vllm.v1.worker.gpu.sample.sampler:Sampler.apply_sampling_params
+  why: the logits come back unchanged when no request of the batch needs logits processing (needs_logits_processing); target_argmax.py serves only such steps, so the samplers read the target logits only through their argmax
+  sha256: c049aa1b1e9ad220d8e6bf21c8d8a6a01c732e7db1a7879b94e955a4b1bd11b5
+  signature: '(self, logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, idx_mapping: torch.Tensor, idx_mapping_np: numpy.ndarray, pos: torch.Tensor, input_ids: torch.Tensor, expanded_local_pos: torch.Tensor, seq_lens_upper_bound_np: numpy.ndarray, skip_top_k_top_p: bool = False) -> torch.Tensor'
+
+- id: dsv41-target-rejection-call
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.rejection_sampler:RejectionSampler.__call__
+  why: the target logits are read by the NaN count, apply_sampling_params and rejection_sample (a greedy request accepts a draft iff it equals the target argmax, then takes the argmax at the first mismatch or the bonus row), and by the logprobs and sampling mask only when requested; target_argmax.py hands it rows holding only that argmax (0.0 there, -inf elsewhere)
+  sha256: 421fd2df7bb2e1c990eee3b650a23bc3f4c5cc03da5ae954f2f02897fa5ce551
+  signature: '(self, logits: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, draft_logits: torch.Tensor | None = None, invalid_drafts: torch.Tensor | None = None) -> vllm.v1.worker.gpu.sample.output.SamplerOutput'
+
+- id: dsv41-target-compute-logits-local
+  kind: method
+  target: vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.compute_logits_local
+  why: the target's shard logits are its logits processor's skip_gather output for the same hidden states, the columns compute_logits all-gathers; target_argmax.py takes the argmax over them
+  sha256: 35012265d57c6eefc7ddb6ef78963a1403428e1c40caf1a9a54e11c89aa33420
+  signature: '(self, hidden_states: torch.Tensor) -> torch.Tensor'
+
+- id: dsv41-target-runner-sample
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample
+  why: outside batch-sharded sampling it calls self.model.compute_logits once, on the step's logits rows, before the grammar bitmask, the sampler and the rejection sampler read the logits; the fork runner (vllm/sm80/worker/graph_mem_worker.py) runs it inside target_argmax.step, and the sm_80 DeepSeek-V4.1 target's compute_logits returns the argmax rows during a greedy-only step
+  sha256: 5585f4a055cf63f8f30c423a6aa02f1ef86a5990bf94018750594e69b8aa0a32
+  signature: '(self, hidden_states: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, grammar_output: vllm.v1.core.sched.output.GrammarOutput | None) -> tuple[vllm.v1.worker.gpu.sample.output.SamplerOutput, torch.Tensor, torch.Tensor]'
+
+- id: dsv41-target-dummy-sampler-run
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner._dummy_sampler_run
+  why: profile_run calls it at boot, outside graph capture, on every rank of the last pipeline stage with the same sample hidden states, which compute_logits takes; the fork runner warms the slot kernels (and refuses a target target_argmax cannot serve) on them after it
+  sha256: 250fbef202183c139a42163ae332ea648be031a398923260f747f80de449bc43
+  signature: '(self, hidden_states: torch.Tensor) -> None'
+
+- id: dsv41-target-sampler-sample
+  kind: method
+  target: vllm.v1.worker.gpu.sample.sampler:Sampler.sample
+  why: with no top-k/top-p in the sampling states (get_top_k_top_p gives None, None) nothing runs between apply_sampling_params and the greedy argmax (gumbel_sample at temperature 0); target_argmax.greedy_only requires that, since top-p may drop the first of tied maxima
+  sha256: 148909f008cd7b044b84fd034cd15d5567abd00fcfc49bf4925733f36d8643fa
+  signature: '(self, logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, idx_mapping: torch.Tensor, idx_mapping_np: numpy.ndarray, pos: torch.Tensor, input_ids: torch.Tensor, expanded_local_pos: torch.Tensor, seq_lens_upper_bound_np: numpy.ndarray, return_logprobs: bool = False) -> tuple[torch.Tensor, torch.Tensor]'
+
+- id: dsv41-target-sampling-states-add-request
+  kind: method
+  target: vllm.v1.worker.gpu.sample.states:SamplingStates.add_request
+  why: a temperature-0 request needs no logits processing from these states (temperature and min-p are not applied by apply_sampling_params for it; its top-k/top-p, reset by SamplingParams, are stored as no filter, top_k = vocab_size and top_p = 1.0); target_argmax.greedy_only reads temperature.np, top_k.np, top_p.np and the sampler's needs_logits_processing this sets
+  sha256: 3b14a9e897290c536b7e41f8b33217942c5b973a12ba75df670d78a0e6e72318
+  signature: '(self, req_idx: int, sampling_params: vllm.sampling_params.SamplingParams) -> bool'

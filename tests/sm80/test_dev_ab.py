@@ -191,6 +191,7 @@ def test_allowlist():
         "custom_allreduce_flags",
         "kda_prefill",
         "local_argmax_reduction",
+        "dsv41_target_shard_argmax",
         "qwen4_router_fp32",
     }
 
@@ -491,6 +492,52 @@ def test_local_argmax_switch_sets_the_speculator():
     # The speculator's own check still guards the on arm.
     with pytest.raises(ValueError, match="get_top_tokens"):
         switch.apply(SimpleNamespace(speculator=Speculator(object())), True)
+def test_target_shard_argmax_switch(monkeypatch):
+    """Eager sampling only, the same tokens: no per-arm graphs; the on arm
+    compiles its kernels when it is applied."""
+    torch = pytest.importorskip("torch")
+    from vllm.sm80.worker import target_argmax
+
+    switch = dev_ab.SWITCHES["dsv41_target_shard_argmax"]
+    assert not switch.graph_bound and switch.output_identical
+    assert switch.env == "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX"
+    lm = SimpleNamespace(
+        lm_head=SimpleNamespace(tp_rank=0, tp_size=4),
+        logits_processor=SimpleNamespace(org_vocab_size=129280, logits_as_input=False),
+    )
+    model = SimpleNamespace(compute_logits_local=lambda h: h, language_model=lm,
+                            target_argmax_logits=True)
+
+    def runner_with(**kw):
+        fields = dict(model=model, lora_config=None, batch_sharder=None,
+                      target_argmax_steps=True, device=torch.device("cpu"),
+                      model_config=SimpleNamespace(get_hidden_size=lambda: 8,
+                                                   dtype=torch.bfloat16))
+        fields.update(kw)
+        return SimpleNamespace(**fields)
+
+    warmed = []
+    monkeypatch.setattr(target_argmax, "argmax_rows",
+                        lambda m, h: warmed.append((m, h.shape, h.dtype)))
+    runner = runner_with()
+    assert switch.unavailable(runner) is None
+    monkeypatch.setenv(switch.env, "0")
+    assert switch.current(runner) is False
+    switch.apply(runner, True)
+    assert switch.current(runner) is True and runner._target_shard_argmax is True
+    assert warmed == [(model, (1, 8), torch.bfloat16)]
+    switch.apply(runner, False)
+    assert switch.current(runner) is False and len(warmed) == 1
+    # Servers where the on arm cannot run: refuse at boot.
+    assert "batch-sharded" in switch.unavailable(runner_with(batch_sharder=object()))
+    upstream = runner_with(target_argmax_steps=False)
+    assert "does not sample in greedy steps" in switch.unavailable(upstream)
+    headless = runner_with(model=SimpleNamespace(target_argmax_logits=True))
+    assert "compute_logits_local" in switch.unavailable(headless)
+    with pytest.raises(ValueError, match="compute_logits_local"):
+        switch.apply(headless, True)
+
+
 @pytest.fixture
 def router_model(monkeypatch):
     """Two target and one draft Qwen4Exp MoE block whose gates carry the

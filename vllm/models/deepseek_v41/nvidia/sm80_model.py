@@ -30,7 +30,11 @@ What changes on sm_80:
   reference computes them: the plugin defaults ``head_dtype`` to float32
   (``vllm.sm80.plugin.HF_CONFIG_DEFAULTS``), the EXL3 head stores its FP32
   result in that dtype and both models' logits processors serve it
-  (``Exl3HeadLogitsProcessor``).
+  (``Exl3HeadLogitsProcessor``);
+- with ``VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX`` the target's
+  ``compute_logits`` returns, inside a greedy-only sampling step of the fork
+  runner, rows that hold only the vocabulary-parallel argmax instead of the
+  all-gathered logits (``vllm/sm80/worker/target_argmax.py``).
 
 The attention layers are the platform's (``_select_dsv4_attn_cls``); the
 layer topology this supports is TP with whole-expert EP and no sequence
@@ -55,6 +59,7 @@ from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
 from vllm.models.deepseek_v41.nvidia import sm80_split_reduce
 from vllm.models.deepseek_v41.nvidia.sm80_moe import adopt_moe
 from vllm.sm80.kernels.exl3.quant import Exl3HeadLogitsProcessor
+from vllm.sm80.worker import target_argmax
 
 logger = init_logger(__name__)
 
@@ -394,6 +399,18 @@ class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
             prefix=f"{maybe_prefix(prefix, 'language_model')}.lm_head",
         )
         Exl3HeadLogitsProcessor.adopt(self.language_model.logits_processor)
+
+    # target_argmax.refusal: compute_logits serves greedy-only steps.
+    target_argmax_logits = True
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Upstream's gathered logits; inside a greedy-only sampling step
+        (``VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX``) the rows that hold only
+        their argmax, without the all-gather
+        (``vllm/sm80/worker/target_argmax.py``)."""
+        if target_argmax.active():
+            return target_argmax.argmax_rows(self, hidden_states)
+        return super().compute_logits(hidden_states)
 
 
 class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):

@@ -52,8 +52,9 @@ long-lived allocation made during a capture cannot keep a large free segment
 from being released.
 
 The worker and model runner subclasses that call in here are in
-``graph_mem_worker``; the fork platform selects that worker only with the flag
-set, so without it nothing here runs.
+``graph_mem_worker``; without the flag nothing here runs (the fork platform
+also selects that worker for the greedy target argmax, whose runner then
+keeps vLLM's estimate).
 """
 
 from __future__ import annotations
@@ -87,13 +88,22 @@ def tracing() -> bool:
 
 
 def select_worker(parallel_config: Any) -> None:
-    """With the flag, run the fork worker in place of upstream's GPU worker
-    (called by the fork platform's ``check_and_update_config``)."""
-    if not enabled():
+    """With this flag or the greedy target argmax
+    (``VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX``), run the fork worker in place
+    of upstream's GPU worker (called by the fork platform's
+    ``check_and_update_config``). The argmax refuses another worker; the
+    estimate split only warns."""
+    argmax = bool(envs.VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX)
+    if not (enabled() or argmax):
         return
     if parallel_config.worker_cls == UPSTREAM_WORKER:
         parallel_config.worker_cls = WORKER
     elif parallel_config.worker_cls != WORKER:
+        if argmax:
+            raise ValueError(
+                "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX: the greedy target "
+                f"argmax needs the fork GPU worker, not {parallel_config.worker_cls}"
+            )
         logger.warning(
             "VLLM_CUDAGRAPH_ESTIMATE_SPLIT=1 is set but the worker is %s, not "
             "vLLM's GPU worker; the CUDA-graph memory estimate stays vLLM's.",

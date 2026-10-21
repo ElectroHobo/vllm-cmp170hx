@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
     VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX: bool = False
+    VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
     VLLM_DEEPSEEK_V41_SWA_META_BATCH: bool = False
@@ -1072,6 +1073,26 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vllm/sm80/spec_decode/shard_argmax.py.
     "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", "0"))
+    ),
+    # Greedy target sampling without the all-gather of the target logits: when
+    # every request of a step is greedy (temperature 0)
+    # and nothing reads the logits beyond their argmax (no logprobs, logits
+    # processing, grammar bitmask, NaN count, sampling mask or watermarking),
+    # each TP rank takes the argmax of its own vocabulary shard of the target
+    # logits, the ranks exchange one (value, index) pair per 4096-column chunk
+    # through the DSpark drafter's 16-byte all-reduce slots, and the samplers
+    # get rows holding 0.0 at that token and -inf elsewhere. Precision: none
+    # changes. The token is torch.argmax's over the gathered row, ties and NaN
+    # included (the first index of the largest value, the first NaN, -0.0
+    # equal to +0.0), so the sampled and accepted tokens are the gathered
+    # path's whenever its rows hold no NaN. Every other step takes the gather.
+    # Set, it selects the fork GPU worker (vllm/sm80/worker/graph_mem_worker.py,
+    # V2 runner; another worker or runner is refused at boot) and warms the
+    # kernels in the dummy sampler run. Default OFF: unset, the full-vocabulary
+    # all-gather always runs. Read in vllm/sm80/worker/target_argmax.py and
+    # vllm/models/deepseek_v41/nvidia/sm80_model.py.
+    "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX", "0"))
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
