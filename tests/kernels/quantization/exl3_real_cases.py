@@ -244,9 +244,21 @@ class Checkpoint:
     """Packed matrices of an EXL3 checkpoint, read through its headers."""
 
     def __init__(self, directory: Path):
+        from vllm.sm80.kernels.exl3.hybrid import HYBRID_KEYS
         from vllm.sm80.kernels.exl3.utils import Exl3Manifest
 
-        self.manifest = Exl3Manifest(directory)
+        # A hybrid checkpoint (EXL3 for the modules its quantization_config
+        # selects, another method for the rest) is read as the engine reads
+        # it: the index names each tensor's file, FP8 dtypes included.
+        config = Path(directory) / "config.json"
+        quant = (
+            json.loads(config.read_text()).get("quantization_config") or {}
+            if config.exists()
+            else {}
+        )
+        self.manifest = Exl3Manifest(
+            directory, select_by_index=any(key in quant for key in HYBRID_KEYS)
+        )
 
     def _array(self, name: str) -> np.ndarray:
         header = self.manifest.tensors[name]

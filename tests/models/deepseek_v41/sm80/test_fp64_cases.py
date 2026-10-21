@@ -492,6 +492,50 @@ def _recorded(ckpt, stem, local, experts):
     return expert_map, meta
 
 
+def test_moe_experts_from_a_hybrid_checkpoint(tmp_path):
+    """A hybrid checkpoint (EXL3 routed experts, FP8 for the other modules,
+    the index naming each tensor's file): the experts are read past the FP8
+    tensors, as the engine's manifest reads them."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    config = fixture.tiny_config()
+    config["quantization_config"].update(
+        module_quantization={"rules": [
+            {"match": r"^(layers|mtp)\.\d+\.ffn\.experts(\.|$)", "method": "exl3"}]},
+        non_routed_quantization={"quant_method": "fp8"},
+    )
+    fixture.write_checkpoint(tmp_path, config)
+    save_file({
+        "layers.0.attn.wkv.weight": torch.zeros(32, 32, dtype=torch.float8_e4m3fn),
+        "layers.0.attn.wkv.scale": torch.full((1, 1), 127, dtype=torch.uint8).view(
+            torch.float8_e8m0fnu),
+    }, str(tmp_path / "fp8.safetensors"))
+    # As the hybrid build: the FP8 file replaces the EXL3 wkv, whose tensors
+    # stay in their shard but are not in the index.
+    weight_map = {}
+    for path in sorted(tmp_path.glob("*.safetensors")):
+        with safe_open(str(path), "pt") as f:
+            weight_map.update({
+                name: path.name for name in f.keys()
+                if path.name == "fp8.safetensors" or not name.startswith("layers.0.attn.wkv.")
+            })
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+    ckpt = real.Checkpoint(tmp_path)
+    expert_map, meta = _recorded(
+        ckpt, "layers.0.ffn.experts", (3, 7), fixture.TEXT["n_routed_experts"]
+    )
+    weights, _, got = F.expert_set(
+        str(tmp_path), "model.layers.0.ffn.experts", expert_map, meta, CPU
+    )
+    assert torch.equal(got, meta)
+    assert torch.equal(weights[3][0], ckpt.whole("layers.0.ffn.experts.7.w1")[0])
+
+
+
 @pytest.fixture(scope="module")
 def mixed_checkpoint(tmp_path_factory):
     """The tiny checkpoint with layer 1's routed experts at bits_x2 4 (the
