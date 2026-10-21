@@ -22,7 +22,10 @@ TP rank 0 then appends one JSON line per request found in both batches to
 
     {"step": n, "req": id, "conf": [p_1, ...], "width": drafted positions,
      "verified": drafts the target verified, "accepted": accepted drafts,
-     "batch": requests in the verifying step}
+     "batch": requests in the verifying step, "t": time.monotonic() when the
+     verifying step's draft call began (CLOCK_MONOTONIC: comparable with a
+     client's time.monotonic() on the same host, so rows can be assigned to
+     benchmark windows)}
 
 ``verified`` and ``accepted`` come from ``num_sampled - 1 + num_rejected`` and
 ``num_sampled - 1``. Requests with no sampled token this step (partial
@@ -36,6 +39,7 @@ from __future__ import annotations
 import atexit
 import inspect
 import json
+import time
 import weakref
 from collections import deque
 from dataclasses import dataclass
@@ -70,6 +74,7 @@ class _Pending:
     prev_req_ids: list[str]
     prev_width: int
     req_ids: list[str]
+    t: float
 
 
 def _tp_rank() -> int:
@@ -127,6 +132,7 @@ class ConfidenceDump:
     ) -> None:
         """Stage the previous draft step's ``confidences`` against this step's
         verification result (``num_sampled``/``num_rejected`` of ``req_ids``)."""
+        now = time.monotonic()
         self._step += 1
         prev = self._prev
         if not self.writes or prev is None:
@@ -148,7 +154,9 @@ class ConfidenceDump:
             event = torch.cuda.Event()
             event.record()
         self._pending.append(
-            _Pending(event, slot_idx, self._step, prev_req_ids, prev_width, req_ids)
+            _Pending(
+                event, slot_idx, self._step, prev_req_ids, prev_width, req_ids, now
+            )
         )
         self.drain(wait=False)
 
@@ -183,6 +191,7 @@ class ConfidenceDump:
                 "verified": accepted + int(slot.num_rejected[i]),
                 "accepted": accepted,
                 "batch": len(p.req_ids),
+                "t": p.t,
             }
             self._file.write(json.dumps(row, separators=(",", ":")) + "\n")
             self.rows_written += 1

@@ -148,6 +148,9 @@ def test_rows_pair_each_rounds_confidences_with_its_verification(make, monkeypat
     # not the dummy run's.
     assert rows[0]["conf"] == pytest.approx([1.0, 1.01, 1.02, 1.03, 1.04])
     assert rows[1]["conf"] == pytest.approx([2.1, 2.11, 2.12, 2.13, 2.14])
+    # Monotonic stage times: step 2's verification before step 3's.
+    assert rows[0]["t"] < rows[1]["t"]
+    assert rows[1]["step"] > rows[0]["step"]
 
 
 def test_other_ranks_stage_nothing(tmp_path):
