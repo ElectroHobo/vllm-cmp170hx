@@ -615,6 +615,31 @@ def _route_apply(runner, on: bool) -> None:
         router.fused_route = on
 
 
+_DRAFT_PROLOGUE_ENV = "VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED"
+
+
+def _draft_prologue_layers(runner) -> list:
+    """The drafter's sm_80 DeepSeek-V4.1 attention layers whose context-KV
+    prologue may run as one kernel."""
+    model = getattr(_speculator(runner), "model", None)
+    if model is None:
+        return []
+    return [m for m in model.modules()
+            if getattr(m, "_sm80_draft_prologue_eligible", False)]
+
+
+def _draft_prologue_unavailable(runner) -> str | None:
+    if not _draft_prologue_layers(runner):
+        return "the served drafter has no eligible sm_80 DeepSeek-V4.1 attention layers"
+    return None
+
+
+def _draft_prologue_apply(runner, on: bool) -> None:
+    _set_env(_DRAFT_PROLOGUE_ENV, on)
+    for layer in _draft_prologue_layers(runner):
+        layer._sm80_draft_prologue = on
+
+
 def _gemv_gates(runner) -> list:
     """Every adopted DeepSeek-V4.1 MoE gate of the target and the drafter."""
     from vllm.models.deepseek_v41.nvidia.sm80_moe import Sm80DeepseekV41Gate
@@ -734,6 +759,12 @@ SWITCHES: dict[str, Switch] = {
             _route_unavailable,
             lambda runner: any(r.fused_route for r in _route_routers(runner)),
             _route_apply,
+        ),
+        Switch(
+            "dsv41_draft_prologue_fused", _DRAFT_PROLOGUE_ENV, True, True,
+            _draft_prologue_unavailable,
+            lambda runner: any(m._sm80_draft_prologue for m in _draft_prologue_layers(runner)),
+            _draft_prologue_apply,
         ),
         Switch(
             "dsv41_gate_gemv", "VLLM_DEEPSEEK_V41_GATE_GEMV", True, False,

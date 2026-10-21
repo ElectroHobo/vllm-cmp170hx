@@ -174,6 +174,7 @@ def test_allowlist():
         "dsv41_fused_mhc",
         "dsv41_fused_mhc_finish",
         "dsv41_fused_route",
+        "dsv41_draft_prologue_fused",
         "dsv41_gate_gemv",
         "dsv41_wo_a_strided",
         "dsv41_swa_meta_batch",

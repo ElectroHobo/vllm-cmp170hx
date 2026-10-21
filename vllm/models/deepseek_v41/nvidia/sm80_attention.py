@@ -399,6 +399,10 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 f"{index_n_heads} index heads do not split over TP {tp_size}"
             )
         self._sm80_fused_attn = self._sm80_fused_attn_gate(vllm_config)
+        self._sm80_draft_prologue_eligible = self._sm80_draft_prologue_gate()
+        self._sm80_draft_prologue = self._sm80_draft_prologue_eligible and bool(
+            envs.VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED
+        )
         self._sm80_rope_params = _rope_params(
             config, self.compress_ratio, self.rope_head_dim
         )
@@ -461,6 +465,27 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             )
 
     # -- pieces -------------------------------------------------------------
+
+    def _sm80_draft_prologue_gate(self) -> bool:
+        """Whether this layer's DSpark context-KV prologue may run as one
+        kernel (``VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED``, taken by
+        :meth:`sm80_store_context_kv`): the layer has the configuration the
+        kernel was validated for."""
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_draft_prologue
+
+        reason = sm80_draft_prologue.supports(
+            self.head_dim,
+            self.rope_head_dim,
+            self.kv_cache_torch_dtype,
+            current_platform.get_device_capability(),
+        )
+        if reason is not None and envs.VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED:
+            logger.warning_once(
+                "DeepSeek-V4.1 sm_80: VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED=1 but "
+                "the draft context-KV prologue stays unfused: %s", reason,
+                scope="global",
+            )
+        return reason is None
 
     def _sm80_fused_attn_gate(self, vllm_config: VllmConfig) -> bool:
         """Whether this layer may take the fused attention core
@@ -801,9 +826,21 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
     ) -> None:
         """DSpark context KV: ``kv_norm(wkv(main_x))`` RoPE'd and FP8 qdq'd
         into this layer's window cache at ``slot_mapping`` (the reference
-        ``DSparkAttention`` main KV)."""
+        ``DSparkAttention`` main KV). With
+        ``VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED`` everything after the
+        projection is one kernel with the same bytes
+        (``ops/sm80_draft_prologue.py``)."""
         qr_kv = self._fused_wqa_wkv_gemm(main_x)
         if slot_mapping is None:
+            return
+        if self._sm80_draft_prologue:
+            from vllm.models.deepseek_v41.nvidia.ops import sm80_draft_prologue
+
+            sm80_draft_prologue.store_context_kv(
+                qr_kv[:, self.q_lora_rank :], self.kv_norm.weight, self.eps,
+                positions, self._sm80_freqs, self.swa_cache_layer.kv_cache,
+                slot_mapping,
+            )
             return
         n = min(slot_mapping.shape[0], qr_kv.shape[0])
         kv = core.rms_norm(qr_kv[:n, self.q_lora_rank :], self.kv_norm.weight, self.eps)

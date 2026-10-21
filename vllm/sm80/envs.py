@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
+    VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
     VLLM_DEEPSEEK_V41_WO_A_STRIDED: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
@@ -969,6 +970,16 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # same bytes. Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
     "VLLM_DEEPSEEK_V41_FUSED_ROUTE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ROUTE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the DSpark drafter's context-KV prologue per
+    # draft layer (kv_norm RMSNorm, RoPE, FP8 qdq and the window-cache write
+    # after the wkv projection: 26 torch and Triton kernels per layer) as one
+    # Triton kernel (ops/sm80_draft_prologue.py) with the torch ops'
+    # arithmetic and order (the RMSNorm sum in torch's CUDA reduction order),
+    # so the same cache bytes. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the MoE gate GEMM of calls of at most 64 rows
     # (decode, speculative verify, draft) as one Triton kernel
