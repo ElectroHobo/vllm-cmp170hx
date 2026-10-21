@@ -1384,3 +1384,45 @@ seams:
   why: the gathered row is the ranks' head outputs concatenated in rank order (all-gather on the last dim) and cut at org_vocab_size; shard_argmax.py numbers a rank's columns from rank * local width and stops at org_vocab_size
   sha256: 50f037e79ede7e763cdc90b3bf38d87faa466101ca2088f23576aabb4cbedda6
   signature: '(self, hidden_states: torch.Tensor, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, embedding_bias: torch.Tensor | None, skip_gather: bool = False) -> torch.Tensor | None'
+
+- id: dsv41-swa-builder-build
+  kind: method
+  target: vllm.v1.attention.backends.mla.sparse_swa:DeepseekSparseSWAMetadataBuilder.build
+  why: sm80_swa_meta_batch._metadata returns what it returns for a causal batch without image spans (same fields over the same builder buffers), and ops/sm80_swa_meta.py writes what its torch.ge, decode-lens fill and index launches write; a change here must be carried over
+  sha256: a4fde14ecb55f1a2da1e7c0928dc7e77d4659d7723e7bd3323cf77e60302c967
+  signature: '(self, common_prefix_len: int, common_attn_metadata: vllm.v1.attention.backend.CommonAttentionMetadata, fast_build: bool = False, replay_start: torch.Tensor | None = None) -> vllm.v1.attention.backends.mla.sparse_swa.DeepseekSparseSWAMetadata'
+
+- id: dsv41-swa-builder-prefill-metadata
+  kind: method
+  target: vllm.v1.attention.backends.mla.sparse_swa:DeepseekSparseSWAMetadataBuilder._build_deepseek_v4_metadata
+  why: sm80_swa_meta_batch._metadata builds the same prefill fields, the gather lengths from ops/sm80_swa_meta.py
+  sha256: ae4ed4196187fb775a6c53203ead813c390b37bfb12fa24324678acf002db0a3
+  signature: '(self, num_decodes: int, num_prefills: int, seq_lens: torch.Tensor, seq_lens_cpu: torch.Tensor | None, query_start_loc: torch.Tensor, query_start_loc_cpu: torch.Tensor, replay_start: torch.Tensor) -> dict[str, torch.Tensor | int | None]'
+
+- id: dsv41-swa-indices-kernel
+  kind: function
+  target: vllm.v1.attention.backends.mla.sparse_swa:_compute_swa_indices_and_lens_kernel.fn
+  why: ops/sm80_swa_meta.py _window_row is its arithmetic without image spans (window start, replay start, slot ids, -1 padding, invalid rows)
+  sha256: 4954bff106edb182d3bea2a652d93c1606bdb5b838c45f3512c2e7789f198bb3
+  signature: '(swa_indices_ptr, swa_indices_stride, swa_lens_ptr, window_size, index_width, left_visible_ptr, right_visible_ptr, query_start_loc_ptr, seq_lens_ptr, token_to_req_indices_ptr, is_valid_token_ptr, block_table_ptr, block_table_stride, block_size, replay_start_ptr, token_offset, HAS_IMAGE: triton.language.core.constexpr, TRITON_BLOCK_SIZE: triton.language.core.constexpr)'
+
+- id: dsv41-swa-prefill-metadata-kernel
+  kind: function
+  target: vllm.v1.attention.backends.mla.sparse_swa:ComputePrefillMetadataKernel.kernel.fn
+  why: ops/sm80_swa_meta.py writes the prefill gather lengths with its arithmetic
+  sha256: e299bccba808a21ef4b47af7392040f7cc9f106ea6e557b7ebc69487ca1903fc
+  signature: '(prefill_gather_lens_ptr, seq_lens_ptr, query_start_loc_ptr, replay_start_ptr, num_prefills, num_decodes, window_size, BLOCK_SIZE: triton.language.core.constexpr)'
+
+- id: dsv41-swa-build-attn-metadata
+  kind: function
+  target: vllm.v1.worker.gpu.attn_utils:build_attn_metadata
+  why: sm80_swa_meta_batch treats one call as one step - every group's build gets the same batch-level tensors (query_start_loc, seq_lens and their host copies, is_prefilling) sliced fresh per call, the window groups build in group order, and each group's block table and slot mapping are views of the runner's persistent buffers
+  sha256: b7faabe5c799633ecf6f4ee767c989c6e1dd836d7453f01a3e02c239ea62da12
+  signature: '(attn_groups: list[list[vllm.v1.worker.utils.AttentionGroup]], num_reqs: int, num_tokens: int, query_start_loc_gpu: torch.Tensor, query_start_loc_cpu: torch.Tensor, max_query_len: int, seq_lens: torch.Tensor, max_seq_len: int, block_tables: collections.abc.Sequence[torch.Tensor], slot_mappings: torch.Tensor, kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, seq_lens_cpu_upper_bound: torch.Tensor | None = None, dcp_local_seq_lens: torch.Tensor | None = None, dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None, positions: torch.Tensor | None = None, is_prefilling: torch.Tensor | None = None, mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None, model_specific_attn_metadata: vllm.v1.worker.gpu.model_states.interface.ModelSpecificAttnMetadata | None = None, for_cudagraph_capture: bool = False, causal: bool | torch.Tensor | collections.abc.Mapping[int, bool] = True, rswa_prefix_lens: torch.Tensor | None = None, ubatch_idx: int = 0, fast_prefill: vllm.v1.worker.gpu.attn_utils.FastPrefillBatchMetadata | None = None, req_idx: numpy.ndarray | None = None) -> dict[str, typing.Any]'
+
+- id: dsv41-swa-block-tables
+  kind: method
+  target: vllm.v1.worker.gpu.block_table:BlockTables.__init__
+  why: the per-group input block tables and the stacked slot mappings are allocated once, so sm80_swa_meta_batch can learn their addresses from one step and launch on them in the next
+  sha256: d7ae50c01b47a6193d06243d62ac0dff8bd27d5cb1bfe749e125ffa0b0614346
+  signature: '(self, block_sizes: list[int], max_num_reqs: int, max_num_batched_tokens: int, max_num_blocks_per_group: list[int], device: torch.device, cp_size: int = 1, cp_rank: int = 0, cp_interleave: int = 1, slot_mapping_enabled: list[bool] | None = None, dcp_sharded: list[bool] | None = None)'

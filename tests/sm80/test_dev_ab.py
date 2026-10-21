@@ -176,6 +176,7 @@ def test_allowlist():
         "dsv41_fused_route",
         "dsv41_gate_gemv",
         "dsv41_wo_a_strided",
+        "dsv41_swa_meta_batch",
         "dsv41_fused_attn_decode",
         "dsv41_attn_pipeline",
         "dsv41_moe_prefill_tc",
@@ -415,6 +416,33 @@ def test_qsa_switch_refuses_a_model_without_the_indexer(monkeypatch):
     monkeypatch.setattr(dev_ab.importlib, "import_module", imported.append)
     why = dev_ab.SWITCHES["qsa_topk_canonical"].unavailable(None)
     assert "not loaded" in why and imported == []
+
+
+def test_swa_meta_batch_switch(monkeypatch):
+    """Eager step preparation only, the same bytes: no per-arm graphs."""
+    from vllm.models.deepseek_v41.nvidia import sm80_swa_meta_batch
+    from vllm.models.deepseek_v41.nvidia.sm80_attention import Sm80SWAMetadataBuilder
+
+    switch = dev_ab.SWITCHES["dsv41_swa_meta_batch"]
+    assert not switch.graph_bound and switch.output_identical
+    assert switch.env == "VLLM_DEEPSEEK_V41_SWA_META_BATCH"
+    group = SimpleNamespace(metadata_builders=[object()])
+    assert "no sm_80" in switch.unavailable(SimpleNamespace(attn_groups=[[group]]))
+    builder = object.__new__(Sm80SWAMetadataBuilder)
+    runner = SimpleNamespace(
+        attn_groups=[[group], [SimpleNamespace(metadata_builders=[builder])]]
+    )
+    assert switch.unavailable(runner) is None
+    monkeypatch.setenv(switch.env, "0")
+    resets = []
+    monkeypatch.setattr(sm80_swa_meta_batch, "reset", lambda: resets.append(1))
+    assert switch.current(runner) is False
+    switch.apply(runner, True)
+    assert switch.current(runner) is True
+    switch.apply(runner, False)
+    assert switch.current(runner) is False
+    # Learned groups are forgotten at every switch.
+    assert resets == [1, 1]
 
 
 def test_local_argmax_switch_sets_the_speculator():

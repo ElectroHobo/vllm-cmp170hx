@@ -55,6 +55,7 @@ from vllm.models.deepseek_v41.attention import (
     DeepseekV4Indexer,
     DeepseekV4IndexerCache,
 )
+from vllm.models.deepseek_v41.nvidia import sm80_swa_meta_batch
 from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLABackend,
@@ -114,10 +115,48 @@ class Sm80IndexKBackend(Sm80SparseDsv41Backend):
 
 
 class Sm80SWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
-    """Upstream's sliding-window metadata without FlashMLA tile plans."""
+    """Upstream's sliding-window metadata without FlashMLA tile plans.
+
+    With ``VLLM_DEEPSEEK_V41_SWA_META_BATCH`` the builds of one
+    ``build_attn_metadata`` call share one launch for every SWA group
+    (``sm80_swa_meta_batch``); each build returns what its own build does."""
 
     def build_tile_scheduler(self, num_decode_tokens: int) -> dict[str, Any]:
         return super().build_tile_scheduler(0)
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: Any,
+        fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
+    ):
+        if envs.VLLM_DEEPSEEK_V41_SWA_META_BATCH:
+            return sm80_swa_meta_batch.build(
+                self, common_prefix_len, common_attn_metadata, fast_build, replay_start
+            )
+        return self.build_per_group(
+            common_prefix_len, common_attn_metadata, fast_build, replay_start
+        )
+
+    def build_per_group(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: Any,
+        fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
+    ):
+        """Upstream's build of this group alone."""
+        return super().build(
+            common_prefix_len, common_attn_metadata, fast_build, replay_start
+        )
+
+    # Capture and drafting builds stay per group (outside the step's batch).
+    def build_for_cudagraph_capture(self, common_attn_metadata: Any):
+        return self.build_per_group(0, common_attn_metadata)
+
+    def build_for_drafting(self, common_attn_metadata: Any, draft_index: int):
+        return self.build_per_group(0, common_attn_metadata, fast_build=True)
 
 
 class Sm80SWABackend(DeepseekSparseSWABackend):

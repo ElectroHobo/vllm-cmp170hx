@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
+    VLLM_DEEPSEEK_V41_SWA_META_BATCH: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -1085,6 +1086,15 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # no sequence parallelism, batched Engram projection or microbatching.
     "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the sliding-window metadata of every SWA KV
+    # cache group of a step (one group per layer) in one Triton launch
+    # instead of three to five launches per group, the same bytes in the same
+    # builder buffers (vllm/models/deepseek_v41/nvidia/sm80_swa_meta_batch.py).
+    # Eager step preparation only; captures and other shapes build per group.
+    # Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_SWA_META_BATCH": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_SWA_META_BATCH", "0"))
     ),
     # Where the sm_80 Engram storage keeps the E4M3 values of its owned table
     # rows (vllm/models/deepseek_v41/nvidia/sm80_engram.py): "ssd" reads them

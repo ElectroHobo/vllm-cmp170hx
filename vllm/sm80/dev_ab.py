@@ -643,6 +643,29 @@ def _gate_gemv_apply(runner, on: bool) -> None:
         gate.gemv = on
 
 
+_SWA_BATCH_ENV = "VLLM_DEEPSEEK_V41_SWA_META_BATCH"
+
+
+def _swa_batch_unavailable(runner) -> str | None:
+    from vllm.models.deepseek_v41.nvidia.sm80_attention import Sm80SWAMetadataBuilder
+
+    for groups in getattr(runner, "attn_groups", None) or ():
+        for group in groups:
+            for builder in group.metadata_builders:
+                if isinstance(builder, Sm80SWAMetadataBuilder):
+                    return None
+    return "the served model has no sm_80 DeepSeek-V4.1 sliding-window builders"
+
+
+def _swa_batch_apply(runner, on: bool) -> None:
+    from vllm.models.deepseek_v41.nvidia import sm80_swa_meta_batch
+
+    # Eager step preparation only: graphs read the builders' buffers, which
+    # both arms fill with the same bytes, so one capture serves both.
+    _set_env(_SWA_BATCH_ENV, on)
+    sm80_swa_meta_batch.reset()
+
+
 def _dense_prefill_unavailable(runner) -> str | None:
     from vllm.sm80.kernels.exl3 import dense_prefill_tc, ops
 
@@ -722,6 +745,11 @@ SWITCHES: dict[str, Switch] = {
             _wo_a_unavailable,
             lambda runner: any(m.strided_input for m in _wo_a_methods(runner)),
             _wo_a_apply,
+        ),
+        Switch(
+            "dsv41_swa_meta_batch", _SWA_BATCH_ENV, False, True,
+            _swa_batch_unavailable, lambda runner: _env_flag(_SWA_BATCH_ENV),
+            _swa_batch_apply,
         ),
         Switch(
             "exl3_dense_prefill_tc", "VLLM_EXL3_DENSE_PREFILL_TC", True, False,
