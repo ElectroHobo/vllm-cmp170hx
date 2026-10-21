@@ -10,7 +10,14 @@ run left out and named. Each family's capture point takes the arguments the
 driver reads, and the plain-argument points compose the layer functions.
 The EXL3 MoE's expert matrices (target and drafter layers, from the module
 prefix and expert map) and FP64 reference (with the SwiGLU clamp) run on
-the tiny checkpoint against a direct sum. GPU (skips without CUDA): the same cases through the CUDA paths.
+the tiny checkpoint against a direct sum. Routed experts split across the
+tensor-parallel ranks: each rank's columns of every expert matrix, the
+ranks' FP64 partials summing to the whole experts' output, and the split
+cases derived from whole-expert calls, on the tiny checkpoint and (when
+VLLM_DSV41_TEST_EXL3_CHECKPOINT, VLLM_DSV41_TEST_MOE_CAPTURE and, for the
+prefill calls, VLLM_DSV41_TEST_MOE_PREFILL_CAPTURE are set) on the served
+checkpoint and captures of its whole experts. GPU (skips without CUDA): the
+same cases through the CUDA paths.
 
     pytest -q tests/models/deepseek_v41/sm80/test_fp64_cases.py
 """
@@ -18,6 +25,7 @@ the tiny checkpoint against a direct sum. GPU (skips without CUDA): the same cas
 import json
 import math
 import re
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -701,6 +709,358 @@ def test_moe_families_run_at_both_bit_widths(tmp_path, mixed_checkpoint, monkeyp
         assert rc == 1 and rows == {}, name
 
 
+# ---------------------------------------------------------------- EXL3 MoE split over TP ranks
+
+# The served routed experts' 2304 intermediate columns in 4 chunks of 5, 5,
+# 4 and 4 H128 blocks.
+CHUNKS = [(0, 640), (640, 1280), (1280, 1792), (1792, 2304)]
+DSV41_CHECKPOINT_ENV = "VLLM_DSV41_TEST_EXL3_CHECKPOINT"
+MOE_CAPTURE_ENV = "VLLM_DSV41_TEST_MOE_CAPTURE"
+MOE_PREFILL_CAPTURE_ENV = "VLLM_DSV41_TEST_MOE_PREFILL_CAPTURE"
+
+
+def test_split_columns_rotate_whole_blocks_by_layer():
+    """Rank r of layer L holds chunk (r + L) mod 4, so every rank is 640
+    wide in 20 of the 40 target layers; the drafter's layers continue the
+    count; one rank holds every column."""
+    heavy = [0] * 4
+    for layer in range(43):
+        prefix = f"language_model.model.layers.{layer}.ffn.experts"
+        got = [F.expert_columns(2304, prefix, rank, 4) for rank in range(4)]
+        assert [(s.start, s.stop) for s in got] == [CHUNKS[(r + layer) % 4] for r in range(4)]
+        if layer < 40:
+            for rank, s in enumerate(got):
+                heavy[rank] += s.stop - s.start == 640
+    assert heavy == [20] * 4
+    assert F.expert_columns(2304, "model.layers.41.ffn.experts", 0, 4) == slice(640, 1280)
+    assert F.expert_columns(2304, "model.layers.7.ffn.experts", 0, 1) == slice(0, 2304)
+
+
+def _moe_call(ckpt, layer, local, g, rows=3):
+    """The arguments of a whole-expert call of the tiny checkpoint's layer
+    ``layer`` holding the experts ``local``."""
+    text = fixture.TEXT
+    expert_map, meta = _recorded(
+        ckpt, f"layers.{layer}.ffn.experts", local, text["n_routed_experts"]
+    )
+    k = text["num_experts_per_tok"]
+    return dict(
+        x=torch.randn(rows, text["hidden_size"], generator=g).to(BF16),
+        topk_ids=torch.randint(0, text["n_routed_experts"], (rows, k), generator=g).to(
+            torch.int32
+        ),
+        topk_weights=torch.rand(rows, k, generator=g),
+        packed_meta=meta, expert_map=expert_map,
+        intermediate_size=text["moe_intermediate_size"], swiglu_limit=10.0,
+    )
+
+
+def _reassembled(pieces, down):
+    """The matrix (trellis, suh, svh) of the ranks' pieces [(first column,
+    piece)] in column order: down along its inputs, gate/up its outputs."""
+    ordered = [p for _, p in sorted(pieces, key=lambda item: item[0])]
+    trellis = torch.cat([p[0] for p in ordered], dim=0 if down else 1)
+    if down:
+        return trellis, torch.cat([p[1] for p in ordered]), ordered[0][2]
+    return trellis, ordered[0][1], torch.cat([p[2] for p in ordered])
+
+
+def _rank_piece_is_the_checkpoint_columns(piece, whole, cols, down):
+    (t, s, v), (wt, ws, wv) = piece, whole
+    if down:
+        return (torch.equal(t, wt[cols.start // 16 : cols.stop // 16])
+                and torch.equal(s, ws[cols]) and torch.equal(v, wv))
+    return (torch.equal(t, wt[:, cols.start // 16 : cols.stop // 16])
+            and torch.equal(s, ws) and torch.equal(v, wv[cols]))
+
+
+def _sums_to(partials, whole):
+    scale = float(whole.abs().max())
+    assert scale > 0
+    total = torch.stack(partials).sum(0)
+    return float((total - whole).abs().max()) <= F.TP_SUM_RTOL * scale
+
+
+def test_a_split_expert_set_holds_the_rank_columns_and_the_partials_sum(checkpoint):
+    """Each rank's experts of a whole-expert call replayed as a split
+    (tp_call): the identity map over every expert, the rank's columns of
+    each matrix (the checkpoint's bytes there), the four ranks' pieces
+    reassembling the whole matrix bit for bit, and their FP64 partial
+    outputs summing to the whole experts' FP64 output."""
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    ckpt = real.Checkpoint(checkpoint)
+    g = torch.Generator().manual_seed(13)
+    layer, prefix = 3, "model.layers.3.ffn.experts"
+    inter, experts = fixture.TEXT["moe_intermediate_size"], fixture.TEXT["n_routed_experts"]
+    a = _moe_call(ckpt, layer, (2, 9, 11), g, rows=5)
+    a["topk_ids"][0, :3] = torch.tensor([9, 4, -1], dtype=torch.int32)
+    stems = [f"layers.{layer}.ffn.experts.9.{w}" for w in ("w1", "w3", "w2")]
+    whole = [ckpt.whole(stem) for stem in stems]
+    pieces, partials = [[], [], []], []
+    for rank in range(4):
+        cols = F.expert_columns(inter, prefix, rank, 4)
+        width = cols.stop - cols.start
+        t = F.tp_call(a, prefix, rank, 4)
+        assert torch.equal(t["expert_map"], torch.arange(experts, dtype=torch.int32))
+        assert t["intermediate_size"] == width and t["packed_meta"].shape == (experts, 3, 4)
+        assert all(t[k] is a[k] for k in ("x", "topk_ids", "topk_weights", "swiglu_limit"))
+        weights, _, got = F.expert_set(
+            str(checkpoint), prefix, t["expert_map"], t["packed_meta"], CPU, rank, 4
+        )
+        assert torch.equal(got, t["packed_meta"])
+        for j, piece in enumerate(weights[3 * 9 : 3 * 9 + 3]):
+            assert _rank_piece_is_the_checkpoint_columns(piece, whole[j], cols, j == 2)
+            pieces[j].append((cols.start, piece))
+        partials.append(F.moe_exact(a["x"], a["topk_ids"], a["topk_weights"],
+                                    t["expert_map"], weights, got, width, 10.0))
+    for j, w in enumerate(whole):
+        assert all(torch.equal(p, q) for p, q in zip(_reassembled(pieces[j], j == 2), w))
+
+    exact = F.whole_fp64(str(checkpoint), prefix, a, CPU)
+    one = F.tp_call(a, prefix, 0, 1)
+    weights, _, got = F.expert_set(str(checkpoint), prefix, one["expert_map"],
+                                   one["packed_meta"], CPU)
+    assert one["intermediate_size"] == inter and set(got[:, 0, 1].tolist()) == {inter}
+    assert torch.equal(
+        F.moe_exact(a["x"], a["topk_ids"], a["topk_weights"], one["expert_map"], weights,
+                    got, inter, 10.0),
+        exact,
+    )
+    assert _sums_to(partials, exact)
+    assert not _sums_to(partials[:3], exact)
+
+    with pytest.raises(ValueError, match="tp_rank"):
+        F.expert_set(str(checkpoint), prefix, t["expert_map"], t["packed_meta"], CPU)
+
+
+def test_split_cases_run_end_to_end_and_partials_that_do_not_sum_refuse(
+    tmp_path, mixed_checkpoint, cases, monkeypatch
+):
+    """Through fp64_cases.run (operators replaced by CPU stand-ins): a case
+    with expert_tp 4 replays its whole-expert source on every rank (four
+    ranks' outputs, each the whole call and three rows alone), and a call
+    captured on a split (meta.tp_rank, meta.tp_size) runs on its rank's
+    columns. Ranks that do not tile the columns (each holding the same
+    chunk) give partials that do not sum to the whole experts' output: the
+    case is refused. expert_tp on a family that is not an EXL3 MoE refuses
+    its case."""
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    seen = _cpu_operators(monkeypatch)
+    ckpt = real.Checkpoint(mixed_checkpoint)
+    g = torch.Generator().manual_seed(17)
+    hidden = fixture.TEXT["hidden_size"]
+
+    def source(name, family, layer, args, **meta):
+        path = _source(tmp_path, name, family, args)
+        obj = torch.load(path, weights_only=True)
+        obj["meta"].update(module_prefix=f"model.layers.{layer}.ffn.experts", **meta)
+        torch.save(obj, path)
+        return {"id": name, "family": family, "phase": "decode", "concurrency": 3,
+                "captured_sources": [path]}
+
+    ep = dict(_moe_call(ckpt, 1, range(4), g), bits_x2=4)
+    derived = dict(source("derived", "exl3_moe_out_v2", 1, ep), expert_tp=4)
+    split = F.tp_call(_moe_call(ckpt, 2, range(4), g), "model.layers.2.ffn.experts", 2, 4)
+    captured = source("captured_split", "exl3_moe_out", 2, split, tp_rank=2, tp_size=4)
+    rc, _, rows = _run(tmp_path, [derived, captured], target=mixed_checkpoint)
+    assert rc == 0 and set(rows) == {"derived", "captured_split"}
+    for cid, row in rows.items():
+        _well_formed(row)
+        assert row["bitwise"] and row["row_invariance"], cid
+        assert row["fp64"]["cand_max"] == row["fp64"]["ref_max"] > 0, cid
+    assert rows["derived"]["numel"] == 4 * 3 * hidden
+    assert rows["captured_split"]["numel"] == 3 * hidden
+    assert seen == [4] * 16
+
+    columns = F.expert_columns
+    monkeypatch.setattr(F, "expert_columns",
+                        lambda inter, prefix, rank, size: columns(inter, prefix, 0, size))
+    rc, _, rows = _run(tmp_path, [derived], target=mixed_checkpoint)
+    assert rc == 1 and rows == {}
+    monkeypatch.setattr(F, "expert_columns", columns)
+
+    engram = dict(next(c for c in cases if c["id"] == "engram_dequant"), id="engram_tp",
+                  expert_tp=4)
+    rc, _, rows = _run(tmp_path, [engram], target=mixed_checkpoint)
+    assert rc == 1 and rows == {}
+
+    # A call of split experts is not replayed as the whole experts of a split.
+    again = dict(captured, id="split_again", expert_tp=4)
+    rc, _, rows = _run(tmp_path, [again], target=mixed_checkpoint)
+    assert rc == 1 and rows == {}
+
+
+def test_a_split_expert_of_the_served_checkpoint():
+    """One routed expert of the served checkpoint at layer 3 on each of 4
+    ranks: the rank holds chunk (r + 3) mod 4 of its intermediate (the
+    checkpoint's bytes there), the pieces reassemble the expert bit for bit,
+    and the four FP64 partial outputs of two rows routed to it sum to the
+    whole expert's."""
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    directory = str(real.directory_or_skip(
+        DSV41_CHECKPOINT_ENV, "the served DeepSeek-V4.1 EXL3 checkpoint"))
+    layout, resolver, ckpt = F._expert_layout(directory)
+    layer, expert = 3, 5
+    prefix = f"language_model.model.layers.{layer}.ffn.experts"
+    names = [layout.expert_matrix(resolver, prefix, expert, role) for role in F.ROLES]
+    matrices = [ckpt.matrix(name) for name in names]
+    hidden, inter = matrices[0].padded_in, matrices[0].padded_out
+    assert inter == CHUNKS[-1][1]
+    config = json.loads((Path(directory) / "config.json").read_text())
+    experts = config.get("text_config", config)["n_routed_experts"]
+    emap = torch.full((experts,), -1, dtype=torch.int32)
+    emap[expert] = 0
+    whole = [ckpt.whole(name) for name in names]
+    g = torch.Generator().manual_seed(23)
+    x = torch.randn(2, hidden, generator=g).to(BF16)
+    ids = torch.tensor([[expert], [expert]], dtype=torch.int32)
+    tw = torch.tensor([[1.0], [0.5]])
+    pieces, partials = [[], [], []], []
+    for rank in range(4):
+        start, stop = CHUNKS[(rank + layer) % 4]
+        width = stop - start
+        kinds = [[m.bits_x2, m.codebook] for m in matrices]
+        meta = torch.tensor([[[hidden, width, *kinds[0]], [hidden, width, *kinds[1]],
+                              [width, hidden, *kinds[2]]]])
+        weights, _, got = F.expert_set(directory, prefix, emap, meta, CPU, rank, 4)
+        for j, piece in enumerate(weights):
+            assert _rank_piece_is_the_checkpoint_columns(
+                piece, whole[j], slice(start, stop), j == 2)
+            pieces[j].append((start, piece))
+        partials.append(F.moe_exact(x, ids, tw, emap, weights, got, width, 10.0))
+    for j, w in enumerate(whole):
+        assert all(torch.equal(p, q) for p, q in zip(_reassembled(pieces[j], j == 2), w))
+    a = dict(x=x, topk_ids=ids, topk_weights=tw, expert_map=emap,
+             intermediate_size=inter, swiglu_limit=10.0)
+    assert _sums_to(partials, F.whole_fp64(directory, prefix, a, CPU))
+
+
+def _one_call_capture(capture, root, point, layer, rows=None):
+    """A capture at ``root`` of 4 ranks holding one saved call of ``point``
+    at ``layer`` (the fewest rows, or ``rows``) of ``capture``: each rank's
+    file linked, rank 0's index line. (path of rank 0's file, its index
+    line, its name under r<rank>)."""
+    records = [json.loads(line) for line in
+               (capture / "r0" / "index.jsonl").read_text().splitlines() if line]
+    rec = min((r for r in records if r.get("saved") and r["point"] == point
+               and r["prefix"].endswith(f"layers.{layer}.ffn.experts")
+               and rows in (None, r["rows"])), key=lambda r: r["rows"])
+    name = Path(rec["path"]).relative_to(capture / "r0")
+    for rank in range(4):
+        (root / f"r{rank}" / name).parent.mkdir(parents=True)
+        (root / f"r{rank}" / name).symlink_to(capture / f"r{rank}" / name)
+    path = str(root / "r0" / name)
+    (root / "r0" / "index.jsonl").write_text(json.dumps(dict(rec, path=path)) + "\n")
+    return path, rec, name
+
+
+def _a_split_case_of(case, path, rec, capture, name, directory, layer):
+    """The exported case of the one call: expert_tp 4, pinned to rank 0's
+    file; each rank's derived arguments hold the same rows, the identity
+    map and the rank's chunk of the layer, which the checkpoint's experts
+    match."""
+    obj = torch.load(path, weights_only=True)
+    a, meta = obj["tensors"], obj["meta"]
+    assert (case["family"], case["expert_tp"], case["scheduler_phase"], case["rows"]) == (
+        rec["point"], 4, rec["phase"], rec["rows"])
+    assert case["phase"] == ("prefill" if rec["phase"] == "prefill" else "decode")
+    assert case["concurrency"] == len(meta["query_lens"])
+    assert case["captured_sources"] == [path]
+    assert case["captured_sha256"] == {path: "sha256:" + rec["sha256"]}
+    experts = a["expert_map"].numel()
+    assert int((a["expert_map"] >= 0).sum()) == a["packed_meta"].shape[0] < experts
+    routed = sorted({int(e) for e in a["topk_ids"].flatten()})
+    for rank in range(4):
+        t = F.tp_call(a, meta["module_prefix"], rank, 4)
+        start, stop = CHUNKS[(rank + layer) % 4]
+        assert t["intermediate_size"] == stop - start
+        assert torch.equal(t["expert_map"], torch.arange(experts, dtype=torch.int32))
+        assert t["packed_meta"].shape == (experts, 3, 4)
+        assert set(t["packed_meta"][:, :2, 1].flatten().tolist()) == {stop - start}
+        other = torch.load(capture / f"r{rank}" / name, weights_only=True)["tensors"]
+        assert all(F.bits_equal(other[k], t[k]) for k in ("x", "topk_ids", "topk_weights"))
+        g = routed[rank % len(routed)]
+        emap = torch.full((experts,), -1, dtype=torch.int32)
+        emap[g] = 0
+        F.expert_set(str(directory), meta["module_prefix"], emap,
+                     t["packed_meta"][g : g + 1], CPU, rank, 4)
+
+
+def _routed_other_rows(root, name):
+    """Rank 2's file of the call at ``root`` with other rows than rank 0's."""
+    bad = torch.load(root / "r2" / name, weights_only=True)
+    bad["tensors"]["x"] = bad["tensors"]["x"] + 1
+    (root / "r2" / name).unlink()
+    torch.save(bad, root / "r2" / name)
+
+
+def test_split_cases_from_a_whole_expert_capture(tmp_path):
+    """The export of split cases from one decode-step call of a whole-expert
+    capture of 4 ranks: one case of that call; an export is never replaced;
+    a rank whose file routed other rows refuses the export."""
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    directory = real.directory_or_skip(
+        DSV41_CHECKPOINT_ENV, "the served DeepSeek-V4.1 EXL3 checkpoint")
+    capture = real.directory_or_skip(
+        MOE_CAPTURE_ENV, "a capture of the served whole experts on 4 ranks (r0..r3)")
+    layer, root = 3, tmp_path / "capture"
+    path, rec, name = _one_call_capture(capture, root, "exl3_moe_out_v2", layer)
+    out = tmp_path / "cases.json"
+    argv = ["--export-expert-tp", str(root), "--checkpoint", str(directory), "--out", str(out)]
+    assert F.main(argv) == 0
+    assert F.main(argv) == 2  # an export is never replaced
+    doc = json.loads(out.read_text())
+    assert doc["schema"] == "served_cases/1" and doc["checkpoint"] == {"target": str(directory)}
+    (case,) = doc["cases"]
+    _a_split_case_of(case, path, rec, capture, name, directory, layer)
+
+    _routed_other_rows(root, name)
+    with pytest.raises(ValueError, match="rank 2"):
+        F.expert_tp_cases([root], directory)
+
+
+def test_split_prefill_cases_join_the_decode_ones(tmp_path):
+    """One export of two captures: a decode-step call of one and a prefill
+    (exl3_moe_out_prefill_v2) call of the other give one cases file with a
+    case of each, the prefill case a prefill case of its rows; a rank of the
+    prefill capture that routed other rows refuses the export."""
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    directory = real.directory_or_skip(
+        DSV41_CHECKPOINT_ENV, "the served DeepSeek-V4.1 EXL3 checkpoint")
+    decode = real.directory_or_skip(
+        MOE_CAPTURE_ENV, "a capture of the served whole experts on 4 ranks (r0..r3)")
+    prefill = real.directory_or_skip(
+        MOE_PREFILL_CAPTURE_ENV,
+        "a capture of the served whole experts' prefill calls on 4 ranks (r0..r3)")
+    calls = {}
+    for point, capture, layer in (("exl3_moe_out_v2", decode, 3),
+                                  ("exl3_moe_out_prefill_v2", prefill, 11)):
+        root = tmp_path / point
+        calls[point] = (*_one_call_capture(capture, root, point, layer), capture, layer, root)
+    out = tmp_path / "cases.json"
+    roots = [str(c[-1]) for c in calls.values()]
+    assert F.main(["--export-expert-tp", *roots, "--checkpoint", str(directory),
+                   "--out", str(out)]) == 0
+    doc = json.loads(out.read_text())
+    assert doc["source"] == roots
+    by_family = {c["family"]: c for c in doc["cases"]}
+    assert len(doc["cases"]) == 2 and set(by_family) == set(calls)
+    for point, (path, rec, name, capture, layer, _) in calls.items():
+        _a_split_case_of(by_family[point], path, rec, capture, name, directory, layer)
+    assert by_family["exl3_moe_out_prefill_v2"]["phase"] == "prefill"
+    assert by_family["exl3_moe_out_prefill_v2"]["rows"] >= 65
+
+    path, rec, name, capture, layer, root = calls["exl3_moe_out_prefill_v2"]
+    _routed_other_rows(root, name)
+    with pytest.raises(ValueError, match="rank 2"):
+        F.expert_tp_cases([Path(r) for r in roots], directory)
+
+
 # ---------------------------------------------------------------- hybrid CPU contracts
 
 
@@ -801,7 +1161,7 @@ def test_hybrid_explicit_draft_phase_during_prefill(monkeypatch, tmp_path):
 
     cfg = c._Config(str(tmp_path), frozenset({"hybrid"}), re.compile(".*"),
                     re.compile(".*"), frozenset({1}), 2, frozenset({1}), 65,
-                    1 << 20, 0, 0, prefill_per_key=0)
+                    1 << 20, 0, 0, 1, prefill_per_key=0)
     monkeypatch.setattr(c, "_cfg", cfg)
     monkeypatch.setattr(c, "_step", {"real": True, "step": 1, "phase": "prefill",
                                    "query_lens": [128], "context_lens": [0], "context": "short"})

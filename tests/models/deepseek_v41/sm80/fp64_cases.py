@@ -6,6 +6,13 @@
 
 Run from the tree root on one CUDA card (it refuses to run without CUDA).
 
+    python tests/models/deepseek_v41/sm80/fp64_cases.py --export-expert-tp <capture> \
+        [<capture> ...] --checkpoint <dir> --out <file> [--tp-size 4] [--calls 4]
+
+writes the cases of routed experts split across the tensor-parallel ranks
+derived from captures of whole experts, decode-step and prefill calls
+(:func:`expert_tp_cases`, on the CPU).
+
 Cases: a JSON object with schema ``served_cases/1`` (the export of captured
 calls) or ``generated_cases/1``. Each case has an ``id``, a ``family`` and
 ``captured_sources``, the files of the calls it pools; the file's top-level
@@ -84,6 +91,18 @@ unless named in full.
   ``bits_x2``, the layer's one routed bit width, which must be the one in
   ``packed_meta``.
   ``moe_out`` is its own reference path.
+  Routed experts split across the tensor-parallel ranks (Exl3MoEMethod at
+  MoE tensor parallel size > 1): a call whose ``packed_meta`` is narrower
+  than the checkpoint's experts holds, of every expert, the columns
+  :func:`expert_columns` gives its ``meta.tp_rank`` of ``meta.tp_size`` at
+  the layer of ``meta.module_prefix`` (gate and up: those outputs; down:
+  those inputs); its FP64 value is that rank's partial output. A case with
+  ``expert_tp`` (a tensor parallel size) replays each whole-expert source
+  as every rank of that split runs it (:func:`tp_call`: the same rows, the
+  identity expert map, the rank's columns of every expert). The ranks'
+  outputs, stacked in rank order, are judged together, and the ranks' FP64
+  partials must sum to the whole experts' FP64 output within FP64 rounding
+  (``TP_SUM_RTOL`` of its largest magnitude), else the case is refused.
 - ``mhc_delayed``: ``sm80_mhc:mhc_fused_post_pre_delayed`` (x, residual,
   post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
   hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, pre_mix, norm_weight,
@@ -170,12 +189,15 @@ class Call:
 @dataclass
 class Source:
     """What a family reads besides the arguments: the call's metadata,
-    the served launch's checkpoints ({role: directory}) and, for the
-    families with several outputs, the output the case judges."""
+    the served launch's checkpoints ({role: directory}), for the
+    families with several outputs the output the case judges and, for the
+    EXL3 MoE families, the case's ``expert_tp`` (the tensor parallel size
+    of the split its whole-expert sources are replayed as)."""
 
     meta: dict
     checkpoint: dict
     output: str | None = None
+    expert_tp: int | None = None
 
 
 def picks(n: int) -> list[int]:
@@ -500,12 +522,33 @@ _WORKSPACE = {
 }
 
 
-def expert_set(checkpoint: str, module_prefix: str, expert_map, packed_meta, device):
-    """The layer's local experts as Exl3MoEMethod lays them out, read from
-    the checkpoint: (per projection (trellis, suh, svh), pointer table,
-    meta). Local expert l is the global g with ``expert_map[g] == l``; its
-    matrices are the model layout's expert matrices of ``module_prefix``.
-    The meta must be the recorded ``packed_meta``."""
+# The routed-expert families and the expert matrices of each expert, in order.
+EXL3_MOE_FAMILIES = tuple(f"exl3_{op}" for op in _WORKSPACE)
+ROLES = ("gate_proj", "up_proj", "down_proj")
+# Bound of |sum of the ranks' FP64 partial outputs - the whole experts' FP64
+# output| of a split replay, relative to the whole output's largest
+# magnitude: the FP64 rounding of the regrouped sums, far below what one
+# misplaced block of columns gives.
+TP_SUM_RTOL = 1e-9
+
+
+def expert_columns(intermediate: int, module_prefix: str, rank: int, size: int) -> slice:
+    """The intermediate columns rank ``rank`` of ``size`` holds of every
+    routed expert of the MoE layer ``module_prefix`` when the experts are
+    split across the tensor-parallel ranks, as Exl3MoEMethod splits them:
+    whole H128 blocks, the larger chunks first, rank r of layer L holding
+    chunk (r + L) mod ``size`` (block_shard rotated by the layer index)."""
+    from vllm.model_executor.models.utils import extract_layer_index
+    from vllm.sm80.kernels.exl3.utils import block_shard
+
+    return block_shard(
+        intermediate, intermediate, rank, size, extract_layer_index(module_prefix)
+    )
+
+
+@functools.lru_cache(maxsize=2)
+def _expert_layout(checkpoint: str):
+    """(model layout, its resolver, the checkpoint's packed matrices)."""
     from tests.kernels.quantization import exl3_real_cases as real
     from vllm.models.deepseek_v41.nvidia.sm80_exl3 import DeepseekV41Exl3Layout
 
@@ -514,6 +557,23 @@ def expert_set(checkpoint: str, module_prefix: str, expert_map, packed_meta, dev
     layout = DeepseekV41Exl3Layout(SimpleNamespace(text_config=text))
     resolver = SimpleNamespace()
     resolver.source_prefix = lambda prefix: layout.source_prefix(resolver, prefix)
+    return layout, resolver, real.Checkpoint(Path(checkpoint))
+
+
+def expert_set(
+    checkpoint: str, module_prefix: str, expert_map, packed_meta, device,
+    rank: int = 0, size: int = 1,
+):
+    """The layer's local experts as Exl3MoEMethod lays them out, read from
+    the checkpoint: (per projection (trellis, suh, svh), pointer table,
+    meta). Local expert l is the global g with ``expert_map[g] == l``; its
+    matrices are the model layout's expert matrices of ``module_prefix``.
+    A ``packed_meta`` narrower than the checkpoint's experts is a split
+    over the tensor-parallel ranks: each expert's columns of rank ``rank``
+    of ``size`` (expert_columns), the outputs of gate and up (trellis
+    columns, svh; the whole suh) and the inputs of down (trellis rows, suh;
+    the whole svh). The meta must be the recorded ``packed_meta``."""
+    layout, resolver, ckpt = _expert_layout(str(checkpoint))
     owner = {}
     for g, local in enumerate(expert_map.tolist()):
         if local >= 0:
@@ -522,19 +582,42 @@ def expert_set(checkpoint: str, module_prefix: str, expert_map, packed_meta, dev
             owner[local] = g
     if sorted(owner) != list(range(packed_meta.shape[0])):
         raise ValueError("the expert map does not cover the local experts")
-    ckpt = real.Checkpoint(Path(checkpoint))
+
+    def matrix_name(local, role):
+        return layout.expert_matrix(resolver, module_prefix, owner[local], role)
+
+    columns = None
+    if packed_meta.shape[0]:
+        whole = ckpt.matrix(matrix_name(0, "gate_proj")).padded_out
+        recorded = int(packed_meta[0, 0, 1])
+        if recorded != whole:
+            if size <= 1:
+                raise ValueError(
+                    "the checkpoint's expert layout differs from the recorded one: "
+                    f"{recorded} of {whole} intermediate columns, and a split needs "
+                    "the source's tensor parallel rank and size (meta.tp_rank, "
+                    "meta.tp_size)"
+                )
+            columns = expert_columns(whole, module_prefix, rank, size)
     weights, pointers, meta = [], [], []
     for local in range(packed_meta.shape[0]):
         ptrs, rows = [], []
-        for role in ("gate_proj", "up_proj", "down_proj"):
-            name = layout.expert_matrix(resolver, module_prefix, owner[local], role)
+        for role in ROLES:
+            name = matrix_name(local, role)
             matrix = ckpt.matrix(name)
-            parts = [t.to(device) for t in ckpt.whole(name)]
+            k, n = matrix.padded_in, matrix.padded_out
+            if columns is None:
+                parts = ckpt.whole(name)
+            elif role == "down_proj":
+                parts = ckpt.shard(name, (columns.start, columns.stop), [(0, n)])
+                k = columns.stop - columns.start
+            else:
+                parts = ckpt.shard(name, (0, k), [(columns.start, columns.stop)])
+                n = columns.stop - columns.start
+            parts = [t.to(device) for t in parts]
             weights.append(parts)
             ptrs.append([p.data_ptr() for p in parts])
-            rows.append(
-                [matrix.padded_in, matrix.padded_out, matrix.bits_x2, matrix.codebook]
-            )
+            rows.append([k, n, matrix.bits_x2, matrix.codebook])
         pointers.append(ptrs)
         meta.append(rows)
     meta = torch.tensor(meta, dtype=torch.int64)
@@ -542,6 +625,70 @@ def expert_set(checkpoint: str, module_prefix: str, expert_map, packed_meta, dev
         raise ValueError("the checkpoint's expert layout differs from the recorded one")
     pointers = torch.tensor(pointers, dtype=torch.int64, device=device)
     return weights, pointers, meta.to(device)
+
+
+def tp_call(a: dict, module_prefix: str, rank: int, size: int) -> dict:
+    """The arguments rank ``rank`` of ``size`` passes the experts' operator
+    for the rows of the whole-expert call ``a`` (any expert map) when the
+    routed experts are split across the tensor-parallel ranks: every rank
+    routes the same rows (x, topk_ids, topk_weights unchanged) and holds
+    every expert (the identity expert map) at the same columns
+    (expert_columns; ``intermediate_size`` is their width). ``packed_meta``
+    gives every expert the call's bit width and codebook of each projection,
+    gate and up narrowed to those outputs and down to those inputs.
+    ``size`` 1: every expert whole."""
+    meta = a["packed_meta"]
+    inter = int(a["intermediate_size"])
+    if meta.dim() != 3 or meta.shape[0] == 0 or tuple(meta.shape[1:]) != (3, 4):
+        raise ValueError(f"packed_meta {tuple(meta.shape)} is not [local experts, 3, 4]")
+    hidden = int(meta[0, 0, 0])
+    shapes = {tuple(r) for r in meta[..., :2].reshape(meta.shape[0], 6).tolist()}
+    if shapes != {(hidden, inter, hidden, inter, inter, hidden)}:
+        raise ValueError(
+            f"packed_meta of other than {inter}-column experts: expert shapes {sorted(shapes)}"
+        )
+    kinds = []
+    for p, role in enumerate(ROLES):
+        kind = {tuple(r) for r in meta[:, p, 2:].tolist()}
+        if len(kind) != 1:
+            raise ValueError(f"the call's {role} matrices mix bit widths or codebooks: "
+                             f"{sorted(kind)}")
+        kinds.append(list(kind.pop()))
+    columns = expert_columns(inter, module_prefix, rank, size)
+    width = columns.stop - columns.start
+    experts = a["expert_map"].numel()
+    row = [[hidden, width, *kinds[0]], [hidden, width, *kinds[1]],
+           [width, hidden, *kinds[2]]]
+    return dict(
+        a,
+        packed_meta=torch.tensor([row] * experts, dtype=meta.dtype),
+        expert_map=torch.arange(experts, dtype=a["expert_map"].dtype),
+        intermediate_size=width,
+    )
+
+
+def whole_fp64(checkpoint: str, module_prefix: str, a: dict, device) -> torch.Tensor:
+    """FP64 routed-expert output of the call ``a`` on the whole experts
+    (any expert of the layer by its global id), each read from the
+    checkpoint when the call routes to it."""
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    layout, resolver, ckpt = _expert_layout(str(checkpoint))
+
+    def decode(g):
+        out = []
+        for role in ROLES:
+            name = layout.expert_matrix(resolver, module_prefix, g, role)
+            matrix = ckpt.matrix(name)
+            t, s, v = (p.to(device) for p in ckpt.whole(name))
+            out.append((real.core_weight(t, matrix.bits_x2, matrix.codebook), s, v))
+        return out
+
+    calls = [tuple(a[k].to(device) for k in ("x", "topk_ids", "topk_weights"))]
+    identity = torch.arange(a["expert_map"].numel())
+    return real.moe_fp64(
+        calls, identity, decode, int(a["intermediate_size"]), float(a["swiglu_limit"])
+    )[0]
 
 
 def moe_exact(x, ids, weights_t, expert_map, weights, meta, intermediate, limit):
@@ -559,20 +706,20 @@ def moe_exact(x, ids, weights_t, expert_map, weights, meta, intermediate, limit)
     return real.moe_fp64(calls, expert_map, decode, intermediate, limit)[0]
 
 
-def _exl3_moe(name: str, a: dict, device: torch.device, src: Source) -> Call:
+def _exl3_moe_call(
+    name: str, a: dict, device: torch.device, checkpoint: str, prefix: str,
+    rank: int, size: int,
+) -> Call:
+    """One call of ``name`` on the experts it records (rank ``rank`` of
+    ``size``'s columns of each when they are split)."""
     from vllm.sm80.kernels.exl3 import ops
 
-    checkpoint = src.checkpoint.get("target")
-    prefix = src.meta.get("module_prefix")
-    if not checkpoint or not prefix:
-        raise ValueError("an EXL3 MoE call needs the cases file's checkpoint.target "
-                         "and the source's meta.module_prefix")
     x, ids, tw, emap = (
         a[k].to(device) for k in ("x", "topk_ids", "topk_weights", "expert_map")
     )
     inter, limit = int(a["intermediate_size"]), float(a["swiglu_limit"])
     weights, pointers, meta = expert_set(
-        checkpoint, prefix, a["expert_map"], a["packed_meta"], device
+        checkpoint, prefix, a["expert_map"], a["packed_meta"], device, rank, size
     )
     extra = {}
     if name in ("moe_out_v2", "moe_out_prefill_v2"):
@@ -607,6 +754,40 @@ def _exl3_moe(name: str, a: dict, device: torch.device, src: Source) -> Call:
         subs = [slice(i, i + 1) for i in picks(n)]
     alone = all(bits_equal(whole[s], run(name, s)) for s in subs)
     return Call(whole, ref, exact, alone)
+
+
+def _exl3_moe(name: str, a: dict, device: torch.device, src: Source) -> Call:
+    checkpoint = src.checkpoint.get("target")
+    prefix = src.meta.get("module_prefix")
+    if not checkpoint or not prefix:
+        raise ValueError("an EXL3 MoE call needs the cases file's checkpoint.target "
+                         "and the source's meta.module_prefix")
+    if src.expert_tp is None:
+        # Captures from before meta.tp_size held whole experts.
+        rank, size = int(src.meta.get("tp_rank", 0)), int(src.meta.get("tp_size", 1))
+        return _exl3_moe_call(name, a, device, checkpoint, prefix, rank, size)
+    size = int(src.expert_tp)
+    if size < 2:
+        raise ValueError(f"expert_tp {src.expert_tp!r}: a split needs at least 2 ranks")
+    calls = [
+        _exl3_moe_call(name, tp_call(a, prefix, rank, size), device, checkpoint, prefix,
+                       rank, size)
+        for rank in range(size)
+    ]
+    partials = torch.stack([c.exact for c in calls])
+    whole = whole_fp64(checkpoint, prefix, a, device)
+    finite = whole[torch.isfinite(whole)]
+    bound = TP_SUM_RTOL * float(finite.abs().max()) if finite.numel() else 0.0
+    _, worst, _ = abs_errors(partials.sum(0), whole)
+    if not worst <= bound:
+        raise ValueError(
+            f"the {size} ranks' FP64 partial outputs sum to the whole experts' FP64 "
+            f"output within {worst:.3g}, not {bound:.3g}"
+        )
+    return Call(
+        torch.stack([c.cand for c in calls]), torch.stack([c.ref for c in calls]),
+        partials, all(c.row_invariant for c in calls),
+    )
 
 
 # ---------------------------------------------------------------- mHC
@@ -1154,7 +1335,11 @@ def case_row(
             raise ValueError(f"{path}: family {family!r} in a case of {case['family']!r}")
         multi = family in MULTI_OUTPUT
         families.add(f"{family}:{output}" if multi else family)
-        src = Source(obj.get("meta") or {}, checkpoint, output if multi else None)
+        expert_tp = case.get("expert_tp")
+        if expert_tp is not None and family not in EXL3_MOE_FAMILIES:
+            raise ValueError(f"{path}: expert_tp is for the EXL3 MoE families, not {family!r}")
+        src = Source(obj.get("meta") or {}, checkpoint, output if multi else None,
+                     expert_tp)
         call = FAMILIES[family](obj["tensors"], device, src)
         cs, cm, n = abs_errors(call.cand, call.exact)
         ref_exact = call.exact if call.ref_exact is None else call.ref_exact
@@ -1237,11 +1422,136 @@ def run(cases: Path, out: Path, device: torch.device) -> int:
     return 0
 
 
+def _spread(records: list[dict], calls: int) -> list[dict]:
+    """Up to ``calls`` of ``records`` (capture index lines of one cell),
+    spread over their layers: evenly spaced layers first, each layer's calls
+    in step order."""
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    by_layer: dict[int, list[dict]] = {}
+    for rec in sorted(records, key=lambda r: (r["step"], r["path"])):
+        by_layer.setdefault(extract_layer_index(rec["prefix"]), []).append(rec)
+    layers = sorted(by_layer)
+    chosen: list[dict] = []
+    for depth in range(max(map(len, by_layer.values()))):
+        left = [layer for layer in layers if depth < len(by_layer[layer])]
+        k = min(calls - len(chosen), len(left))
+        chosen += [by_layer[left[i * len(left) // k]][depth] for i in range(k)]
+        if len(chosen) == calls:
+            break
+    return chosen
+
+
+def expert_tp_cases(captures, checkpoint, size: int = 4, calls: int = 4) -> dict:
+    """served_cases/1 cases of the routed experts split across ``size``
+    tensor-parallel ranks, derived from captures of whole experts
+    (expert-parallel) at ``captures``: each the VLLM_SM80_CAPTURE_DIR of a
+    boot of ``size`` ranks, r<rank>/index.jsonl and the files it names, of
+    the ``checkpoint`` they served. Every rank of the split routes the same
+    rows, so rank 0's file of a call stands for every rank (each rank's file
+    of that name must hold the same x, topk_ids and topk_weights); the
+    driver derives each rank's arguments (tp_call). Per operator (decode,
+    verify, draft and prefill), phase, rows and model (target or drafter
+    layer) up to ``calls`` calls of all the captures, spread over the
+    layers, one case per request count, with ``expert_tp`` = ``size``; the
+    calls of decode, verify and draft steps are decode cases
+    (``scheduler_phase`` keeps the capture's phase)."""
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    if size < 2 or calls < 1:
+        raise ValueError(f"a split of {size} ranks, {calls} calls per case")
+    captures, checkpoint = [Path(c) for c in captures], Path(checkpoint)
+    config = json.loads((checkpoint / "config.json").read_text())
+    targets = int(config.get("text_config", config)["num_hidden_layers"])
+    cells: dict[tuple, list[dict]] = {}
+    for capture in captures:
+        for line in (capture / "r0" / "index.jsonl").read_text().splitlines():
+            rec = json.loads(line) if line.strip() else {}
+            if rec.get("point") in EXL3_MOE_FAMILIES and rec.get("saved"):
+                drafter = extract_layer_index(rec["prefix"]) >= targets
+                key = (rec["point"], rec["phase"], int(rec["rows"]), drafter)
+                cells.setdefault(key, []).append(dict(rec, capture=capture))
+    if not cells:
+        raise ValueError(f"{', '.join(map(str, captures))}: no saved routed-expert call")
+    cases: dict[tuple, dict] = {}
+    for (point, phase, rows, drafter), records in sorted(cells.items()):
+        for rec in _spread(records, calls):
+            path, capture = Path(rec["path"]), rec["capture"]
+            name = path.relative_to(capture / "r0")
+            with path.open("rb") as f:
+                digest = hashlib.file_digest(f, "sha256").hexdigest()
+            if digest != rec["sha256"]:
+                raise ValueError(f"{path}: captured source hash changed")
+            obj = torch.load(path, map_location="cpu", weights_only=True)
+            if obj.get("schema") != SOURCE_SCHEMA or obj.get("family") != point:
+                raise ValueError(f"{path}: not a {SOURCE_SCHEMA} call of {point}")
+            a, meta = obj["tensors"], obj["meta"]
+            prefix = meta["module_prefix"]
+            tp_call(a, prefix, 0, 1)
+            # Whole experts: as wide as the checkpoint's (a split call's are
+            # narrower).
+            layout, resolver, ckpt = _expert_layout(str(checkpoint))
+            some = int(torch.nonzero(a["expert_map"] >= 0)[0])
+            gate = layout.expert_matrix(resolver, prefix, some, "gate_proj")
+            if int(a["intermediate_size"]) != ckpt.matrix(gate).padded_out:
+                raise ValueError(f"{path}: experts of {a['intermediate_size']} of the "
+                                 f"checkpoint's {ckpt.matrix(gate).padded_out} columns, "
+                                 "not whole experts")
+            for rank in range(1, size):
+                other = torch.load(capture / f"r{rank}" / name, map_location="cpu",
+                                   weights_only=True)["tensors"]
+                if not all(bits_equal(a[k], other[k])
+                           for k in ("x", "topk_ids", "topk_weights")):
+                    raise ValueError(f"{name}: rank {rank} routed other rows than rank 0")
+            n = len(meta.get("query_lens") or ())
+            if n < 1:
+                raise ValueError(f"{path}: the call records no requests")
+            model = "drafter" if drafter else "target"
+            case = cases.setdefault((point, phase, rows, drafter, n), {
+                "id": f"{point}/{phase}/M{rows}/c{n}/{model}/tp{size}", "family": point,
+                "phase": "prefill" if phase == "prefill" else "decode",
+                "scheduler_phase": phase, "concurrency": n, "rows": rows,
+                "drafter": drafter, "expert_tp": size, "captured_sources": [],
+                "captured_sha256": {},
+            })
+            case["captured_sources"].append(str(path))
+            case["captured_sha256"][str(path)] = "sha256:" + digest
+    return {
+        "schema": "served_cases/1",
+        "checkpoint": {"target": str(checkpoint)},
+        "source": [str(c) for c in captures],
+        "source_kind": "expert_tp_from_whole_experts",
+        "expert_tp": size,
+        "sampling": f"up to {calls} calls per operator, phase, rows and model, "
+                    "spread over the layers",
+        "limitations": ["the rows and routes of whole-expert calls, replayed on the "
+                        "layout of the split"],
+        "cases": [cases[k] for k in sorted(cases)],
+    }
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--cases", type=Path, required=True)
+    ap.add_argument("--cases", type=Path)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--export-expert-tp", type=Path, nargs="+", metavar="CAPTURE",
+                    help="write the split-expert cases of whole-expert captures to --out")
+    ap.add_argument("--checkpoint", type=Path,
+                    help="the target checkpoint the captures served")
+    ap.add_argument("--tp-size", type=int, default=4)
+    ap.add_argument("--calls", type=int, default=4, help="calls per case")
     a = ap.parse_args(argv)
+    if a.export_expert_tp is not None:
+        if a.checkpoint is None:
+            ap.error("--export-expert-tp needs --checkpoint")
+        if a.out.exists():
+            print(f"fp64_cases: refusing to replace {a.out}", file=sys.stderr)
+            return 2
+        doc = expert_tp_cases(a.export_expert_tp, a.checkpoint, a.tp_size, a.calls)
+        a.out.write_text(json.dumps(doc, indent=1) + "\n")
+        return 0
+    if a.cases is None:
+        ap.error("--cases is required")
     if not torch.cuda.is_available():
         print("fp64_cases: the candidate path runs on CUDA; no CUDA device", file=sys.stderr)
         return 2

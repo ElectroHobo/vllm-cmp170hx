@@ -125,6 +125,7 @@ class _Config:
     max_bytes: int
     rank: int
     tp_rank: int
+    tp_size: int
     prefill_per_key: int
 
 
@@ -132,17 +133,23 @@ def _ints(text: str) -> frozenset:
     return frozenset(int(v) for v in text.split(",") if v.strip())
 
 
-def _ranks() -> tuple[int, int]:
+def _ranks() -> tuple[int, int, int]:
+    """(global rank, tensor parallel rank, tensor parallel size)."""
     rank = tp_rank = 0
+    tp_size = 1
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
     try:
-        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
 
         tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
     except (AssertionError, RuntimeError):
         tp_rank = rank
-    return rank, tp_rank
+    return rank, tp_rank, tp_size
 
 
 _cfg: _Config | None = None
@@ -159,7 +166,7 @@ def config() -> _Config:
         unknown = families - set(FAMILIES)
         if unknown:
             raise ValueError(f"VLLM_SM80_CAPTURE_FAMILIES: unknown {sorted(unknown)}")
-        rank, tp_rank = _ranks()
+        rank, tp_rank, tp_size = _ranks()
         cfg = _Config(
             root=os.path.join(envs.VLLM_SM80_CAPTURE_DIR, f"r{rank}"),
             families=families,
@@ -174,6 +181,7 @@ def config() -> _Config:
             max_bytes=envs.VLLM_SM80_CAPTURE_MAX_MB << 20,
             rank=rank,
             tp_rank=tp_rank,
+            tp_size=tp_size,
             prefill_per_key=envs.VLLM_SM80_CAPTURE_PREFILL_PER_KEY,
         )
         if cfg.prefill_per_key < 0:
@@ -417,8 +425,8 @@ def _write(
         if _bytes[0] + size <= cfg.max_bytes:
             meta = dict(
                 rec.meta, module_prefix=rec.prefix, rank=cfg.rank,
-                tp_rank=cfg.tp_rank, phase=record_phase, step_phase=_step["phase"],
-                owner=owner,
+                tp_rank=cfg.tp_rank, tp_size=cfg.tp_size, phase=record_phase,
+                step_phase=_step["phase"], owner=owner,
                 step=_step["step"], query_lens=list(_step["query_lens"]),
                 context_lens=list(_step["context_lens"]),
                 rows=rec.rows, graph=graph, sm_count=sm_count,

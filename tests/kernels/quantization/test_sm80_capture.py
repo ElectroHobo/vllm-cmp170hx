@@ -198,6 +198,9 @@ def test_moe_point_names_operator(on):
     assert obj["family"] == "exl3_moe_out_v2"
     assert obj["tensors"]["bits_x2"] == 6 and obj["tensors"]["swiglu_limit"] == 10.0
     assert obj["meta"]["module_prefix"] == "model.layers.3.ffn.experts"
+    # The tensor parallel rank and size say which columns of each expert a
+    # call held when the routed experts are split (one process: 0 of 1).
+    assert (obj["meta"]["tp_rank"], obj["meta"]["tp_size"]) == (0, 1)
 
 
 def test_mhc_proxy_records_call_and_outputs(on):
