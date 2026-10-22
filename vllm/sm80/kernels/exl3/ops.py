@@ -29,6 +29,15 @@ _dense_splitk = False
 # Each matrix processes rows in chunks whose native workspace fits it.
 LINEAR_SCRATCH_ELEMENTS = 8 << 20
 
+# Scratch switch, default off: moe_out_prefill_v2's calls of the whole-expert
+# configuration (hidden 5120, intermediate 2304, top-6, 96 of 384 experts local,
+# bits_x2 6 or 4, 65..2048 rows) run _exl3_C::moe_out_prefill_try instead
+# (csrc/exl3/moe_prefill_try.cu: the same arithmetic, bitwise equal, in one
+# launch sequence per call), with its workspace size. Every other call is
+# unchanged.
+TRY_MOE_PREFILL = os.environ.get("VLLM_TRY_MOE_PREFILL", "0") == "1"
+TRY_MOE_PREFILL_ROWS = (65, 2048)
+
 # moe_out_v2 (csrc/exl3/moe_v2.cu) covers calls of 1..MOE_V2_MAX_ROWS rows of
 # these configurations: (hidden, intermediate, top-k, local experts, global
 # experts) -> the bits_x2 values its kernels are built for. Every routed matrix
@@ -947,7 +956,27 @@ def require_moe_prefill_v2() -> None:
             ) from exc
     if not _moe_prefill_v2_fake_registered:
         torch.library.register_fake("_exl3_C::moe_out_prefill_v2")(_moe_v2_fake)
+        if TRY_MOE_PREFILL:
+            for name in ("moe_out_prefill_try", "moe_workspace_size_prefill_try"):
+                try:
+                    torch._C._dispatch_find_schema_or_throw(f"_exl3_C::{name}", "")
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"VLLM_TRY_MOE_PREFILL=1 needs _exl3_C::{name}: rebuild the "
+                        f"EXL3 extension from this tree, or unset it. Detail: {exc}"
+                    ) from exc
+            torch.library.register_fake("_exl3_C::moe_out_prefill_try")(_moe_v2_fake)
+            logger.info_once(
+                "VLLM_TRY_MOE_PREFILL: moe_out_prefill_v2 calls of 65..2048 rows of the "
+                "whole-expert configuration (hidden 5120, intermediate 2304, top-6, "
+                "96 of 384 experts local, bits_x2 6 or 4) run moe_out_prefill_try."
+            )
         _moe_prefill_v2_fake_registered = True
+
+
+def _try_moe_prefill(hidden: int, intermediate: int, topk: int, local: int) -> bool:
+    """VLLM_TRY_MOE_PREFILL is set and the shape is the one it covers."""
+    return TRY_MOE_PREFILL and (hidden, intermediate, topk, local) == (5120, 2304, 6, 96)
 
 
 @lru_cache(maxsize=None)
@@ -961,9 +990,14 @@ def moe_workspace_size_prefill_v2(
     """FP32 workspace elements of moe_out_prefill_v2 for calls of up to
     ``max_rows`` rows (they run in row chunks of at most 512 rows)."""
     ensure_extension()
-    return torch.ops._exl3_C.moe_workspace_size_prefill_v2(
+    size = torch.ops._exl3_C.moe_workspace_size_prefill_v2(
         max_rows, hidden_size, intermediate_size, topk, local_experts
     )
+    if _try_moe_prefill(hidden_size, intermediate_size, topk, local_experts):
+        size = max(size, torch.ops._exl3_C.moe_workspace_size_prefill_try(
+            max_rows, hidden_size, intermediate_size, topk, local_experts
+        ))
+    return size
 
 
 def moe_out_prefill_v2(
@@ -984,7 +1018,16 @@ def moe_out_prefill_v2(
     a MOE_PREFILL_V2_CONFIGS configuration; see csrc/exl3/moe_prefill_v2.cu.
     ``bits_x2`` is the one bit width of every routed matrix of the layer."""
     ensure_extension()
-    torch.ops._exl3_C.moe_out_prefill_v2(
+    op = torch.ops._exl3_C.moe_out_prefill_v2
+    if (
+        _try_moe_prefill(x.shape[1], intermediate_size, topk_ids.shape[1],
+                         packed_ptrs.shape[0])
+        and expert_map.numel() == 384
+        and bits_x2 in (6, 4)
+        and TRY_MOE_PREFILL_ROWS[0] <= x.shape[0] <= TRY_MOE_PREFILL_ROWS[1]
+    ):
+        op = torch.ops._exl3_C.moe_out_prefill_try
+    op(
         x,
         topk_ids,
         topk_weights,
@@ -1026,33 +1069,37 @@ def warmup_moe_prefill_v2(
     key = (device, hidden_size, intermediate_size, bits_x2)
     if key in _moe_prefill_v2_warm:
         return
-    rows = MOE_PREFILL_MIN_ROWS
-    ids = torch.tensor(
-        [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
-    )
-    weights = torch.full((rows, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
-    x = torch.ones((rows, hidden_size), dtype=torch.bfloat16, device=device)
-    out = torch.empty_like(x)
-    workspace = torch.empty(
-        moe_workspace_size_prefill_v2(
-            rows, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
-        ),
-        dtype=torch.float32,
-        device=device,
-    )
-    moe_out_prefill_v2(
-        x,
-        ids,
-        weights,
-        packed_ptrs,
-        packed_meta,
-        expert_map,
-        intermediate_size,
-        out,
-        workspace,
-        swiglu_limit=swiglu_limit,
-        bits_x2=bits_x2,
-    )
+    rows_list = [MOE_PREFILL_MIN_ROWS]
+    if _try_moe_prefill(hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]):
+        # moe_out_prefill_try launches other GEMM shapes above 1024 rows.
+        rows_list.append(1025)
+    for rows in rows_list:
+        ids = torch.tensor(
+            [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
+        )
+        weights = torch.full((rows, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+        x = torch.ones((rows, hidden_size), dtype=torch.bfloat16, device=device)
+        out = torch.empty_like(x)
+        workspace = torch.empty(
+            moe_workspace_size_prefill_v2(
+                rows, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        moe_out_prefill_v2(
+            x,
+            ids,
+            weights,
+            packed_ptrs,
+            packed_meta,
+            expert_map,
+            intermediate_size,
+            out,
+            workspace,
+            swiglu_limit=swiglu_limit,
+            bits_x2=bits_x2,
+        )
     torch.cuda.synchronize(device)
     _moe_prefill_v2_warm.add(key)
 

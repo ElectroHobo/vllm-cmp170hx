@@ -34,6 +34,7 @@ SOURCES = (
     # VLLM_TRY_MOE_V2: own namespace and headers (moe_v2_try/); leaves every
     # other object's code as it is.
     "moe_v2_try.cu",
+    "moe_prefill_try.cu",
 )
 
 
