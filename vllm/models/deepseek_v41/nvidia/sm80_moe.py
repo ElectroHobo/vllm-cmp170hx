@@ -249,6 +249,7 @@ def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
         raise ValueError("VLLM_TRY_ROUTER: the hybrid capture records the FP32 gate GEMM; capture with it off")
     gate.mma = True
     router.mma_gate = gate
+    sm80_router_mma.register_warmup(router)
     logger.info_once(
         "DeepSeek-V4.1 sm_80: MoE gate and routing on the BF16 tensor cores for calls "
         "of 1 to %d rows (VLLM_TRY_ROUTER=1)",

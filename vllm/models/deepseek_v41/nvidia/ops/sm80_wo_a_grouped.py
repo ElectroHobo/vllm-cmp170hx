@@ -59,7 +59,15 @@ scales as loaded (no Marlin repack, no per-group sub-layers; the same bytes
 as Marlin's copy) and projects through :func:`wo_a_grouped`. For the dev A/B
 switch it also builds the Marlin sub-layers of its parent, and ``gemm``
 selects the arm.
+
+CUDA graphs and the first eager prefill: :data:`WO_A_GROUPED_WARMUP` compiles
+the kernel at one row count of each :data:`CONFIGS` entry for every adopted
+``wo_a`` shape, target and drafter, before capture (registered by
+:meth:`WoAGroupedGemmMethod.adopt`).
 """
+
+import weakref
+from dataclasses import dataclass, field
 
 import torch
 import triton
@@ -68,6 +76,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
 from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
 
 logger = init_logger(__name__)
@@ -197,6 +206,11 @@ def config_for(rows: int) -> tuple[int, int, int, int, int, int]:
     raise AssertionError("the last config takes every row count")
 
 
+# The smallest row count of each CONFIGS entry: the kernel does not specialise
+# on M, so its config is all a call's row count puts into the cache key.
+WARMUP_ROWS = (1, *(c[0] + 1 for c in CONFIGS if c[0] is not None))
+
+
 def supports(groups: int, rows_per_group: int, inputs: int) -> str | None:
     """Why the kernel cannot take this ``wo_a`` shape, or None."""
     if groups < 1 or rows_per_group % _MAX_BN:
@@ -294,6 +308,9 @@ class WoAGroupedGemmMethod(GroupedLinearMethod):
         layer.quant_method = cls(
             layer.quant_method, groups, strided_input, gemm, keep_groups
         )
+        if gemm:
+            _ADOPTED.add(layer)
+            WO_A_GROUPED_WARMUP.register_warmup()
         logger.info_once(
             "DeepSeek-V4.1 sm_80: grouped MXFP8 wo_a as one Triton GEMM "
             "(VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM=%d%s)",
@@ -337,3 +354,54 @@ class WoAGroupedGemmMethod(GroupedLinearMethod):
         if x.dim() != 3 or x.shape[1] != self.groups:
             raise ValueError(f"Grouped input must be [tokens, {self.groups}, input]")
         return wo_a_grouped(x, layer.wo_a_codes, layer.wo_a_scales)
+
+
+# The wo_a layers running wo_a_grouped, the target's and the drafter's: the
+# drafter loads outside the runner's warmup registry, so the one registration
+# (made while the target loads) reads the set at warmup time.
+_ADOPTED: "weakref.WeakSet[nn.Module]" = weakref.WeakSet()
+
+
+def _cuda(device: torch.device) -> bool:
+    return device.type == "cuda"
+
+
+class WoAGroupedWarmup(VllmJitKernel["WoAGroupedWarmup.Key"]):
+    """Boot-time compile of :func:`wo_a_grouped` (the entry
+    :meth:`WoAGroupedGemmMethod.apply_grouped` calls) for each adopted ``wo_a``
+    shape at :data:`WARMUP_ROWS`, on the layer's codes and scales and a BF16
+    input of the served [T, G, D] layout (unit stride along D, row and group
+    strides multiples of 16 elements)."""
+
+    @dataclass(frozen=True)
+    class Key:
+        rows: int
+        groups: int
+        outputs: int
+        inputs: int
+        aligned: tuple
+        layer: object = field(compare=False, hash=False, repr=False)
+
+    def get_warmup_keys(self) -> list["WoAGroupedWarmup.Key"]:
+        keys: dict = {}
+        for layer in list(_ADOPTED):
+            codes, scales = layer.wo_a_codes, layer.wo_a_scales
+            if not _cuda(codes.device):
+                continue
+            aligned = (codes.data_ptr() % 16 == 0, scales.data_ptr() % 16 == 0)
+            for rows in WARMUP_ROWS:
+                key = self.Key(rows, layer.quant_method.groups, codes.shape[0],
+                               codes.shape[1], aligned, layer)
+                keys.setdefault(key, None)
+        return list(keys)
+
+    def compile(self, compile_key: "WoAGroupedWarmup.Key") -> None:
+        layer = compile_key.layer
+        dev = layer.wo_a_codes.device
+        x = torch.zeros(compile_key.rows, compile_key.groups, compile_key.inputs,
+                        dtype=torch.bfloat16, device=dev)
+        wo_a_grouped(x, layer.wo_a_codes, layer.wo_a_scales)
+        torch.cuda.synchronize(dev)
+
+
+WO_A_GROUPED_WARMUP = WoAGroupedWarmup()

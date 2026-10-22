@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Boot warmup of the Triton kernels served DeepSeek-V4.1 runs used to compile
-mid-request: the sm_80 index scores and the speculative-decoding kernels.
+mid-request: the sm_80 index scores, the speculative-decoding kernels, the
+MoE gate and route of VLLM_TRY_ROUTER and the grouped wo_a GEMM.
 
 * The index-score launch's specialisation key (Triton's: pointer dtypes and
   16-byte alignment, the class of every specialised integer -- 1, divisible by
@@ -12,6 +13,10 @@ mid-request: the sm_80 index scores and the speculative-decoding kernels.
   ``prepare_dflash_inputs`` can pick.
 * The spec-decode warmup drives the runner's own rejection sampler and the
   speculator's own buffers.
+* The router warmup's and the wo_a warmup's launches have, between them, the
+  specialisation key (constexprs and launch options exactly) of every launch
+  a served call of 1..MAX_ROWS (router: target and drafter shapes, with and
+  without image routing, several SM counts) or 1..2048 rows (wo_a) makes.
 
     pytest -q tests/models/deepseek_v41/sm80/test_boot_warmup.py
 """
@@ -27,6 +32,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     triton_scalar_specialization_rep,
 )
 from vllm.models.deepseek_v41.nvidia.ops import sm80_index_scores as isc
+from vllm.models.deepseek_v41.nvidia.ops import sm80_router_mma as rm
+from vllm.models.deepseek_v41.nvidia.ops import sm80_wo_a_grouped as wg
 from vllm.sm80.spec_decode import warmup as spec_warmup
 from vllm.triton_utils import triton
 
@@ -335,3 +342,166 @@ def test_spec_decode_warmup_is_called_by_the_runner_warmup() -> None:
     assert "warmup_spec_decode(model_runner)" in _inspect.getsource(
         gpu_warmup.warmup_kernels
     )
+
+
+class _SpecRecorder(_Recorder):
+    """A :class:`_Recorder` whose key also takes the kernel, its constexprs
+    exactly and the launch options (``num_warps``, ``num_stages``)."""
+
+    def __init__(self, kernel):
+        super().__init__(kernel)
+        self.name = f"{kernel.fn.__module__}.{kernel.fn.__name__}"
+        self.constexprs = {p.name for p in kernel.params if p.is_constexpr}
+
+    def key(self, call: dict) -> tuple:
+        args = {n: call[n] for n in self.arg_names}
+        consts = tuple((n, args[n]) for n in self.arg_names if n in self.constexprs)
+        options = tuple(sorted((k, v) for k, v in call.items() if k not in args))
+        return (self.name, super().key(args) + consts, options)
+
+    def drain(self) -> set[tuple]:
+        keys = {self.key(c) for c in self.calls}
+        self.calls.clear()
+        return keys
+
+
+def _record_router(monkeypatch, sms: int) -> list[_SpecRecorder]:
+    recs = []
+    for module, name in ((rm.G, "_gate_kernel"), (rm.RG, "_route_kernel"), (rm.R, "_route_kernel")):
+        rec = _SpecRecorder(getattr(module, name))
+        monkeypatch.setattr(module, name, rec)
+        recs.append(rec)
+    locks = torch.zeros(rm.G.LOCK_SLOTS, dtype=torch.int32)
+    monkeypatch.setattr(rm, "_sms", lambda device: sms)
+    monkeypatch.setattr(rm, "_locks", lambda device: locks)
+    monkeypatch.setattr(rm, "_sm80", lambda device: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    return recs
+
+
+class _MmaGate:
+    def __init__(self, experts: int):
+        self.weight = torch.zeros(experts, rm.HIDDEN)
+        self.weight_bf16 = self.weight.to(torch.bfloat16)
+
+    def _weight_bf16(self) -> torch.Tensor:
+        return self.weight_bf16
+
+
+def _router(experts: int, vision: bool) -> SimpleNamespace:
+    """The attributes of an adopted router the layers' route call reads."""
+    return SimpleNamespace(
+        mma_gate=_MmaGate(experts),
+        e_score_correction_bias=torch.zeros(experts),
+        bias_vl=torch.zeros(experts) if vision else None,
+        top_k=rm.EXPERTS_TOP_K[experts],
+        image_sentinel_lo=rm.SENTINEL_LO if vision else 0,
+    )
+
+
+@pytest.mark.parametrize("sms", [70, 82, 108])
+@pytest.mark.parametrize("experts", sorted(rm.EXPERTS_TOP_K))
+def test_router_warmup_covers_every_served_launch(monkeypatch, experts, sms) -> None:
+    recs = _record_router(monkeypatch, sms)
+
+    def drain():
+        return frozenset().union(*(r.drain() for r in recs))
+
+    x_all = torch.zeros(rm.MAX_ROWS, rm.HIDDEN, dtype=torch.bfloat16)
+    ids_all = torch.zeros(rm.MAX_ROWS, dtype=torch.int32)  # the runner's input_ids
+    for vision in (False, True):
+        router = _router(experts, vision)
+        w16 = router.mma_gate._weight_bf16()
+        served, by_variant = set(), {}
+        for rows in range(1, rm.MAX_ROWS + 1):
+            # What Sm80DeepseekV41Gate.forward and the router's
+            # _compute_routing call (sm80_moe.py).
+            _, pending = rm.gate(x_all[:rows], w16)
+            rm.route(pending, w16, router.e_score_correction_bias, router.bias_vl,
+                     ids_all[:rows], router.top_k, router.image_sentinel_lo)
+            keys = drain()
+            served |= keys
+            by_variant.setdefault(rm.launch_variant(rows, experts, sms), set()).add(keys)
+        # A call's row count reaches its launches' keys only through
+        # launch_variant ...
+        assert all(len(v) == 1 for v in by_variant.values()), by_variant
+        # ... and the warmup runs one call per variant: the same keys.
+        monkeypatch.setattr(rm, "_ADOPTED", [router])
+        warm = rm.RouterWarmup()
+        warm_keys = warm.get_warmup_keys()
+        assert [k.rows for k in warm_keys] == list(rm.warmup_rows(experts, sms))
+        assert len(warm_keys) == len(by_variant)
+        # 1 row; 17 (gate tile of 32 rows); 65 (prefill gate tiling and the
+        # Triton route); 257 (single-warp route programs).
+        assert {1, 17, 65, 257} <= {k.rows for k in warm_keys}
+        warmed = set()
+        for key in warm_keys:
+            warm.compile(key)
+            warmed |= drain()
+        assert warmed == served
+
+
+def test_router_warmup_dedups_layers_and_skips_off_sm80(monkeypatch) -> None:
+    _record_router(monkeypatch, 108)
+    target = [_router(384, True) for _ in range(3)]
+    drafter = [_router(128, True) for _ in range(2)]
+    monkeypatch.setattr(rm, "_ADOPTED", target + drafter)
+    keys = rm.RouterWarmup().get_warmup_keys()
+    assert len(keys) == len(rm.warmup_rows(384, 108)) + len(rm.warmup_rows(128, 108))
+    assert {(k.experts, k.top_k) for k in keys} == {(384, 6), (128, 3)}
+    monkeypatch.setattr(rm, "_sm80", lambda device: False)
+    assert rm.RouterWarmup().get_warmup_keys() == []
+
+
+def test_wo_a_warmup_covers_every_served_launch(monkeypatch) -> None:
+    rec = _SpecRecorder(wg._wo_a_grouped_kernel)
+    monkeypatch.setattr(wg, "_wo_a_grouped_kernel", rec)
+    monkeypatch.setattr(wg, "_cuda", lambda device: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    # The served wo_a at TP 4: 2 local groups of 1024 outputs over 4096 inputs.
+    groups, per_group, inputs, max_rows = 2, 1024, 4096, 2048
+    codes = torch.zeros(groups * per_group, inputs, dtype=torch.uint8)
+    scales = torch.zeros(groups * per_group, inputs // 32, dtype=torch.uint8)
+    x_all = torch.zeros(max_rows, groups, inputs, dtype=torch.bfloat16)
+    for rows in range(1, max_rows + 1):
+        wg.wo_a_grouped(x_all[:rows], codes, scales)
+    served = rec.drain()
+    assert len(served) == len(wg.CONFIGS)
+
+    layer = SimpleNamespace(
+        wo_a_codes=codes, wo_a_scales=scales, quant_method=SimpleNamespace(groups=groups)
+    )
+    monkeypatch.setattr(wg, "_ADOPTED", [layer, layer])
+    warm = wg.WoAGroupedWarmup()
+    keys = warm.get_warmup_keys()
+    assert [k.rows for k in keys] == list(wg.WARMUP_ROWS) == [1, 17, 33, 49, 65, 257]
+    for key in keys:
+        warm.compile(key)
+    assert rec.drain() == served
+    monkeypatch.setattr(wg, "_cuda", lambda device: False)
+    assert wg.WoAGroupedWarmup().get_warmup_keys() == []
+
+
+def test_router_and_wo_a_warmups_register_at_adoption(monkeypatch) -> None:
+    import weakref
+
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v41.nvidia import sm80_moe
+
+    monkeypatch.setattr(rm, "_ADOPTED", weakref.WeakSet())
+    registry = JitWarmupRegistry(SimpleNamespace())
+    routers = [torch.nn.Module(), torch.nn.Module()]
+    with registry.activate():
+        for router in routers:
+            rm.register_warmup(router)
+    # One registration (no arguments: get_warmup_keys reads the adopted set,
+    # which the drafter's layers, loaded outside the registry, also join).
+    assert len(registry) == 1 and set(rm._ADOPTED) == set(routers)
+    drafter = torch.nn.Module()
+    rm.register_warmup(drafter)  # no active registry: joins the set only
+    assert len(registry) == 1 and set(rm._ADOPTED) == {*routers, drafter}
+    assert "sm80_router_mma.register_warmup(router)" in inspect.getsource(
+        sm80_moe._adopt_router_mma
+    )
+    adopt = inspect.getsource(wg.WoAGroupedGemmMethod.adopt)
+    assert "_ADOPTED.add(layer)" in adopt and "WO_A_GROUPED_WARMUP.register_warmup()" in adopt

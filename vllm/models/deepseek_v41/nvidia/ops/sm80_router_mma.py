@@ -15,12 +15,24 @@ Served configuration: hidden 5120, 384 experts top 6 (target) or 128 experts
 top 3 (drafter), routed scaling 1.5, renormalised, gate_temp 1, image sentinel
 ids [129264, 129269) or none, BF16 x of 1 to :data:`MAX_ROWS` rows
 (:func:`serves`).
+
+CUDA graphs and the first eager prefill: :data:`ROUTER_WARMUP` compiles every
+form of both kernels a served call can reach (one call per
+:func:`launch_variant` in 1..MAX_ROWS) for every adopted layer shape, target
+and drafter, before capture (registered by :func:`register_warmup` from
+``sm80_moe._adopt_router_mma``).
 """
 
-from dataclasses import dataclass
+import functools
+import weakref
+from dataclasses import dataclass, field
 
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    triton_scalar_specialization_rep,
+)
 from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_mma as G
 from vllm.models.deepseek_v41.nvidia.ops import sm80_route_gluon as RG
 from vllm.models.deepseek_v41.nvidia.ops import sm80_route_mma as R
@@ -179,3 +191,99 @@ def gate_route(
     w16 = (weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)).contiguous()
     _, pending = gate(x, w16)
     return route(pending, w16, bias, bias_vl, input_ids, top_k, sentinel_lo)
+
+
+def launch_variant(rows: int, experts: int, sms: int) -> tuple:
+    """The part of the Triton cache keys of a call's two launches that depends
+    on its row count (``sms`` SMs): the gate's tiling, split K, DEFER, warps and
+    stages (:func:`sm80_gate_mma.config`; its ``M`` is not specialised), and
+    the route: the Gluon kernel with its GSPLIT, GCOLS and the class of its
+    ``gate_rows`` argument (Triton specialises an integer on the value 1 and
+    on divisibility by 16) up to :data:`EXACT_ROWS` rows, else the Triton
+    kernel's warps. Every other launch argument is a layer tensor, a constant,
+    a fresh output or a scratch view at a 16-byte aligned offset."""
+    block_t, block_e, block_k, split, tb, warps, stages = G.config(rows, experts, HIDDEN, sms)
+    defer = rows <= EXACT_ROWS and split > 1
+    gate_key = (block_t, block_e, block_k, split, defer, warps, stages)
+    if rows <= EXACT_ROWS:
+        gcols = triton.cdiv(experts, block_e) * block_e
+        route_key = ("gluon", split if defer else 1, gcols, triton_scalar_specialization_rep(tb * block_t))
+    else:
+        route_key = ("triton", _ROUTE_WARPS_LARGE if rows > _LARGE_ROWS else _ROUTE_WARPS)
+    return gate_key, route_key
+
+
+@functools.cache
+def warmup_rows(experts: int, sms: int) -> tuple[int, ...]:
+    """The smallest row count of every :func:`launch_variant` in 1..MAX_ROWS."""
+    first: dict = {}
+    for rows in range(1, MAX_ROWS + 1):
+        first.setdefault(launch_variant(rows, experts, sms), rows)
+    return tuple(sorted(first.values()))
+
+
+# The routers whose layers run this gate and route, the target's and the
+# drafter's: the drafter loads outside the runner's warmup registry, so the
+# one registration (made while the target loads) reads the set at warmup time.
+_ADOPTED: "weakref.WeakSet[torch.nn.Module]" = weakref.WeakSet()
+
+
+def register_warmup(router: torch.nn.Module) -> None:
+    """Compile this path's kernels for ``router`` (its ``mma_gate`` adopted)
+    in the boot warmup."""
+    _ADOPTED.add(router)
+    ROUTER_WARMUP.register_warmup()
+
+
+def _sm80(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) == (8, 0)
+
+
+def _tensor_class(t: torch.Tensor | None) -> tuple | None:
+    """A tensor argument's part of a Triton cache key."""
+    return None if t is None else (t.dtype, t.data_ptr() % 16 == 0)
+
+
+class RouterWarmup(VllmJitKernel["RouterWarmup.Key"]):
+    """Boot-time compile of :func:`gate` and :func:`route` for each adopted
+    layer shape at :func:`warmup_rows` (one call per :func:`launch_variant`
+    reachable on the device: every graph capture size and every eager row
+    count share the cache entries of one of them), through those entry points
+    with the layer's gate weight, biases and image sentinel, as the layers
+    call them (``sm80_moe``), and the runner's int32 token ids."""
+
+    @dataclass(frozen=True)
+    class Key:
+        rows: int
+        experts: int
+        top_k: int
+        sentinel_lo: int
+        biases: tuple
+        router: object = field(compare=False, hash=False, repr=False)
+
+    def get_warmup_keys(self) -> list["RouterWarmup.Key"]:
+        keys: dict = {}
+        for router in list(_ADOPTED):
+            weight = router.mma_gate.weight
+            if not _sm80(weight.device):
+                continue
+            experts = weight.shape[0]
+            biases = (_tensor_class(router.e_score_correction_bias), _tensor_class(router.bias_vl))
+            for rows in warmup_rows(experts, _sms(weight.device)):
+                key = self.Key(rows, experts, router.top_k, router.image_sentinel_lo, biases, router)
+                keys.setdefault(key, None)
+        return list(keys)
+
+    def compile(self, compile_key: "RouterWarmup.Key") -> None:
+        router, rows = compile_key.router, compile_key.rows
+        w16 = router.mma_gate._weight_bf16()
+        dev = w16.device
+        x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+        input_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
+        _, pending = gate(x, w16)
+        route(pending, w16, router.e_score_correction_bias, router.bias_vl, input_ids,
+              router.top_k, router.image_sentinel_lo)
+        torch.cuda.synchronize(dev)
+
+
+ROUTER_WARMUP = RouterWarmup()
