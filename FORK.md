@@ -97,7 +97,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/hybrid.py` | 133 |
 | `vllm/sm80/kernels/exl3/layout.py` | 108 |
 | `vllm/sm80/kernels/exl3/loader.py` | 230 |
-| `vllm/sm80/kernels/exl3/ops.py` | 1,316 |
+| `vllm/sm80/kernels/exl3/ops.py` | 1,383 |
 | `vllm/sm80/kernels/exl3/override.py` | 128 |
 | `vllm/sm80/kernels/exl3/placement.py` | 131 |
 | `vllm/sm80/kernels/exl3/quant.py` | 1,848 |
@@ -135,7 +135,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **54 files** | **18,679** |
+| **54 files** | **18,746** |
 
 ### `vllm/sm80/`
 
@@ -353,7 +353,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_chunk_rows.py` | 273 |
 | `tests/kernels/quantization/test_exl3_moe_prefill.py` | 536 |
 | `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
-| `tests/kernels/quantization/test_exl3_moe_prefill_v2.py` | 727 |
+| `tests/kernels/quantization/test_exl3_moe_prefill_v2.py` | 768 |
 | `tests/kernels/quantization/test_exl3_moe_swiglu_clamp.py` | 86 |
 | `tests/kernels/quantization/test_exl3_moe_tp_shapes.py` | 102 |
 | `tests/kernels/quantization/test_exl3_moe_v2.py` | 618 |
@@ -607,7 +607,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **283 files** | **120,165** |
+| **283 files** | **120,206** |
 
 #### `tools/`
 
@@ -632,6 +632,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `csrc/moe/marlin_moe_wna16/kernel.h` | modified | 46 | 0 | 6 |
 | `csrc/moe/marlin_moe_wna16/marlin_template.h` | modified | 320 | 11 | 37 |
 | `csrc/moe/marlin_moe_wna16/ops.cu` | modified | 150 | 4 | 34 |
+| `csrc/quantization/marlin/marlin.cu` | modified | 11 | 1 | 2 |
 | `pyproject.toml` | modified | 1 | 0 | 1 |
 | `setup.py` | modified | 19 | 0 | 5 |
 | `vllm/config/scheduler.py` | modified | 59 | 0 | 4 |
@@ -707,7 +708,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu_model_runner.py` | modified | 7 | 0 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **79 files** | | **3,633** | **253** | **521** |
+| **80 files** | | **3,644** | **254** | **523** |
 
 ### Tests, docs and .github
 
@@ -745,9 +746,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 79 | 3,633 | 253 | 521 |
+| Product code | 80 | 3,644 | 254 | 523 |
 | Tests, docs and .github | 26 | 1,271 | 551 | 88 |
-| All | 105 | 4,904 | 804 | 609 |
+| All | 106 | 4,915 | 805 | 611 |
 
 ## 3. Fork environment variables
 
@@ -931,11 +932,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 221 |
-| Fork-added product lines | 73,212 |
-| Patched upstream files | 105 |
-| Patched upstream lines | +4,904 / -804 |
-| Patched upstream product files | 79 |
-| Patched upstream product lines | +3,633 / -253 |
-| Product lines added (new files and patches) | 76,845 |
+| Fork-added product lines | 73,279 |
+| Patched upstream files | 106 |
+| Patched upstream lines | +4,915 / -805 |
+| Patched upstream product files | 80 |
+| Patched upstream product lines | +3,644 / -254 |
+| Product lines added (new files and patches) | 76,923 |
 | Fork environment variables (flags) | 150 |
 | Unreferenced fork definitions | 7 (59 lines) |
