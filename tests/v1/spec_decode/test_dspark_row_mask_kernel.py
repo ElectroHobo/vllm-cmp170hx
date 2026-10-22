@@ -23,7 +23,10 @@
   past the batch and rows past the maskable span are never written; the
   raw-confidence policy equals the confidence-only rule
   (``E(k) / cost`` on the confidences themselves) wherever that rule's best
-  score leads by more than 1e-5.
+  score leads by more than 1e-5. With a ``p_hat`` output (the host width,
+  half the cases) the kernel writes the numpy reference's ``p_i`` for
+  positions 1 .. 5 whatever K is, nothing past the batch, and the same
+  decisions.
 """
 
 import json
@@ -402,7 +405,8 @@ def interpreted_results() -> dict:
                 row_live = torch.randint(0, 2, (span_tokens,), generator=gen).to(torch.int8)
                 s.row_live.copy_(row_live)
                 s.live_len.fill_(-3)
-                kernel.compute_row_mask(s, idx, b, k)
+                p_hat = torch.full((MAX_REQS, 5), -2.0) if trial in (1, 3) else None
+                kernel.compute_row_mask(s, idx, b, k, p_hat)
                 live_len = s.live_len.tolist()
                 rows = s.row_live.tolist()
                 out.append({
@@ -413,6 +417,7 @@ def interpreted_results() -> dict:
                     "idx": idx.tolist(), "row_live_before": row_live.tolist(),
                     "live_len": live_len, "row_live": rows,
                     "active": s.active,
+                    "p_hat": None if p_hat is None else p_hat.tolist(),
                 })
     return {"cases": out, "span_tokens": span_tokens}
 
@@ -455,6 +460,31 @@ def test_interpreted_kernel_matches_numpy_reference(interpreted):
         assert c["row_live"] == expect, c["case"]
     # d covers every depth 0 .. 7.
     assert seen == set(range(8)), sorted(seen)
+
+
+def np_probs(conf, stats, weights, n, uses_stats):
+    """p_i for positions 1 .. n (float32, the kernel's operation order)."""
+    out = []
+    for k in range(1, n + 1):
+        w = weights[k - 1].astype(F32)
+        z = F32(w[0] + F32(w[1] * np_log_odds(conf[k - 1])))
+        if uses_stats:
+            z = F32(z + F32(w[2] * np_log_odds(stats[0][k - 1])))
+            z = F32(z + F32(w[3] * F32(stats[1][k - 1])))
+        out.append(float(F32(F32(1.0) / F32(F32(1.0) + np.exp(F32(-z))))))
+    return out
+
+
+def test_interpreted_p_hat(interpreted):
+    with_p = [c for c in interpreted["cases"] if c["p_hat"] is not None]
+    assert len(with_p) == len(interpreted["cases"]) // 2
+    for c in with_p:
+        _, b, k, _ = c["case"]
+        weights = np.asarray(c["weights"], dtype=F32)
+        for r, slot in enumerate(c["idx"]):
+            want = np_probs(c["conf"][slot], c["stats"][slot], weights, 5, c["uses_stats"])
+            np.testing.assert_allclose(c["p_hat"][r], want, rtol=2e-6, err_msg=str(c["case"]))
+        assert c["p_hat"][b:] == [[-2.0] * 5] * (MAX_REQS - b), c["case"]
 
 
 def test_raw_confidence_policy_is_the_confidence_rule(interpreted):

@@ -55,6 +55,11 @@ Batch sizes not listed are interpolated linearly between the nearest listed
 ones on the k both list (the nearest one outside them). Every batch size the
 speculative config's per-batch-size draft counts reach must have ``T_b(k)``
 for k = 0 .. K(b).
+
+An optional ``host_width`` block has the scheduler choose the step's
+verified width K from each request's ``p_i`` of an earlier round
+(``dspark_host_width``); the decision kernel then also returns every
+request's ``p_i`` for the block's widest K.
 """
 
 from __future__ import annotations
@@ -94,6 +99,9 @@ class DepthPolicy:
     # cost rule (always at b = 1, and everywhere without "tau").
     tau: torch.Tensor
     uses_stats: bool
+    # Positions of p_i the kernel returns per request for the host width
+    # (0: no host width).
+    p_hat_width: int = 0
 
 
 def _costs_by_batch(path, raw) -> dict[int, list[float]]:
@@ -198,11 +206,22 @@ def load_policy(
                 w = 0.0 if hi == lo else (b - lo) / (hi - lo)
                 t = given[lo] + (given[hi] - given[lo]) * w
             tau[b] = t
+    p_hat_width = 0
+    if raw.get("host_width") is not None:
+        from vllm.sm80.spec_decode.dspark_host_width import parse_host_width
+
+        p_hat_width = parse_host_width(path, raw).width
+        if p_hat_width > max_draft:
+            raise ValueError(
+                f"{path}: host_width chooses K up to {p_hat_width}, past the "
+                f"drafter's {max_draft} drafts"
+            )
     return DepthPolicy(
         weights=table,
         cost=cost,
         tau=tau,
         uses_stats=any(f in STATS_FEATURES for f in features),
+        p_hat_width=p_hat_width,
     )
 
 
@@ -236,6 +255,11 @@ class RowMaskState:
     # cleared when the rows are reset to live).
     active: bool = False
     uses_stats: bool = False
+    # Host width: positions of p_i returned per request (0: off), and this
+    # step's [num_reqs, p_hat_width] output (None on a step without the
+    # kernel); the step's async output takes it (take_p_hat).
+    p_hat_width: int = 0
+    p_hat_step: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         d = self.device
@@ -262,6 +286,12 @@ class RowMaskState:
         self.cost.copy_(policy.cost)
         self.tau.copy_(policy.tau)
         self.uses_stats = policy.uses_stats
+        self.p_hat_width = policy.p_hat_width
+
+    def take_p_hat(self) -> torch.Tensor | None:
+        """This step's p_hat, once."""
+        p_hat, self.p_hat_step = self.p_hat_step, None
+        return p_hat
 
     def reset_live(self) -> None:
         """Every row live again (no-op unless a mask was applied)."""
@@ -307,6 +337,10 @@ def init_row_mask_state(
     )
     state = RowMaskState(max_num_reqs, max_num_tokens, max_draft, torch.device(device))
     state.set_policy(policy)
+    if policy.p_hat_width:
+        from vllm.sm80.spec_decode.dspark_host_width import install_output_copy
+
+        install_output_copy()
     _STATE = state
     logger.info(
         "DSpark adaptive depth on (%s=%s): %d drafts, %d request slots%s",
@@ -314,7 +348,8 @@ def init_row_mask_state(
         envs.VLLM_DSPARK_ADAPTIVE_DEPTH,
         max_draft,
         max_num_reqs,
-        ", draft-logit features" if policy.uses_stats else "",
+        (", draft-logit features" if policy.uses_stats else "")
+        + (f", p_i 1..{policy.p_hat_width} to the host width" if policy.p_hat_width else ""),
     )
     return state
 

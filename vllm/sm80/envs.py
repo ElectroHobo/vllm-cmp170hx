@@ -569,7 +569,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # request's acceptance history, against the step cost table) makes worth
     # verifying; the rows past them take no routed expert and their drafts
     # count as rejected (dspark_row_mask.py). Greedy output is the unmasked
-    # output truncated at the kept drafts. Empty: off.
+    # output truncated at the kept drafts. A host_width block in the file also
+    # has the scheduler choose each step's verified width from the requests'
+    # earlier rounds (dspark_host_width.py). Empty: off.
     "VLLM_DSPARK_ADAPTIVE_DEPTH": lambda: os.getenv("VLLM_DSPARK_ADAPTIVE_DEPTH", ""),
     # Trial: DSpark verify width from each request's last verified round, per
     # load (vllm/sm80/spec_decode/dspark_depth_hint.py); empty is off.

@@ -176,8 +176,11 @@ def register() -> None:
     register_moe_layers()
     log_marlin_decode_v2_gate()
     from vllm.sm80.spec_decode.dspark_depth_hint import install as install_depth_hint
+    from vllm.sm80.spec_decode.dspark_host_width import install as install_host_width
 
     install_depth_hint()
+    # After the hint: the host width runs on the width the hint chose.
+    install_host_width()
 
 
 def is_registered() -> bool:
