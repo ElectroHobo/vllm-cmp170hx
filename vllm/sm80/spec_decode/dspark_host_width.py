@@ -20,8 +20,8 @@ first rounds, placeholder drafts, or a round without the decision kernel:
 prefill rows or mixed draft counts). Inside the step the decision kernel
 picks each request's live depth as at any b. Steps with a prefill row and
 batch sizes outside the block keep the width the load (and
-``VLLM_DSPARK_DEPTH_HINT``) gave; the host width never verifies more than
-that width or the drafts on hand.
+``VLLM_DSPARK_DEPTH_HINT``) gave; the host width chooses among the K at most
+that width and the drafts on hand.
 
 Why a round back: under async scheduling the scheduler fixes step n's shape
 while step n - 1 runs, with the outputs of steps up to n - 2 processed, so
@@ -41,7 +41,9 @@ No upstream file changes:
   ``p_i``), ``Scheduler._select_adaptive_k`` (the width) and
   ``AdaptiveKPolicy.mark_padded`` / ``forget``.
 
-It needs ``speculative_config.adaptive_k``. The first step refuses a K choice
+Pipeline parallelism is refused, and a forced calibration depth
+(``VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE``) is left as forced. It needs
+``speculative_config.adaptive_k``. The first step refuses a K choice
 without CUDA graphs: one adaptive_k does not capture up to the largest batch
 size (``by_load`` lists it), or a ``cudagraph_capture_sizes`` without
 b * (K + 1) for a batch size b of the block.
@@ -207,12 +209,17 @@ def _expected(q, d: int) -> float:
     return e
 
 
-def choose_width(hw: HostWidth, b: int, estimates) -> int:
-    """The K of ``hw.k_choices`` for a b-request step whose requests' p_i
-    (each at least ``hw.width`` positions) are ``estimates``."""
+def choose_width(hw: HostWidth, b: int, estimates, cap: int | None = None) -> int:
+    """The K of ``hw.k_choices`` (those at most ``cap``) for a b-request step
+    whose requests' p_i (each at least ``hw.width`` positions) are
+    ``estimates``; ``cap`` when no choice is that narrow."""
     cum, t0, tau, share = hw.cum[b], hw.t0[b], hw.tau[b], hw.share[b]
-    best, best_k = None, hw.k_choices[0]
-    for k in hw.k_choices:
+    choices = [k for k in hw.k_choices if cap is None or k <= cap]
+    if not choices:
+        assert cap is not None
+        return cap
+    best, best_k = None, choices[0]
+    for k in choices:
         depths = [_depth(q, k, tau) for q in estimates]
         tokens = sum(_expected(q, d) for q, d in zip(estimates, depths))
         ms = t0 + b * cum[k] - (1.0 - share[k]) * sum(cum[k] - cum[d] for d in depths)
@@ -308,7 +315,14 @@ def _rounds(policy, hw: HostWidth) -> _Rounds:
 
 
 def _check_captured(scheduler, hw: HostWidth) -> None:
-    """Refuse a K choice without CUDA graphs at some batch size of the block."""
+    """Refuse a K choice without CUDA graphs at some batch size of the block,
+    and pipeline parallelism (a micro-batch decodes part of the running
+    requests, which the rule would cost as all of them)."""
+    if scheduler.vllm_config.parallel_config.pipeline_parallel_size > 1:
+        raise ValueError(
+            "VLLM_DSPARK_ADAPTIVE_DEPTH: host_width does not serve pipeline "
+            "parallelism (each micro-batch decodes part of the running requests)"
+        )
     config = scheduler.adaptive_k.config
     max_reqs = scheduler.max_num_running_reqs
     sizes = [b for b in sorted(hw.batch_sizes) if b <= max_reqs]
@@ -373,13 +387,18 @@ def install() -> None:
         b = len(running)
         if b not in hw.batch_sizes or any(r.is_prefill_chunk for r in running):
             return k_verify, k_draft
+        if self._forced_depth() is not None:
+            # Step-cost calibration: the forced depth stands.
+            return k_verify, k_draft
         rounds = _rounds(self.adaptive_k, hw)
         if not rounds.checked:
             _check_captured(self, hw)
             rounds.checked = True
         estimates = rounds.estimates(running)
-        k = hw.fallback_k if estimates is None else choose_width(hw, b, estimates)
-        k = min(k, k_verify)
+        if estimates is None:
+            k = min(hw.fallback_k, k_verify)
+        else:
+            k = choose_width(hw, b, estimates, cap=k_verify)
         for request in running:
             if len(request.spec_token_ids) > k:
                 # Rebind: AsyncScheduler shares one placeholder list.

@@ -13,8 +13,9 @@
   back (two: the round before the step in flight), falls back without it
   (first rounds, placeholder drafts, a step whose output carried no p_i, a
   forgotten request), leaves other batch sizes and prefill steps alone, never
-  verifies more than the drafts on hand, and refuses K choices without CUDA
-  graphs.
+  verifies more than the drafts on hand (the best K within the cap, not the
+  capped best), leaves a forced calibration depth alone, and refuses K
+  choices without CUDA graphs and pipeline parallelism.
 - The kernel's torch reference returns p_i past K without changing the
   decision; ``begin_step`` exposes them only for a uniform step.
 """
@@ -73,6 +74,21 @@ def test_hand_computed_edges(hw):
     free = parse_host_width("cases", raw)
     # Dead rows free and no request keeps a draft: every K costs t0 exactly.
     assert choose_width(free, 4, [[1e-3] * 5] * 4) == 1
+
+
+def test_best_k_within_the_cap():
+    # K5 scores best overall; under a cap of 3, K1 beats K3 (not min(5, 3)).
+    raw = block()
+    raw["host_width"]["t0_ms"]["4"] = 10.0
+    raw["host_width"]["cum_ms"]["4"] = [0.0, 0.1, 3.0, 3.0, 3.0, 3.0]
+    raw["host_width"]["s"]["4"] = {str(k): 0.0 for k in range(1, 6)}
+    hw = parse_host_width("cases", raw)
+    q = [[0.9] * 5] * 4
+    assert choose_width(hw, 4, q) == 5
+    assert choose_width(hw, 4, q, cap=3) == 1
+    raw["host_width"]["k_choices"] = [2, 5]
+    raw["host_width"]["fallback_k"] = 5
+    assert choose_width(parse_host_width("cases", raw), 4, q, cap=1) == 1
 
 
 def test_one_formula(hw):
@@ -173,7 +189,7 @@ class Engine:
     schedule (its width choice, then its output) and returns the width and
     the step's output; ``done(output, p_hat)`` processes a step's output."""
 
-    def __init__(self, monkeypatch, tmp_path, by_load=BY_LOAD, capture=CAPTURE):
+    def __init__(self, monkeypatch, tmp_path, by_load=BY_LOAD, capture=CAPTURE, pp=1):
         from vllm.sm80.spec_decode.adaptive_k import AdaptiveKConfig, AdaptiveKPolicy
         from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -217,7 +233,10 @@ class Engine:
             adaptive_k=self.policy,
             _forced_depth=lambda: None,
             max_num_running_reqs=8,
-            vllm_config=S(compilation_config=S(cudagraph_capture_sizes=capture)),
+            vllm_config=S(
+                compilation_config=S(cudagraph_capture_sizes=capture),
+                parallel_config=S(pipeline_parallel_size=pp),
+            ),
             pad=set(),
         )
 
@@ -314,6 +333,21 @@ def test_other_steps_keep_their_width(monkeypatch, tmp_path):
     (k, _), _ = e.step(run)
     assert k == 3  # never past the drafts on hand
     assert [len(r.spec_token_ids) for r in run] == [3, 3, 3]
+
+
+def test_forced_depth_stands(monkeypatch, tmp_path):
+    e = Engine(monkeypatch, tmp_path)
+    for _ in range(2):
+        _, out = e.step(_running(3))
+        e.done(out, {r: LOW for r in "abc"})
+    e.sched._forced_depth = lambda: 5
+    assert e.step(_running(3))[0][0] == 5
+
+
+def test_pipeline_parallel_refuses(monkeypatch, tmp_path):
+    e = Engine(monkeypatch, tmp_path, pp=2)
+    with pytest.raises(ValueError, match="pipeline"):
+        e.step(_running(3))
 
 
 @pytest.mark.parametrize(
