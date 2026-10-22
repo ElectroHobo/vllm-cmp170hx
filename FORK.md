@@ -585,7 +585,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/spec_decode/test_adaptive_k.py` | 223 |
 | `tests/v1/spec_decode/test_dspark_confidence_dump.py` | 308 |
 | `tests/v1/spec_decode/test_dspark_depth_hint.py` | 162 |
-| `tests/v1/spec_decode/test_dspark_host_width.py` | 437 |
+| `tests/v1/spec_decode/test_dspark_host_width.py` | 443 |
 | `tests/v1/spec_decode/test_dspark_host_width_gpu.py` | 124 |
 | `tests/v1/spec_decode/test_dspark_row_mask_conf.py` | 475 |
 | `tests/v1/spec_decode/test_dspark_row_mask_gpu.py` | 294 |
@@ -607,7 +607,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **283 files** | **120,129** |
+| **283 files** | **120,135** |
 
 #### `tools/`
 

@@ -162,13 +162,13 @@ def test_policy_load(tmp_path, monkeypatch):
         dspark_row_mask.load_policy(path, 8, 4, [0] + [4] * 8)
     plain = _policy(tmp_path, with_block=False)
     assert dspark_row_mask.load_policy(plain, 8, 7, [0] + [7] * 8).p_hat_width == 0
-    monkeypatch.setenv("VLLM_DSPARK_ADAPTIVE_DEPTH", str(plain))
+    monkeypatch.setattr(hw_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", str(plain))
     hw_module.configured.cache_clear()
     assert hw_module.configured() is None
-    monkeypatch.setenv("VLLM_DSPARK_ADAPTIVE_DEPTH", str(path))
+    monkeypatch.setattr(hw_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", str(path))
     hw_module.configured.cache_clear()
     assert hw_module.configured().k_choices == (1, 2, 3, 4, 5)
-    monkeypatch.delenv("VLLM_DSPARK_ADAPTIVE_DEPTH")
+    monkeypatch.setattr(hw_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", "")
     hw_module.configured.cache_clear()
     assert hw_module.configured() is None
 
@@ -216,12 +216,14 @@ class Engine:
 
         monkeypatch.setattr(Scheduler, "schedule", schedule)
         monkeypatch.setattr(Scheduler, "update_from_output", lambda sched, so, mro: "updated")
-        monkeypatch.setenv("VLLM_DSPARK_ADAPTIVE_DEPTH", str(_policy(tmp_path)))
+        monkeypatch.setattr(
+            hw_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", str(_policy(tmp_path))
+        )
         hw_module.configured.cache_clear()
         hw_module.install()
         hw_module.install()
         assert Scheduler._select_adaptive_k._dspark_host_width
-        monkeypatch.delenv("VLLM_DSPARK_ADAPTIVE_DEPTH")
+        monkeypatch.setattr(hw_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", "")
         hw_module.configured.cache_clear()
         config = AdaptiveKConfig.from_dict({"by_load": by_load, "draft_by_load": True}, 7)
         self.policy = AdaptiveKPolicy(config)
@@ -367,7 +369,11 @@ def test_off_installs_nothing(monkeypatch, tmp_path):
     from vllm.v1.core.sched.scheduler import Scheduler
 
     monkeypatch.setattr(Scheduler, "_select_adaptive_k", Scheduler._select_adaptive_k)
-    monkeypatch.setenv("VLLM_DSPARK_ADAPTIVE_DEPTH", str(_policy(tmp_path, with_block=False)))
+    monkeypatch.setattr(
+        hw_module.envs,
+        "VLLM_DSPARK_ADAPTIVE_DEPTH",
+        str(_policy(tmp_path, with_block=False)),
+    )
     hw_module.configured.cache_clear()
     hw_module.install()
     assert not getattr(Scheduler._select_adaptive_k, "_dspark_host_width", False)
