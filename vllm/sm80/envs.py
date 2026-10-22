@@ -108,6 +108,9 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2: bool = False
     VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM: bool = False
+    VLLM_TRY_ROUTER: bool = False
+    VLLM_TRY_MOE_V2: bool = False
+    VLLM_TRY_MOE_PREFILL: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
     VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
@@ -992,6 +995,16 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM", "0"))
     ),
+    # Trial kernels, each read with os.environ where
+    # it is used ("1" turns it on); declared here so a launch may set them.
+    # Default OFF. VLLM_TRY_ROUTER: MoE gate and routing on the BF16 tensor
+    # cores (sm80_moe.py, ops/sm80_router_mma.py; needs FUSED_ROUTE and
+    # GATE_GEMV). VLLM_TRY_MOE_V2: one-launch moe_out_v2_try for the target's
+    # expert-parallel layers. VLLM_TRY_MOE_PREFILL: one launch sequence per
+    # moe_out_prefill_v2 call (vllm/sm80/kernels/exl3/ops.py).
+    "VLLM_TRY_ROUTER": lambda: os.getenv("VLLM_TRY_ROUTER", "0") == "1",
+    "VLLM_TRY_MOE_V2": lambda: os.getenv("VLLM_TRY_MOE_V2", "0") == "1",
+    "VLLM_TRY_MOE_PREFILL": lambda: os.getenv("VLLM_TRY_MOE_PREFILL", "0") == "1",
     # DeepSeek-V4.1 on sm_80: the MoE routing after the FP32 gate GEMM
     # (sqrt-softplus, bias select and add, top-k, gather, renormalisation,
     # scale, int32 ids: fifteen torch kernels per layer) as one Triton kernel
