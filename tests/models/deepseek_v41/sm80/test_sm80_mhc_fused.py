@@ -295,6 +295,8 @@ def test_kernels_compile_for_sm80():
               dict(base, BM=decode.BM_A, NW=decode.WARPS_GLU, HAS_POST=has_post))
     ks = hidden // decode.HB_GLU
     for has_pre, has_norm in ((True, True), (False, True), (True, False)):
+        # PART given: a compile from source takes no default (the launch's
+        # does); the parts launched apart are test_sm80_mhc_side.py's
         build(ASTSource, fused._delayed_finish_kernel, f_types,
               dict(HIDDEN=hidden, KS=ks, KSP2=triton.next_power_of_2(ks), SINK=20,
-                   HAS_PRE_IN=has_pre, HAS_NORM=has_norm, BH=fused._BH, ACCURATE=True))
+                   HAS_PRE_IN=has_pre, HAS_NORM=has_norm, BH=fused._BH, ACCURATE=True, PART=0))

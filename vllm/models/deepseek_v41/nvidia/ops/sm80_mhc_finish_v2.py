@@ -37,11 +37,16 @@ sum), then the RMSNorm in FP32, its statistic from that BF16 value and
 stream and norm-weight loads issued first, the BF16 collapse parked in shared
 memory for the scaling.
 
+``PART`` 1 or 2 launches only the coefficient or only the layer-input CTA of
+each row (grid (tokens, 1)), as the Triton finish does
+(``VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM``, ``ops/sm80_mhc_side.py``).
+
 CUDA graphs: :data:`FINISH_V2_WARMUP` compiles every specialisation the
 wrappers can launch on this path before capture (registered by ``mhc_ops``
 in ``sm80_model.py``); the kernels keep no state and allocate nothing.
 """
 
+import contextlib
 from dataclasses import dataclass
 
 import torch
@@ -138,13 +143,20 @@ def _delayed_finish_v2_kernel(
     rms_eps, hc_eps, post_mult, norm_eps,
     HIDDEN: gl.constexpr, KS: gl.constexpr, KA: gl.constexpr, KB: gl.constexpr, SINK: gl.constexpr,
     HAS_PRE_IN: gl.constexpr, HAS_NORM: gl.constexpr, BH: gl.constexpr,
+    PART: gl.constexpr = 0,
 ):
     NW: gl.constexpr = 4
     HC: gl.constexpr = 4
     NO: gl.constexpr = 24
     f64: gl.constexpr = gl.float64
     m = gl.program_id(0)
-    if gl.program_id(1) == 0:
+    # PART 0: CTA (m, 0) the coefficients, (m, 1) the layer input; PART 1 or
+    # 2: only the coefficient or only the layer-input CTA of row m
+    if PART == 0:
+        coefficients = gl.program_id(1) == 0
+    else:
+        coefficients = PART == 1
+    if coefficients:
         # The KS partial rows in two tiles, KA (a power of two) + KB (the rest, padded to a
         # power of two), so a warp converts no more padded rows than needed: [NW, KA/NW, 32]
         # and [NW, KB/NW, 32], warp w holding rows w*KA/NW .. of each, a thread 4 columns;
@@ -323,11 +335,13 @@ def delayed_finish_v2(
     sinkhorn_repeat: int,
     has_pre_in: bool,
     has_norm: bool,
+    part: int = 0,
 ) -> None:
     """The finish v2 into ``post``, ``comb``, ``next_pre`` and ``layer_input``,
-    the arguments of the served finish kernel (``sm80_mhc_fused._delayed``)."""
+    the arguments of the served finish kernel (``sm80_mhc_fused._delayed``);
+    ``part`` as its ``PART``."""
     ksb, T = mix.shape[0], mix.shape[1]
-    _delayed_finish_v2_kernel[(T, 2)](
+    _delayed_finish_v2_kernel[(T, 2 if part == 0 else 1)](
         mix, sqr, hc_scale, hc_base, rc, pre_in, nw,
         post, comb, next_pre, layer_input, T,
         float(rms_eps), float(hc_eps), float(hc_post_mult_value), float(norm_eps),
@@ -339,6 +353,7 @@ def delayed_finish_v2(
         HAS_PRE_IN=has_pre_in,
         HAS_NORM=has_norm,
         BH=BH_FIN,
+        PART=part,
         num_warps=4,
     )
 
@@ -359,6 +374,7 @@ class FinishV2Warmup(VllmJitKernel["FinishV2Warmup.Key"]):
         return [self.Key(r) for r in sorted(rows.union(WARMUP_ROWS))]
 
     def compile(self, compile_key: "FinishV2Warmup.Key") -> None:
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side
         from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused as fused
 
         if not (fused.FINISH_V2 and fused.FINISH_KERNEL):
@@ -379,17 +395,24 @@ class FinishV2Warmup(VllmJitKernel["FinishV2Warmup.Key"]):
         residual = torch.zeros(T, hc, HIDDEN, dtype=bf16, device=dev)
         norm = torch.ones(HIDDEN, dtype=bf16, device=dev)
         carried = torch.full((T, hc), 0.25, dtype=torch.float32, device=dev)
-        for pre_mix in (None, carried):
-            fused.mhc_pre_delayed(residual, *common, pre_mix=pre_mix, norm_weight=norm)
-            fused.mhc_fused_post_pre_delayed(
-                torch.zeros(T, HIDDEN, dtype=bf16, device=dev),
-                residual,
-                torch.ones(T, hc, 1, dtype=torch.float32, device=dev),
-                torch.full((T, hc, hc), 0.25, dtype=torch.float32, device=dev),
-                *common,
-                pre_mix=pre_mix,
-                norm_weight=norm,
-            )
+        # with VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM also the two kinds of CTA
+        # launched apart, as inside a decoder layer's forward
+        scopes = [contextlib.nullcontext()]
+        if sm80_mhc_side.ACTIVE:
+            scopes.append(sm80_mhc_side.LAYER)
+        for scope in scopes:
+            with scope:
+                for pre_mix in (None, carried):
+                    fused.mhc_pre_delayed(residual, *common, pre_mix=pre_mix, norm_weight=norm)
+                    fused.mhc_fused_post_pre_delayed(
+                        torch.zeros(T, HIDDEN, dtype=bf16, device=dev),
+                        residual,
+                        torch.ones(T, hc, 1, dtype=torch.float32, device=dev),
+                        torch.full((T, hc, hc), 0.25, dtype=torch.float32, device=dev),
+                        *common,
+                        pre_mix=pre_mix,
+                        norm_weight=norm,
+                    )
         torch.cuda.synchronize(dev)
 
 

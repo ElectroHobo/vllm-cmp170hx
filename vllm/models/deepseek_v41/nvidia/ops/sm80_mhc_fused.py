@@ -49,6 +49,12 @@ finish, in Triton:
   the RMSNorm in FP32 as torch does, its statistic from that BF16 value and
   ``weight * x`` rounded to BF16. The two CTAs share nothing.
 
+``PART`` 1 or 2 launches only the coefficient or only the layer-input CTA of
+each row (grid ``(tokens, 1)``): with ``VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM`` a
+decoder layer's call of up to 64 rows launches the two apart, the coefficients
+beside the sublayer's all-reduce (``ops/sm80_mhc_side.py``). Both finish
+kernels take it.
+
 With ``VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2`` (and the finish kernel
 selected) a call inside the validated configuration (hidden 5120, 20
 Sinkhorn iterations, up to 2048 rows, with the norm, sm_80; :func:`finish_v2_unavailable`
@@ -73,6 +79,7 @@ from triton.language.extra import libdevice
 import vllm.envs as envs
 from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
 from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_finish_v2 as finish_v2
+from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side
 from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
 from vllm.sm80.kernels.mhc.decode import HB_GLU, post_prenorm
 from vllm.triton_utils import tl, triton
@@ -94,6 +101,9 @@ _BH = 1024
 # libdevice's exp on CUDA; the Triton interpreter (CPU tests)
 # has no libdevice and takes tl.exp.
 _ACCURATE_EXP = os.environ.get("TRITON_INTERPRET", "0") != "1"
+# The CTAs a finish launch runs: each row's two (grid (T, 2)), or only its
+# coefficient or only its layer-input CTA (grid (T, 1)).
+PART_BOTH, PART_COEFFICIENTS, PART_LAYER_INPUT = 0, 1, 2
 
 
 def supports(hc_mult: int, hidden_size: int) -> str | None:
@@ -179,11 +189,18 @@ def _delayed_finish_kernel(
     HAS_NORM: tl.constexpr,
     BH: tl.constexpr,
     ACCURATE: tl.constexpr,
+    PART: tl.constexpr = 0,
 ):
     HCK: tl.constexpr = 4
     NO: tl.constexpr = 24
     m = tl.program_id(0)
-    if tl.program_id(1) == 0:
+    # PART 0: CTA (m, 0) the coefficients, (m, 1) the layer input; PART 1 or
+    # 2: only the coefficient or only the layer-input CTA of row m
+    if PART == 0:
+        coefficients = tl.program_id(1) == 0
+    else:
+        coefficients = PART == 1
+    if coefficients:
         k = tl.arange(0, KSP2)
         kmask = k < KS
         rows = k * M + m
@@ -348,6 +365,8 @@ def _delayed(
     assert residual.dtype == torch.bfloat16, residual.dtype
     assert fn.dtype == torch.float32 and fn.shape == (NOUT, hc * hidden), (fn.dtype, fn.shape)
     assert hc_scale.dtype == torch.float32 and hc_base.dtype == torch.float32
+    # a previous call's deferred coefficients, before kernel A reads them
+    sm80_mhc_side.flush()
     dev = residual.device
     res = residual.contiguous()
     post = torch.empty(T, hc, 1, dtype=torch.float32, device=dev)
@@ -420,12 +439,39 @@ def _delayed(
     else:
         pre_in = next_pre  # not read
     nw = layer_input if norm_weight is None else norm_weight.contiguous()
-    if v2:
-        finish_v2.delayed_finish_v2(
+    scale, base = hc_scale.contiguous(), hc_base.contiguous()
+
+    def finish(part: int) -> None:
+        """The finish's CTAs of ``part`` (:data:`PART_BOTH`: the launch as
+        before the option)."""
+        if v2:
+            finish_v2.delayed_finish_v2(
+                mix,
+                sqr,
+                scale,
+                base,
+                rc,
+                pre_in,
+                nw,
+                post,
+                comb,
+                next_pre,
+                layer_input,
+                rms_eps,
+                hc_pre_eps,
+                hc_post_mult_value,
+                norm_eps,
+                sinkhorn_repeat,
+                has_pre_in=pre_mix is not None,
+                has_norm=norm_weight is not None,
+                **({} if part == PART_BOTH else {"part": part}),
+            )
+            return
+        _delayed_finish_kernel[(T, 2 if part == PART_BOTH else 1)](
             mix,
             sqr,
-            hc_scale.contiguous(),
-            hc_base.contiguous(),
+            scale,
+            base,
             rc,
             pre_in,
             nw,
@@ -433,42 +479,30 @@ def _delayed(
             comb,
             next_pre,
             layer_input,
-            rms_eps,
-            hc_pre_eps,
-            hc_post_mult_value,
-            norm_eps,
-            sinkhorn_repeat,
-            has_pre_in=pre_mix is not None,
-            has_norm=norm_weight is not None,
+            T,
+            float(rms_eps),
+            float(hc_pre_eps),
+            float(hc_post_mult_value),
+            float(norm_eps),
+            HIDDEN=hidden,
+            KS=ksb,
+            KSP2=triton.next_power_of_2(ksb),
+            SINK=int(sinkhorn_repeat),
+            HAS_PRE_IN=pre_mix is not None,
+            HAS_NORM=norm_weight is not None,
+            BH=_BH,
+            ACCURATE=_ACCURATE_EXP,
+            num_warps=4,
+            **({} if part == PART_BOTH else {"PART": part}),
         )
-        return streams, post, comb, layer_input, next_pre
-    _delayed_finish_kernel[(T, 2)](
-        mix,
-        sqr,
-        hc_scale.contiguous(),
-        hc_base.contiguous(),
-        rc,
-        pre_in,
-        nw,
-        post,
-        comb,
-        next_pre,
-        layer_input,
-        T,
-        float(rms_eps),
-        float(hc_pre_eps),
-        float(hc_post_mult_value),
-        float(norm_eps),
-        HIDDEN=hidden,
-        KS=ksb,
-        KSP2=triton.next_power_of_2(ksb),
-        SINK=int(sinkhorn_repeat),
-        HAS_PRE_IN=pre_mix is not None,
-        HAS_NORM=norm_weight is not None,
-        BH=_BH,
-        ACCURATE=_ACCURATE_EXP,
-        num_warps=4,
-    )
+
+    if sm80_mhc_side.defers(T, dev):
+        # the sublayer reads only the layer input; the coefficients go beside
+        # its all-reduce (ops/sm80_mhc_side.py)
+        finish(PART_LAYER_INPUT)
+        sm80_mhc_side.defer(lambda: finish(PART_COEFFICIENTS))
+    else:
+        finish(PART_BOTH)
     return streams, post, comb, layer_input, next_pre
 
 

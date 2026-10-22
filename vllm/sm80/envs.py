@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2: bool = False
+    VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
     VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
@@ -980,6 +981,16 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
     "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: inside a decoder layer's forward,
+    # the mHC finish's coefficient CTAs (post, comb with its Sinkhorn, the next
+    # pre-mix: first read at the next sublayer boundary) of up to 64 rows run on
+    # a side stream beside the sublayer's TP all-reduce, forked as it starts and
+    # joined as it returns; the layer-input CTAs stay in place. Same kernels and
+    # inputs, so the same bytes. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_side.py.
+    "VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the MoE routing after the FP32 gate GEMM
     # (sqrt-softplus, bias select and add, top-k, gather, renormalisation,

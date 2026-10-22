@@ -47,6 +47,7 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.sm80.kernels.exl3.quant import set_moe_prefill_v2
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv, sm80_route, sm80_router_mma
+from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side
 from vllm.models.deepseek_v41.nvidia.sm80_attention import (
     large_round_once_all_reduce,
     prefill_all_reduce,
@@ -368,10 +369,12 @@ class Sm80DeepseekV41MoE(upstream_model.DeepseekV4MoE):
         return super().forward(hidden_states, input_ids, mega_gate_metadata)
 
     def reduce(self, out: torch.Tensor) -> torch.Tensor:
-        """The TP all-reduce of :meth:`forward_partial`'s output."""
+        """The TP all-reduce of :meth:`forward_partial`'s output, with the mHC
+        coefficients the decoder layer deferred beside it
+        (``ops/sm80_mhc_side.py``)."""
         if self._round_once:
-            return moe_all_reduce(out)
-        return prefill_all_reduce(out)
+            return sm80_mhc_side.beside(moe_all_reduce, out)
+        return sm80_mhc_side.beside(prefill_all_reduce, out)
 
 
 def _adopt_layer_all_reduce(ffn: nn.Module, *, round_once: bool) -> None:

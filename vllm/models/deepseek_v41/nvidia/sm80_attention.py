@@ -57,6 +57,7 @@ from vllm.models.deepseek_v41.attention import (
 )
 from vllm.models.deepseek_v41.nvidia import sm80_swa_meta_batch
 from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_core as core
+from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLABackend,
     DeepseekV41SparseSWAMetadataBuilder,
@@ -901,9 +902,11 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         return wo_b.quant_method.apply(wo_b, self._wo_a_proj(attn_out), None)
 
     def reduce_wo_b(self, partial: torch.Tensor) -> torch.Tensor:
-        """The TP all-reduce of :meth:`wo_b_partial`'s output."""
-        return wo_b_all_reduce(
-            partial, self._wo_b_bf16_allreduce, self._wo_b_bf16_pieces
+        """The TP all-reduce of :meth:`wo_b_partial`'s output, with the mHC
+        coefficients the decoder layer deferred beside it
+        (``ops/sm80_mhc_side.py``)."""
+        return sm80_mhc_side.beside(
+            wo_b_all_reduce, partial, self._wo_b_bf16_allreduce, self._wo_b_bf16_pieces
         )
 
 

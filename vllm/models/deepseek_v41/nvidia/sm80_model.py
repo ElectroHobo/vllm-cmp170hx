@@ -54,6 +54,7 @@ from vllm.models.deepseek_v41.nvidia import dspark as upstream_dspark
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
+from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side
 from vllm.sm80 import capture
 from vllm.models.deepseek_v41.nvidia.ops.sm80_mhc import mhc_post
 from vllm.models.deepseek_v41.nvidia import sm80_split_reduce
@@ -124,10 +125,15 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
     boundary is the previous sublayer's post fused with the next delayed pre.
     With ``_split_reduce`` (VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE) an eager
     step of enough rows runs everything after the attention in two row slices
-    (``sm80_split_reduce.py``).
+    (``sm80_split_reduce.py``). With ``_mhc_side``
+    (VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM) the forward runs inside
+    ``sm80_mhc_side.LAYER``: the mHC finish's coefficient CTAs go beside the
+    sublayers' all-reduces (``ops/sm80_mhc_side.py``).
     """
 
     _split_reduce: bool = False
+    # sm80_mhc_side.LAYER, or None
+    _mhc_side = None
 
     @classmethod
     def adopt(cls, layer: upstream_model.DeepseekV4DecoderLayer, config) -> None:
@@ -144,6 +150,8 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
         layer._mhc_ops = mhc_ops(config)
         if capture.active:
             layer._mhc_ops = _CapturedMhc(layer._mhc_ops, layer)
+        if sm80_mhc_side.ACTIVE:
+            layer._mhc_side = sm80_mhc_side.layer_scope(layer._mhc_ops)
 
     def _mixes(self, attn: bool) -> tuple:
         if attn:
@@ -161,7 +169,14 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
             self.hc_sinkhorn_iters,
         )
 
-    def forward(
+    def forward(self, *args, **kwargs):
+        """:meth:`_forward_layer`, inside ``_mhc_side`` when it is set."""
+        if self._mhc_side is None:
+            return self._forward_layer(*args, **kwargs)
+        with self._mhc_side:
+            return self._forward_layer(*args, **kwargs)
+
+    def _forward_layer(
         self,
         x,
         positions: torch.Tensor,

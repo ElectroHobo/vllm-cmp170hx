@@ -341,7 +341,9 @@ def test_finish_v2_compiles_for_sm80():
                  hc_eps="fp32", post_mult="fp32", norm_eps="fp32")
     for has_pre in (True, False):
         for M in (6, 32):
+            # PART given: a compile from source takes no default (the launch's
+            # does); the parts launched apart are test_sm80_mhc_side.py's
             c = _compile(finish_v2._delayed_finish_v2_kernel, types,
                          dict(HIDDEN=HIDDEN, KS=160, KA=128, KB=32, SINK=20, HAS_PRE_IN=has_pre,
-                              HAS_NORM=True, BH=finish_v2.BH_FIN), M)
+                              HAS_NORM=True, BH=finish_v2.BH_FIN, PART=0), M)
             assert c.asm["cubin"]
