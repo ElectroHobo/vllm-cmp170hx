@@ -111,7 +111,11 @@ def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
                     cost = 20.0 + steps.cumsum(1)
                     cost[0] = 0.0
                     rows = torch.randint(0, 2, (MAX_TOKENS,), generator=gen, dtype=torch.int8)
+                    tau = torch.zeros(MAX_REQS + 1)
+                    if trial == 1:
+                        tau[2:] = torch.rand(MAX_REQS - 1, generator=gen) * 0.8 + 0.05
                     for s in (state, ref):
+                        s.tau.copy_(tau)
                         s.conf_by_slot.copy_(conf)
                         s.stats_by_slot.copy_(stats)
                         s.weights.copy_(weights)
@@ -119,15 +123,15 @@ def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
                         s.row_live.copy_(rows)
                         s.live_len.fill_(-3)
                     idx.copy_(slots)
-                    return slots, conf, stats, weights, cost, rows
+                    return slots, conf, stats, weights, cost, rows, tau
 
                 run = lambda: kmod.compute_row_mask(state, idx, b, k)  # noqa: E731
                 g = None
                 if graph:
-                    refresh(0)
+                    refresh(1)
                     g = _capture(run)
                 for trial in range(3):
-                    slots, conf, stats, weights, cost, rows = refresh(trial)
+                    slots, conf, stats, weights, cost, rows, tau = refresh(trial)
                     if g is not None:
                         g.replay()
                         torch.cuda.synchronize()
@@ -139,7 +143,8 @@ def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
                     assert got[b:].tolist() == [-3] * (MAX_REQS - b), case
                     for r, slot in enumerate(slots.tolist()):
                         _, lead = np_decide(conf[slot].tolist(), stats[slot].tolist(),
-                                            weights.numpy(), cost[b].tolist(), b, k, uses_stats)
+                                            weights.numpy(), cost[b].tolist(), b, k, uses_stats,
+                                            float(tau[b]))
                         if lead > 1e-5:
                             compared += 1
                             assert int(got[r]) == int(ref.live_len[r]), (case, r)

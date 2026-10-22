@@ -40,6 +40,14 @@ sampler takes (Markov bias included). Probabilities are clamped to
 [1e-6, 1 - 1e-6] before the log-odds. The raw confidence rule is the policy
 with weights [0, 1] over [bias, logit_conf]. Other keys are ignored.
 
+Decision per request, over k = 0 .. K (the step's verified width): at one
+request, or when the file has no ``tau``, ``argmax_k E(k) / cost_r(k)``
+(see ``dspark_row_mask_kernel``); with ``"tau": {"<batch>": t}`` a step of
+b >= 2 requests keeps the largest k with ``prod_{j <= k} p_j >= tau_b``
+(a request's extra row delays every request of the step, which its own
+E(k) does not price). Batch sizes ``tau`` does not list are interpolated
+linearly between the nearest listed ones (the nearest one outside them).
+
 ``costs`` gives, per batch size b, ``T_b(k)``: the step time in ms when
 every request of a b-request uniform decode batch verifies k drafts; the
 listed k of a batch must be 0 .. m without gaps, positive and nondecreasing.
@@ -82,6 +90,9 @@ class DepthPolicy:
     weights: torch.Tensor
     # [max_num_reqs + 1, max_draft + 1] float32, T_b(k); NaN where not given.
     cost: torch.Tensor
+    # [max_num_reqs + 1] float32: the threshold of a b-request step; 0: the
+    # cost rule (always at b = 1, and everywhere without "tau").
+    tau: torch.Tensor
     uses_stats: bool
 
 
@@ -167,9 +178,30 @@ def load_policy(
                 f"{path}: costs at batch {b} give k = 0 .. {n - 1}, but a "
                 f"{b}-request step verifies {k_b} drafts"
             )
+    tau = torch.zeros(max_num_reqs + 1, dtype=torch.float32)
+    raw_tau = raw.get("tau")
+    if raw_tau is not None:
+        if not isinstance(raw_tau, dict) or not raw_tau:
+            raise ValueError(f"{path}: tau must be a non-empty object of batch -> threshold")
+        given = {int(b): float(t) for b, t in raw_tau.items()}
+        if any(b < 1 or not 0.0 < t <= 1.0 for b, t in given.items()):
+            raise ValueError(f"{path}: tau needs positive batch sizes and thresholds in (0, 1]")
+        known_t = sorted(given)
+        for b in range(2, max_num_reqs + 1):
+            if b <= known_t[0]:
+                t = given[known_t[0]]
+            elif b >= known_t[-1]:
+                t = given[known_t[-1]]
+            else:
+                lo = max(k for k in known_t if k <= b)
+                hi = min(k for k in known_t if k >= b)
+                w = 0.0 if hi == lo else (b - lo) / (hi - lo)
+                t = given[lo] + (given[hi] - given[lo]) * w
+            tau[b] = t
     return DepthPolicy(
         weights=table,
         cost=cost,
+        tau=tau,
         uses_stats=any(f in STATS_FEATURES for f in features),
     )
 
@@ -194,6 +226,8 @@ class RowMaskState:
     weights: torch.Tensor = field(init=False)
     # T_b(k), [max_num_reqs + 1, max_draft + 1].
     cost: torch.Tensor = field(init=False)
+    # Threshold per batch size (0: the cost rule), [max_num_reqs + 1].
+    tau: torch.Tensor = field(init=False)
     # Per request of the current verify step (batch order): drafts kept.
     live_len: torch.Tensor = field(init=False)
     # Per token row of the current target forward: 1 live, 0 masked.
@@ -217,6 +251,7 @@ class RowMaskState:
         self.cost = torch.zeros(
             self.max_num_reqs + 1, self.max_draft + 1, dtype=torch.float32, device=d
         )
+        self.tau = torch.zeros(self.max_num_reqs + 1, dtype=torch.float32, device=d)
         self.live_len = torch.full(
             (self.max_num_reqs,), self.max_draft, dtype=torch.int32, device=d
         )
@@ -225,6 +260,7 @@ class RowMaskState:
     def set_policy(self, policy: DepthPolicy) -> None:
         self.weights.copy_(policy.weights)
         self.cost.copy_(policy.cost)
+        self.tau.copy_(policy.tau)
         self.uses_stats = policy.uses_stats
 
     def reset_live(self) -> None:

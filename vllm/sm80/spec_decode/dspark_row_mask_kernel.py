@@ -13,6 +13,8 @@ a b-request step, slot ``s = idx_mapping[r]``, in FP32::
     E(k)      = 1 + sum_{i <= k} prod_{j <= i} p_j
     cost_r(k) = T_b(K) - (T_b(K) - T_b(k)) / b
     live_len  = argmax_{k = 0 .. K} E(k) / cost_r(k)     (ties: larger k)
+    or, when tau_b > 0 (b >= 2 with a "tau" in the policy):
+    live_len  = max {k <= K : prod_{j <= k} p_j >= tau_b}   (0 if none)
 
 with ``c_i`` the confidence head's output, ``t_i`` and ``e_i`` the draft
 logits' top-1 probability and entropy (read only when the policy uses them),
@@ -79,6 +81,7 @@ def _row_mask_kernel(
     stats_ptr,
     stats_stride,
     w_ptr,
+    tau_ptr,
     cost_ptr,
     cost_stride,
     idx_ptr,
@@ -101,6 +104,8 @@ def _row_mask_kernel(
         conf_row = conf_ptr + slot * conf_stride
         stats_row = stats_ptr + slot * stats_stride
         cost_row = cost_ptr + num_reqs * cost_stride
+        tau = tl.load(tau_ptr + num_reqs)
+        use_tau = (tau > 0.0) & (num_reqs > 1)
         b = num_reqs.to(tl.float32)
         t_full = tl.load(cost_row + num_drafts)
         t_zero = tl.load(cost_row)
@@ -125,7 +130,7 @@ def _row_mask_kernel(
             expected = expected + prod
             cost = t_full - tl.math.div_rn(t_full - t_k, b)
             score = tl.math.div_rn(expected, cost)
-            take = ok & (score >= best)
+            take = ok & tl.where(use_tau, prod >= tau, score >= best)
             best = tl.where(take, score, best)
             best_k = tl.where(take, k, best_k)
         tl.store(live_len_ptr + r, best_k)
@@ -162,6 +167,8 @@ def reference_row_mask(
     conf = state.conf_by_slot[slots, :k_full]
     stats = state.stats_by_slot[slots, :, :k_full]
     w = state.weights
+    tau = state.tau[n]
+    use_tau = bool(tau > 0) and n > 1
     row = state.cost[n]
     b = torch.tensor(float(n), dtype=torch.float32, device=row.device)
     t_full = row[k_full]
@@ -181,7 +188,7 @@ def reference_row_mask(
         expected = expected + prod
         cost = t_full - torch.div(t_full - row[k], b)
         score = torch.div(expected, cost)
-        take = score >= best
+        take = (prod >= tau) if use_tau else (score >= best)
         best = torch.where(take, score, best)
         best_k = torch.where(take, torch.full_like(best_k, k), best_k)
     state.live_len[:n] = best_k
@@ -211,6 +218,7 @@ def compute_row_mask(
         state.stats_by_slot,
         state.stats_by_slot.stride(0),
         state.weights,
+        state.tau,
         state.cost,
         state.cost.stride(0),
         idx_mapping,

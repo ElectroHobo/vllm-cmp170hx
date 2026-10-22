@@ -150,6 +150,27 @@ def test_reference_b8_k3_all_ties_take_k():
     assert state.live_len.tolist() == [3] * 8
 
 
+def test_reference_threshold_rule_at_b2():
+    state = make_state()
+    state.cost[2] = torch.tensor(T1)
+    state.cost[1] = torch.tensor(T1)
+    state.tau[2] = 0.25
+    # p = 1/2, 1/2, 1, 0, ...: running products 0.5, 0.25, 0.25, 0: keep 3.
+    exact_probs(state, [0.5, 0.5, 1.0, 0.0, 1.0])
+    idx = set_conf(state, [1, 4], [[0.3] * 5] * 2)
+    rmk.reference_row_mask(state, idx, 2, 5)
+    assert state.live_len[:2].tolist() == [3, 3]
+    # p_1 = 0 keeps none; at one request the cost rule runs whatever tau holds.
+    exact_probs(state, [0.0, 1.0, 1.0, 1.0, 1.0])
+    rmk.reference_row_mask(state, idx, 2, 5)
+    assert state.live_len[:2].tolist() == [0, 0]
+    state.tau[1] = 0.9
+    exact_probs(state, [0.5, 0.5, 0.5, 0.5, 0.5])
+    rmk.reference_row_mask(state, idx[:1], 1, 5)
+    # Cost rule at b = 1: E = 1, 1.5, 1.75, 1.875: scores .1, .136, .146, .144: 2.
+    assert int(state.live_len[0]) == 2
+
+
 def test_row_live_layout_and_tail():
     state = make_state()
     state.cost[1] = torch.tensor(T1)
@@ -270,12 +291,14 @@ def np_log_odds(q):
     return F32(np.log(q) - np.log(F32(1.0) - q))
 
 
-def np_decide(conf, stats, weights, cost_row, b, k_full, uses_stats):
-    """live_len and the best score's lead over the runner-up for one request
-    (float32 throughout, the kernel's operation order)."""
+def np_decide(conf, stats, weights, cost_row, b, k_full, uses_stats, tau=0.0):
+    """live_len and the decision's margin for one request (float32
+    throughout, the kernel's operation order): the cost rule's best score's
+    lead over the runner-up, or with ``tau`` > 0 the relative distance of
+    the nearest running product to ``tau``."""
     t_full, t_zero, bb = F32(cost_row[k_full]), F32(cost_row[0]), F32(b)
     best = F32(F32(1.0) / F32(t_full - F32(F32(t_full - t_zero) / bb)))
-    scores = [best]
+    scores, prods = [best], []
     best_k, prod, expected = 0, F32(1.0), F32(1.0)
     for k in range(1, k_full + 1):
         w = weights[k - 1].astype(F32)
@@ -289,8 +312,11 @@ def np_decide(conf, stats, weights, cost_row, b, k_full, uses_stats):
         cost = F32(t_full - F32(F32(t_full - F32(cost_row[k])) / bb))
         score = F32(expected / cost)
         scores.append(score)
-        if score >= best:
+        prods.append(float(prod))
+        if (prod >= F32(tau)) if tau > 0 and b > 1 else (score >= best):
             best, best_k = score, k
+    if tau > 0 and b > 1:
+        return best_k, min([abs(p - tau) / tau for p in prods] or [1.0])
     others = [s for i, s in enumerate(scores) if i != best_k]
     lead = (best - max(others)) / best if others else 1.0
     return best_k, float(lead)
@@ -314,9 +340,10 @@ def np_raw_rule(conf, cost_row, b, k_full):
 
 
 def _random_case(gen, max_draft, b, k, trial):
-    """Features, weights and costs of one case; trials: 0 random, 1
-    dump-like (confidences near one, fitted-like weights), 2 raw-confidence
-    policy, 3 draft-logit statistics."""
+    """Features, weights, costs and thresholds of one case; trials: 0
+    random, 1 dump-like (confidences near one, fitted-like weights, the
+    threshold rule at b >= 2), 2 raw-confidence policy, 3 draft-logit
+    statistics with the threshold rule at b >= 2."""
     conf = torch.rand(MAX_REQS, max_draft, generator=gen)
     stats = torch.stack(
         (torch.rand(MAX_REQS, max_draft, generator=gen),
@@ -345,7 +372,10 @@ def _random_case(gen, max_draft, b, k, trial):
     if trial == 1 and b > 1:
         conf[idx[1]] = 1.0  # keeps every draft
         weights[:, 1] = weights[:, 1].clamp(min=1.0)
-    return conf, stats, weights, cost, idx, uses_stats
+    tau = torch.zeros(MAX_REQS + 1)
+    if trial in (1, 3):
+        tau[2:] = torch.rand(MAX_REQS - 1, generator=gen) * 0.8 + 0.05
+    return conf, stats, weights, cost, idx, uses_stats, tau
 
 
 def interpreted_results() -> dict:
@@ -360,13 +390,14 @@ def interpreted_results() -> dict:
     for b in range(1, MAX_REQS + 1):
         for k in (1, 3, 5, 7):
             for trial in range(4):
-                conf, stats, weights, cost, idx, uses_stats = _random_case(
+                conf, stats, weights, cost, idx, uses_stats, tau = _random_case(
                     gen, max_draft, b, k, trial)
                 s = RowMaskState(MAX_REQS, span_tokens, max_draft, torch.device("cpu"))
                 s.conf_by_slot.copy_(conf)
                 s.stats_by_slot.copy_(stats)
                 s.weights.copy_(weights)
                 s.cost.copy_(cost)
+                s.tau.copy_(tau)
                 s.uses_stats = uses_stats
                 row_live = torch.randint(0, 2, (span_tokens,), generator=gen).to(torch.int8)
                 s.row_live.copy_(row_live)
@@ -378,7 +409,7 @@ def interpreted_results() -> dict:
                     "case": [max_draft, b, k, trial],
                     "uses_stats": uses_stats,
                     "conf": conf.tolist(), "stats": stats.tolist(),
-                    "weights": weights.tolist(), "cost": cost.tolist(),
+                    "weights": weights.tolist(), "cost": cost.tolist(), "tau": tau.tolist(),
                     "idx": idx.tolist(), "row_live_before": row_live.tolist(),
                     "live_len": live_len, "row_live": rows,
                     "active": s.active,
@@ -410,7 +441,7 @@ def test_interpreted_kernel_matches_numpy_reference(interpreted):
         want = []
         for slot in c["idx"]:
             d, _ = np_decide(c["conf"][slot], [c["stats"][slot][0], c["stats"][slot][1]],
-                             weights, c["cost"][b], b, k, c["uses_stats"])
+                             weights, c["cost"][b], b, k, c["uses_stats"], c["tau"][b])
             want.append(d)
         assert c["live_len"][:b] == want, (c["case"], c["live_len"], want)
         seen.update(want)
@@ -447,18 +478,20 @@ def test_torch_reference_matches_numpy_reference():
     for b in range(1, MAX_REQS + 1):
         for k in (1, 3, 7):
             for trial in range(4):
-                conf, stats, weights, cost, idx, uses_stats = _random_case(
+                conf, stats, weights, cost, idx, uses_stats, tau = _random_case(
                     gen, 7, b, k, trial)
                 s = RowMaskState(MAX_REQS, 96, 7, torch.device("cpu"))
                 s.conf_by_slot.copy_(conf)
                 s.stats_by_slot.copy_(stats)
                 s.weights.copy_(weights)
                 s.cost.copy_(cost)
+                s.tau.copy_(tau)
                 s.uses_stats = uses_stats
                 rmk.reference_row_mask(s, idx, b, k)
                 for r, slot in enumerate(idx.tolist()):
                     d, lead = np_decide(conf[slot].tolist(), stats[slot].tolist(),
-                                        weights.numpy(), cost[b].tolist(), b, k, uses_stats)
+                                        weights.numpy(), cost[b].tolist(), b, k, uses_stats,
+                                        float(tau[b]))
                     total += 1
                     # torch's and numpy's exp/log may round differently.
                     if lead > 1e-5:
@@ -480,10 +513,14 @@ def forced_depth_policy(k: int, max_depth: int = 7) -> dict:
     }
 
 
+@pytest.mark.parametrize("tau", (None, 0.5))
 @pytest.mark.parametrize("k", range(8))
-def test_policy_file_forces_a_depth(tmp_path, k):
+def test_policy_file_forces_a_depth(tmp_path, k, tau):
     path = tmp_path / "forced.json"
-    path.write_text(json.dumps(forced_depth_policy(k)))
+    policy = forced_depth_policy(k)
+    if tau is not None:
+        policy["tau"] = {"2": tau}
+    path.write_text(json.dumps(policy))
     policy = dspark_row_mask.load_policy(path, MAX_REQS, 7, [0] + [7] * MAX_REQS)
     state = RowMaskState(MAX_REQS, 96, 7, torch.device("cpu"))
     state.set_policy(policy)
@@ -497,5 +534,5 @@ def test_policy_file_forces_a_depth(tmp_path, k):
             for slot in idx.tolist():
                 d, lead = np_decide(state.conf_by_slot[slot].tolist(), [[0.0] * 7] * 2,
                                     state.weights.numpy(), state.cost[b].tolist(), b, big_k,
-                                    False)
+                                    False, float(state.tau[b]))
                 assert d == min(k, big_k) and lead > 1e-6, (b, big_k, lead)

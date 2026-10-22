@@ -19,7 +19,10 @@ exchange the argmax already all-reduces, and every rank combines them in rank
 order into the same top-1 probability and entropy (`shard_argmax.py`). Then
 `d = argmax_k E(k) / cost_r(k)`, `E(k) = 1 + sum_{i<=k} prod_{j<=i} p_j`,
 `cost_r(k) = T_b(K) - (T_b(K) - T_b(k)) / b` from the file's cost table
-(ties: larger k). The raw-confidence rule is the policy with weights
+(ties: larger k). With a `"tau": {"<batch>": t}` in the file, a step of b >= 2
+requests keeps instead the largest k with `prod_{j<=k} p_j >= tau_b` (a
+request's extra row delays every request of the step, which its own E(k)
+does not price); one request always takes the cost rule. The raw-confidence rule is the policy with weights
 `[0, 1]` over `[bias, logit_conf]`. The load checks the cost table covers
 every draft count each batch size can verify (adaptive_k load widths, the
 per-batch-size table, or num_speculative_tokens).

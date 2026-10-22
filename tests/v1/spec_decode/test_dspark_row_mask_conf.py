@@ -220,6 +220,8 @@ def test_load_checks_the_policy_against_the_verified_drafts(make, monkeypatch, t
         (dict(weights=[[0.0, 1.0]] * 4), "weights needs"),
         (dict(weights=[[0.0]] * MAX_DRAFT), "weights row 0"),
         (dict(features=["bias", "hist_ema"]), "features"),
+        (dict(tau={"2": 1.5}), "tau"),
+        (dict(tau=[0.5]), "tau"),
         (dict(costs={"1": {"0": 1, "2": 2}}), "not 0 .. m"),
         (dict(costs={"1": {"0": 2, "1": 1}}), "nondecreasing"),
     ],
@@ -228,6 +230,15 @@ def test_malformed_policies_are_refused(tmp_path, changes, match):
     path = _policy(tmp_path / "bad.json", **changes)
     with pytest.raises(ValueError, match=match):
         state_module.load_policy(path, MAX_REQS, MAX_DRAFT, [0] + [3] * MAX_REQS)
+
+
+def test_tau_is_interpolated_from_batch_two(tmp_path):
+    path = _policy(tmp_path / "tau.json", tau={"1": 0.9, "2": 0.2, "6": 0.6})
+    policy = state_module.load_policy(path, MAX_REQS, MAX_DRAFT, [0] + [3] * MAX_REQS)
+    # b = 1 always takes the cost rule; 3 .. 5 between 2 and 6; past 6, 6's.
+    assert policy.tau.tolist() == pytest.approx([0, 0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.6, 0.6])
+    path = _policy(tmp_path / "none.json")
+    assert state_module.load_policy(path, MAX_REQS, MAX_DRAFT, [0] + [3] * MAX_REQS).tau.tolist() == [0.0] * 9
 
 
 def test_policy_weights_land_in_the_kernel_columns(tmp_path):
