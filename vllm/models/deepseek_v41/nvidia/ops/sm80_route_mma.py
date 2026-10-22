@@ -53,7 +53,6 @@ def _route_kernel(
     K: tl.constexpr,
     KP: tl.constexpr,
     BLOCK_E: tl.constexpr,
-    BLOCK_D: tl.constexpr,
     SPLIT: tl.constexpr,
     EXACT: tl.constexpr,
     GSPLIT: tl.constexpr,
@@ -88,37 +87,45 @@ def _route_kernel(
 
     lane = tl.arange(0, KP)
     ids = tl.zeros([KP], dtype=tl.int32)
-    for j in tl.static_range(K):
-        top = tl.max(key, 0)
-        pick = BLOCK_E - 1 - (top & 0xFFFFFFFF).to(tl.int32)
-        pick = tl.minimum(pick, num_experts - 1)
-        ids = tl.where(lane == j, pick, ids)
-        key = tl.where(offs == pick, -0x7FFFFFFFFFFFFFFF, key)
-
     keep = lane < K
     if not EXACT:
+        for j in tl.static_range(K):
+            top = tl.max(key, 0)
+            pick = tl.minimum(BLOCK_E - 1 - (top & 0xFFFFFFFF).to(tl.int32), num_experts - 1)
+            ids = tl.where(lane == j, pick, ids)
+            key = tl.where(offs == pick, -0x7FFFFFFFFFFFFFFF, key)
         chosen = tl.load(logits_ptr + t * logits_stride + ids).to(tl.float64)
         scores = _sqrt_softplus64(chosen)
         total = tl.sum(tl.where(keep, scores, 0.0), 0)
         weights = scores / (total + eps) * scale
         tl.store(weights_ptr + t * K + lane, weights.to(tl.float32), mask=keep)
         tl.store(ids_ptr + t * K + lane, ids, mask=keep)
-        return
-    # The chosen experts' logits in FP64 from x and the BF16 weight rows; program (t, s) sums slice s of the row.
-    DS: tl.constexpr = HIDDEN // SPLIT
-    s = tl.program_id(1)
-    offs_d = s * DS + tl.arange(0, BLOCK_D)
-    w_rows = w_ptr + ids.to(tl.int64)[:, None] * HIDDEN + offs_d[None, :]
-    x_row = x_ptr + t * x_stride + offs_d
-    acc = tl.zeros([KP, BLOCK_D], dtype=tl.float64)
-    for d in tl.static_range(0, DS, BLOCK_D):
-        wv = tl.load(w_rows + d).to(tl.float64)
-        xv = tl.load(x_row + d).to(tl.float64)
-        acc += wv * xv[None, :]
-    dots = tl.sum(acc, 1)
-    if SPLIT > 1:
-        # Each slice's FP64 partial goes to scratch; the last program of row t to arrive (acquire-release counter)
-        # adds them in slice order 0 .. SPLIT-1 and resets the counter: order-independent, graph-replayable.
+    else:
+        # Exact: program (t, s) recomputes the chosen experts' logits over K slice s in FP64 (every BF16 x BF16 product
+        # exact). Pipelined with the selection: pick j's weight slice is loaded right after round j and its dot taken
+        # after round j + 1, so the gather overlaps the remaining rounds; the x slice loads up front.
+        DS: tl.constexpr = HIDDEN // SPLIT
+        tl.static_assert(SPLIT > 1)
+        tl.static_assert(DS % 8 == 0 and (DS & (DS - 1)) == 0)
+        s = tl.program_id(1)
+        offs_d = s * DS + tl.arange(0, DS)
+        xs = tl.load(x_ptr + t * x_stride + offs_d).to(tl.float64)
+        acc = tl.zeros([DS // 8, KP], dtype=tl.float64)
+        for j in tl.static_range(K):
+            top = tl.max(key, 0)
+            pick = tl.minimum(BLOCK_E - 1 - (top & 0xFFFFFFFF).to(tl.int32), num_experts - 1)
+            ids = tl.where(lane == j, pick, ids)
+            key = tl.where(offs == pick, -0x7FFFFFFFFFFFFFFF, key)
+            w_cur = tl.load(w_ptr + pick.to(tl.int64) * HIDDEN + offs_d)
+            if j > 0:
+                pj = tl.sum(tl.reshape(w_prev.to(tl.float64) * xs, [DS // 8, 8]), 1)
+                acc = tl.where(lane[None, :] == j - 1, pj[:, None], acc)
+            w_prev = w_cur
+        pj = tl.sum(tl.reshape(w_prev.to(tl.float64) * xs, [DS // 8, 8]), 1)
+        acc = tl.where(lane[None, :] == K - 1, pj[:, None], acc)
+        dots = tl.sum(acc, 0)
+        # Each slice's FP64 partial goes to scratch; the last program of row t to arrive (acquire-release counter) adds
+        # them in slice order 0 .. SPLIT-1 and resets the counter: order-independent, graph-replayable.
         tl.store(part_ptr + (t * SPLIT + s) * KP + lane, dots, cache_modifier=".cg")
         tl.debug_barrier()
         arrived = tl.atomic_add(count_ptr + t, 1, sem="acq_rel", scope="gpu")
@@ -132,9 +139,3 @@ def _route_kernel(
             tl.store(weights_ptr + t * K + lane, weights.to(tl.float32), mask=keep)
             tl.store(ids_ptr + t * K + lane, ids, mask=keep)
             tl.store(count_ptr + t, 0)
-    else:
-        scores = _sqrt_softplus64(dots)
-        total = tl.sum(tl.where(keep, scores, 0.0), 0)
-        weights = scores / (total + eps) * scale
-        tl.store(weights_ptr + t * K + lane, weights.to(tl.float32), mask=keep)
-        tl.store(ids_ptr + t * K + lane, ids, mask=keep)

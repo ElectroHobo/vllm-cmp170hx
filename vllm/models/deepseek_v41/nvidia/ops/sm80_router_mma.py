@@ -32,6 +32,8 @@ MAX_ROWS = 2047
 # gate's FP32 logits.
 EXACT_ROWS = 64
 _ROUTE_WARPS = 4
+# Large prefill calls route one row per single-warp program.
+_ROUTE_WARPS_LARGE, _LARGE_ROWS = 1, 256
 _KP_MAX = 8
 _SMS: dict = {}
 _LOCKS: dict = {}
@@ -82,14 +84,14 @@ def _locks(device: torch.device) -> torch.Tensor:
     return _LOCKS[key]
 
 
-def _route_split(M: int, K: int, sms: int) -> tuple[int, int]:
-    """(SPLIT, BLOCK_D) of the route's exact recompute: the row's K over SPLIT
-    programs, up to two per SM."""
-    split = 1
+def _route_split(M: int, K: int) -> int:
+    """SPLIT of the route: exact rows recompute the chosen logits over 5 K
+    slices of 1024 (one program per row and slice); prefill rows take one
+    program per row."""
     if M <= EXACT_ROWS:
-        split = max(s for s in (1, 2, 4, 5) if K % s == 0 and (s == 1 or M * s <= 2 * sms))
-    ds = K // split
-    return split, min(512, ds & -ds)
+        assert K % 5 == 0 and (K // 5) & (K // 5 - 1) == 0, K
+        return 5
+    return 1
 
 
 @dataclass
@@ -106,7 +108,6 @@ class Pending:
     gate_rows: int
     gcols: int
     split: int
-    block_d: int
 
 
 def gate(x: torch.Tensor, weight_bf16: torch.Tensor) -> tuple[torch.Tensor, Pending]:
@@ -115,7 +116,7 @@ def gate(x: torch.Tensor, weight_bf16: torch.Tensor) -> tuple[torch.Tensor, Pend
     M, K = x.shape
     E = weight_bf16.shape[0]
     sms = _sms(x.device)
-    split, block_d = _route_split(M, K, sms)
+    split = _route_split(M, K)
     ng = G.part_numel(M, E, K, sms)
     nr = M * split * _KP_MAX if split > 1 else 0
     scratch = torch.empty(2 * (ng + nr) + M * E, dtype=torch.float32, device=x.device)
@@ -130,7 +131,7 @@ def gate(x: torch.Tensor, weight_bf16: torch.Tensor) -> tuple[torch.Tensor, Pend
     return logits, Pending(
         x=x, logits=logits, gpart=gpart, rpart=rpart, locks=locks, exact=exact,
         gsplit=gsplit if defer else 1, gate_rows=tb * block_t,
-        gcols=triton.cdiv(E, block_e) * block_e, split=split, block_d=block_d,
+        gcols=triton.cdiv(E, block_e) * block_e, split=split,
     )
 
 
@@ -161,8 +162,9 @@ def route(
     R._route_kernel[(M, p.split)](
         p.logits, p.logits.stride(0), p.x, p.x.stride(0), weight_bf16, bias, bias_vl, tokens, weights, ids,
         p.rpart, p.locks, p.gpart, p.gate_rows, E, lo, hi, SCALE, 1e-20, HIDDEN=HIDDEN, K=top_k, KP=kp,
-        BLOCK_E=triton.next_power_of_2(E), BLOCK_D=p.block_d, SPLIT=p.split, EXACT=p.exact,
-        GSPLIT=p.gsplit, GCOLS=p.gcols, num_warps=_ROUTE_WARPS)
+        BLOCK_E=triton.next_power_of_2(E), SPLIT=p.split, EXACT=p.exact,
+        GSPLIT=p.gsplit, GCOLS=p.gcols,
+        num_warps=_ROUTE_WARPS_LARGE if M > _LARGE_ROWS else _ROUTE_WARPS)
     return weights, ids
 
 
