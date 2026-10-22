@@ -1283,9 +1283,7 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # experts local, every local expert matrix bits_x2 8 with codebook 2), on
     # sm_80; independent of VLLM_EXL3_MOE_V2, which keeps the other
     # configurations, and never folded (VLLM_EXL3_MOE_V2_FOLD does not apply).
-    # The drafter's experts split across tensor-parallel ranks (intermediate
-    # 640 or 512, all 128 local) keep moe_out with the flag on. Results
-    # differ from moe_out in the last bits. Needs an EXL3 extension
+    # Results differ from moe_out in the last bits. Needs an EXL3 extension
     # built from this tree. Default OFF: unset, those calls take moe_out. Read
     # in vllm/sm80/kernels/exl3/quant.py.
     "VLLM_EXL3_MOE_V2_DRAFT": lambda: bool(

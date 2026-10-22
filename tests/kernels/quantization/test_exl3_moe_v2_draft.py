@@ -12,9 +12,7 @@ per request).
   operand, bits_x2 8 decoded from two ring words), activate_down_slice (one
   2^e per down K slice) and combine_routes.
 - Tensor-parallel experts (every expert local, a 640- or 512-column chunk of
-  the intermediate per rank): the gate stays closed (moe_out); moe_out_v2's
-  kernels for them (the tensor-parallel shapes' stages at bits_x2 8) are
-  tested on the GPU below.
+  the intermediate per rank): the tensor-parallel shapes' stages at bits_x2 8.
 
 CPU:
 - both switches default off; the drafter's configurations open only for
@@ -143,6 +141,8 @@ def test_switches_default_off(monkeypatch):
 
 def test_gate_opens_for_the_drafter_configurations_only_with_their_switch():
     assert _reason() is None
+    assert _reason(**_split(640)) is None
+    assert _reason(**_split(512)) is None
     closed = {
         "VLLM_EXL3_MOE_V2": _reason(draft=False),
         "VLLM_EXL3_MOE_V2 split": _reason(draft=False, **_split(640)),
@@ -181,18 +181,13 @@ def test_gate_opens_for_the_drafter_configurations_only_with_their_switch():
     )
     assert h5120._reason() is None
     assert h5120._reason(metadata=h5120._meta(4)) is None
-    assert {DRAFTER} == exl3_ops.MOE_V2_DRAFT_CONFIGS
+    assert {
+        DRAFTER,
+        (HIDDEN, 640, TOPK, GLOBAL, GLOBAL),
+        (HIDDEN, 512, TOPK, GLOBAL, GLOBAL),
+    } == exl3_ops.MOE_V2_DRAFT_CONFIGS
     for shape in exl3_ops.MOE_V2_DRAFT_CONFIGS:
         assert exl3_ops.MOE_V2_CONFIGS[shape] == (BITS_X2,)
-
-
-@pytest.mark.parametrize("width", [640, 512])
-def test_split_drafter_layers_keep_moe_out_with_the_switch(width):
-    # Not checked through the drafter's consumer: closed for both switches.
-    for draft in (True, False):
-        reason = _reason(draft=draft, **_split(width))
-        assert reason and f"(5120, {width}, 3, 128, 128)" in reason, (draft, reason)
-    assert (HIDDEN, width, TOPK, GLOBAL, GLOBAL) not in exl3_ops.MOE_V2_CONFIGS
 
 
 def _method(monkeypatch, calls):
