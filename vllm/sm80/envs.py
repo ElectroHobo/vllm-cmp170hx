@@ -108,9 +108,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2: bool = False
     VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM: bool = False
-    VLLM_TRY_ROUTER: bool = False
-    VLLM_TRY_MOE_V2: bool = False
-    VLLM_TRY_MOE_PREFILL: bool = False
+    VLLM_DEEPSEEK_V41_ROUTER_MMA: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
     VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
@@ -123,7 +121,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
     VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX: bool = False
-    VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX: bool = False
+    VLLM_SM80_TARGET_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
     VLLM_DEEPSEEK_V41_SWA_META_BATCH: bool = False
@@ -144,7 +142,9 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_V2_FOLD: bool = False
     VLLM_EXL3_MOE_V2_DRAFT: bool = False
     VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS: int = 0
+    VLLM_EXL3_MOE_V2_RING: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
+    VLLM_EXL3_MOE_PREFILL_UNCHUNKED: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
     VLLM_EXL3_EXPERT_PLACEMENT: str = ""
     VLLM_EXL3_EXPERT_PLACEMENT_SHA256: str = ""
@@ -995,16 +995,18 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM", "0"))
     ),
-    # Trial kernels, each read with os.environ where
-    # it is used ("1" turns it on); declared here so a launch may set them.
-    # Default OFF. VLLM_TRY_ROUTER: MoE gate and routing on the BF16 tensor
-    # cores (sm80_moe.py, ops/sm80_router_mma.py; needs FUSED_ROUTE and
-    # GATE_GEMV). VLLM_TRY_MOE_V2: one-launch moe_out_v2_try for the target's
-    # expert-parallel layers. VLLM_TRY_MOE_PREFILL: one launch sequence per
-    # moe_out_prefill_v2 call (vllm/sm80/kernels/exl3/ops.py).
-    "VLLM_TRY_ROUTER": lambda: os.getenv("VLLM_TRY_ROUTER", "0") == "1",
-    "VLLM_TRY_MOE_V2": lambda: os.getenv("VLLM_TRY_MOE_V2", "0") == "1",
-    "VLLM_TRY_MOE_PREFILL": lambda: os.getenv("VLLM_TRY_MOE_PREFILL", "0") == "1",
+    # DeepSeek-V4.1 on sm_80: the MoE gate and routing of calls of 1 to 2047
+    # BF16 rows on the BF16 tensor cores (ops/sm80_router_mma.py): the gate
+    # from a BF16 copy of the gate weight with exact BF16 products, FP32 sums
+    # per K chunk and FP64 across chunks, rounded once to FP32; the top-k
+    # selected in FP32 as the fused route, the weights in FP64 rounded once,
+    # from exactly recomputed logits for calls of up to 64 rows. Not the FP32
+    # GEMM's bytes: closer to the FP64 routing weights. Other calls keep the
+    # gate GEMV or the FP32 gate and the route. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_ROUTER_MMA": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ROUTER_MMA", "0"))
+    ),
     # DeepSeek-V4.1 on sm_80: the MoE routing after the FP32 gate GEMM
     # (sqrt-softplus, bias select and add, top-k, gather, renormalisation,
     # scale, int32 ids: fifteen torch kernels per layer) as one Triton kernel
@@ -1128,8 +1130,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # kernels in the dummy sampler run. Default OFF: unset, the full-vocabulary
     # all-gather always runs. Read in vllm/sm80/worker/target_argmax.py and
     # vllm/models/deepseek_v41/nvidia/sm80_model.py.
-    "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX", "0"))
+    "VLLM_SM80_TARGET_SHARD_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_SM80_TARGET_SHARD_ARGMAX", "0"))
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
@@ -1298,6 +1300,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS": lambda: int(
         os.getenv("VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS", "0")
     ),
+    # With VLLM_EXL3_MOE_V2: the moe_out_v2 calls of the whole-expert layers
+    # of ops.MOE_V2_TRY_CONFIG (hidden 5120, intermediate 2304, top-6, 96 of
+    # 384 experts local, bits_x2 6 or 4, 1..64 rows) take moe_out_v2_try
+    # (csrc/exl3/moe_v2_try.cu) in place of moe_out_v2 or moe_out_v2_fold:
+    # the lane GEMMs' trellis words through a per-warp cp.async shared ring,
+    # the same arguments, workspace contract and output bits. Needs an EXL3
+    # extension built from this tree. Default OFF. Read in
+    # vllm/sm80/kernels/exl3/ops.py (moe_v2_try_open).
+    "VLLM_EXL3_MOE_V2_RING": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_V2_RING", "0"))
+    ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_prefill.cu) for
     # calls of 65..3460 rows in prefill steps (some request scheduled more
     # than 1 + num_speculative_tokens tokens), with the hidden-2560
@@ -1309,6 +1322,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # take moe_out.
     "VLLM_EXL3_MOE_PREFILL_TC": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_PREFILL_TC", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: moe_out_prefill_v2's calls of the
+    # whole-expert configuration (hidden 5120, intermediate 2304, top-6, 96
+    # of 384 experts local, bits_x2 6 or 4, 65..2048 rows) run
+    # moe_out_prefill_try (csrc/exl3/moe_prefill_try.cu) as one launch
+    # sequence per call instead of one per 512-row chunk, so each touched
+    # expert is decoded once per call; the same arithmetic, bitwise equal.
+    # Needs an EXL3 extension built from this tree. Default OFF. Read once
+    # at import in vllm/sm80/kernels/exl3/ops.py.
+    "VLLM_EXL3_MOE_PREFILL_UNCHUNKED": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_PREFILL_UNCHUNKED", "0"))
     ),
     # EXL3 routed experts: the trellis, suh and svh of a MoE layer's local
     # expert matrices are views into one device buffer per tensor kind
@@ -1404,6 +1428,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
 # warn_retired_env_vars() and its call below in the next release.
 RETIRED_ENV_VARS: dict[str, str] = {
     # Renamed: shared code is named after the feature, not the model.
+    "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": (
+        "renamed to VLLM_SM80_TARGET_SHARD_ARGMAX (read by the shared "
+        "sm_80 worker)"
+    ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": (
         "renamed to VLLM_MOE_MASK_PADDING_MAX_TOKENS, which is now also the MoE "
         "padding mask cutoff whether or not VLLM_AMPERE_DECODE_KERNELS is on"

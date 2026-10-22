@@ -1127,7 +1127,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 layer, gate_metadata, max_rows, workspace, draft=True
             )
             moe_v2_draft = bool(moe_v2_rows)
-        # VLLM_TRY_MOE_V2: the target layers' moe_out_v2 calls of the covered
+        # VLLM_EXL3_MOE_V2_RING: the target layers' moe_out_v2 calls of the covered
         # configuration take moe_out_v2_try (before moe_out_v2_fold).
         moe_v2_try = False
         if moe_v2_rows and not moe_v2_draft:
@@ -1286,7 +1286,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def _moe_v2_try(self, layer, rows: int, bits_x2: int, workspace: int):
         """(True, a workspace size that fits moe_out_v2_try too) when
-        VLLM_TRY_MOE_V2 is set and the layer is its configuration, after
+        VLLM_EXL3_MOE_V2_RING is set and the layer is its configuration, after
         warming the operator; else (False, workspace)."""
         from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
@@ -1323,7 +1323,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             trial=True,
         )
         logger.info_once(
-            "EXL3 MoE v2 trial kernel active (VLLM_TRY_MOE_V2): moe_out_v2_try "
+            "EXL3 MoE v2 ring kernel active (VLLM_EXL3_MOE_V2_RING): moe_out_v2_try "
             "for MoE calls of 1..%d rows of the covered layers (the same output "
             "bits as moe_out_v2).",
             rows,
@@ -1511,7 +1511,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
     # VLLM_EXL3_MOE_V2_DRAFT: the moe_out_v2 calls are the DSpark drafter's
     # (bits_x2 8 kernels of their own, never folded).
     moe_v2_draft = False
-    # VLLM_TRY_MOE_V2: the moe_out_v2 calls take moe_out_v2_try.
+    # VLLM_EXL3_MOE_V2_RING: the moe_out_v2 calls take moe_out_v2_try.
     moe_v2_try = False
 
     def __init__(

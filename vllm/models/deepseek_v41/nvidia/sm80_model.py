@@ -31,7 +31,7 @@ What changes on sm_80:
   (``vllm.sm80.plugin.HF_CONFIG_DEFAULTS``), the EXL3 head stores its FP32
   result in that dtype and both models' logits processors serve it
   (``Exl3HeadLogitsProcessor``);
-- with ``VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX`` the target's
+- with ``VLLM_SM80_TARGET_SHARD_ARGMAX`` the target's
   ``compute_logits`` returns, inside a greedy-only sampling step of the fork
   runner, rows that hold only the vocabulary-parallel argmax instead of the
   all-gathered logits (``vllm/sm80/worker/target_argmax.py``).
@@ -447,7 +447,7 @@ class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """Upstream's gathered logits; inside a greedy-only sampling step
-        (``VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX``) the rows that hold only
+        (``VLLM_SM80_TARGET_SHARD_ARGMAX``) the rows that hold only
         their argmax, without the all-gather
         (``vllm/sm80/worker/target_argmax.py``)."""
         if target_argmax.active():

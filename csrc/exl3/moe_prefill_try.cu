@@ -3,7 +3,7 @@
 // rows and the faster tile schedule (see the notes below). Same arithmetic as moe_out_prefill_v2: its output
 // is bitwise equal on every input. Registered as _exl3_C::moe_out_prefill_try and
 // _exl3_C::moe_workspace_size_prefill_try with moe_out_prefill_v2's schema; vllm/sm80/kernels/exl3/ops.py
-// routes moe_out_prefill_v2's calls here when VLLM_TRY_MOE_PREFILL=1.
+// routes moe_out_prefill_v2's calls here when VLLM_EXL3_MOE_PREFILL_UNCHUNKED=1.
 //
 // EXL3 routed-expert MoE on the tensor cores for prefill-sized calls of the DeepSeek-V4.1-Flash
 // routed experts: moe_out_prefill (moe_prefill.cu) generalised from its one compile-time shape (hidden

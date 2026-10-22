@@ -10,7 +10,7 @@ on:
   ``profile_cudagraph_memory`` and ``capture_model`` are routed through
   ``cudagraph_mem``, which also has the profiling capture capture every FULL
   graph;
-- ``VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX`` (``target_argmax``): ``sample``
+- ``VLLM_SM80_TARGET_SHARD_ARGMAX`` (``target_argmax``): ``sample``
   runs inside ``target_argmax.step``, so a greedy-only step's target logits
   are the per-rank argmax rows, and the dummy sampler run at boot warms the
   slot kernels (and refuses a target the switch cannot serve).

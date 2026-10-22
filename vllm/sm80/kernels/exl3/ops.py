@@ -3,7 +3,6 @@
 """Bindings for the shipped BF16 EXL3 extension."""
 
 import importlib
-import os
 from functools import lru_cache
 
 import torch
@@ -29,13 +28,13 @@ _dense_splitk = False
 # Each matrix processes rows in chunks whose native workspace fits it.
 LINEAR_SCRATCH_ELEMENTS = 8 << 20
 
-# Scratch switch, default off: moe_out_prefill_v2's calls of the whole-expert
-# configuration (hidden 5120, intermediate 2304, top-6, 96 of 384 experts local,
-# bits_x2 6 or 4, 65..2048 rows) run _exl3_C::moe_out_prefill_try instead
-# (csrc/exl3/moe_prefill_try.cu: the same arithmetic, bitwise equal, in one
-# launch sequence per call), with its workspace size. Every other call is
-# unchanged.
-TRY_MOE_PREFILL = os.environ.get("VLLM_TRY_MOE_PREFILL", "0") == "1"
+# VLLM_EXL3_MOE_PREFILL_UNCHUNKED (default off): moe_out_prefill_v2's calls of
+# the whole-expert configuration (hidden 5120, intermediate 2304, top-6, 96 of
+# 384 experts local, bits_x2 6 or 4, 65..2048 rows) run
+# _exl3_C::moe_out_prefill_try instead (csrc/exl3/moe_prefill_try.cu: the same
+# arithmetic, bitwise equal, in one launch sequence per call), with its
+# workspace size. Every other call is unchanged.
+TRY_MOE_PREFILL = envs.VLLM_EXL3_MOE_PREFILL_UNCHUNKED
 TRY_MOE_PREFILL_ROWS = (65, 2048)
 
 # moe_out_v2 (csrc/exl3/moe_v2.cu) covers calls of 1..MOE_V2_MAX_ROWS rows of
@@ -652,7 +651,7 @@ def moe_out_v2_fold(
     )
 
 
-# VLLM_TRY_MOE_V2=1 (scratch trial, default off): the target model's
+# VLLM_EXL3_MOE_V2_RING=1 (default off): the target model's
 # expert-parallel moe_out_v2 calls of exactly this configuration (hidden,
 # intermediate, top-k, local experts, global experts), bits_x2 6 or 4, 1..64
 # rows, take _exl3_C::moe_out_v2_try (csrc/exl3/moe_v2_try.cu) instead of
@@ -670,9 +669,9 @@ def moe_v2_try_open(
     global_experts: int,
     bits_x2: int,
 ) -> bool:
-    """VLLM_TRY_MOE_V2 is set and the layer is the configuration it covers."""
+    """VLLM_EXL3_MOE_V2_RING is set and the layer is the configuration it covers."""
     return (
-        os.environ.get("VLLM_TRY_MOE_V2", "0") == "1"
+        envs.VLLM_EXL3_MOE_V2_RING
         and (hidden_size, intermediate_size, top_k, local_experts, global_experts)
         == MOE_V2_TRY_CONFIG
         and bits_x2 in MOE_V2_TRY_BITS
@@ -688,7 +687,7 @@ def require_moe_v2_try() -> None:
         torch._C._dispatch_find_schema_or_throw("_exl3_C::moe_out_v2_try", "")
     except RuntimeError as exc:
         raise RuntimeError(
-            "VLLM_TRY_MOE_V2 needs _exl3_C::moe_out_v2_try: rebuild the EXL3 "
+            "VLLM_EXL3_MOE_V2_RING needs _exl3_C::moe_out_v2_try: rebuild the EXL3 "
             "extension from this tree (python csrc/exl3/build_standalone.py "
             f"--out vllm), or unset the flag. Detail: {exc}"
         ) from exc
@@ -725,7 +724,7 @@ def moe_out_v2_try(
     *,
     bits_x2: int,
 ) -> None:
-    """moe_out_v2's arguments and output bits (VLLM_TRY_MOE_V2; callers check
+    """moe_out_v2's arguments and output bits (VLLM_EXL3_MOE_V2_RING; callers check
     moe_v2_try_open and require_moe_v2_try first)."""
     ensure_extension()
     torch.ops._exl3_C.moe_out_v2_try(
@@ -965,12 +964,12 @@ def require_moe_prefill_v2() -> None:
                     torch._C._dispatch_find_schema_or_throw(f"_exl3_C::{name}", "")
                 except RuntimeError as exc:
                     raise RuntimeError(
-                        f"VLLM_TRY_MOE_PREFILL=1 needs _exl3_C::{name}: rebuild the "
+                        f"VLLM_EXL3_MOE_PREFILL_UNCHUNKED=1 needs _exl3_C::{name}: rebuild the "
                         f"EXL3 extension from this tree, or unset it. Detail: {exc}"
                     ) from exc
             torch.library.register_fake("_exl3_C::moe_out_prefill_try")(_moe_v2_fake)
             logger.info_once(
-                "VLLM_TRY_MOE_PREFILL: moe_out_prefill_v2 calls of 65..2048 rows of the "
+                "VLLM_EXL3_MOE_PREFILL_UNCHUNKED: moe_out_prefill_v2 calls of 65..2048 rows of the "
                 "whole-expert configuration (hidden 5120, intermediate 2304, top-6, "
                 "96 of 384 experts local, bits_x2 6 or 4) run moe_out_prefill_try."
             )
@@ -978,7 +977,7 @@ def require_moe_prefill_v2() -> None:
 
 
 def _try_moe_prefill(hidden: int, intermediate: int, topk: int, local: int) -> bool:
-    """VLLM_TRY_MOE_PREFILL is set and the shape is the one it covers."""
+    """VLLM_EXL3_MOE_PREFILL_UNCHUNKED is set and the shape is the one it covers."""
     return TRY_MOE_PREFILL and (hidden, intermediate, topk, local) == (5120, 2304, 6, 96)
 
 

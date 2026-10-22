@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Boot warmup of the Triton kernels served DeepSeek-V4.1 runs used to compile
 mid-request: the sm_80 index scores, the speculative-decoding kernels, the
-MoE gate and route of VLLM_TRY_ROUTER and the grouped wo_a GEMM.
+MoE gate and route of VLLM_DEEPSEEK_V41_ROUTER_MMA and the grouped wo_a GEMM.
 
 * The index-score launch's specialisation key (Triton's: pointer dtypes and
   16-byte alignment, the class of every specialised integer -- 1, divisible by

@@ -502,7 +502,7 @@ def test_target_shard_argmax_switch(monkeypatch):
 
     switch = dev_ab.SWITCHES["dsv41_target_shard_argmax"]
     assert not switch.graph_bound and switch.output_identical
-    assert switch.env == "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX"
+    assert switch.env == "VLLM_SM80_TARGET_SHARD_ARGMAX"
     lm = SimpleNamespace(
         lm_head=SimpleNamespace(tp_rank=0, tp_size=4),
         logits_processor=SimpleNamespace(org_vocab_size=129280, logits_as_input=False),

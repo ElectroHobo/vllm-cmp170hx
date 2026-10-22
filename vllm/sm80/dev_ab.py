@@ -295,7 +295,7 @@ def _argmax_apply(runner, on: bool) -> None:
     speculator._validate_local_argmax_reduction()
 
 
-_TARGET_ARGMAX_ENV = "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX"
+_TARGET_ARGMAX_ENV = "VLLM_SM80_TARGET_SHARD_ARGMAX"
 
 
 def _target_argmax_unavailable(runner) -> str | None:

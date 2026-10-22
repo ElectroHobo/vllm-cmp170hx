@@ -13,7 +13,7 @@ rejection sampler read them. When every request of the step is greedy and
 nothing reads the logits beyond their argmax, that gather only feeds an
 argmax.
 
-With ``VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX`` the fork's V2 model runner
+With ``VLLM_SM80_TARGET_SHARD_ARGMAX`` the fork's V2 model runner
 (``vllm/sm80/worker/graph_mem_worker.py``) runs ``sample`` inside
 :func:`step`, which decides from the step's batch, grammar output and sampler
 states whether the step is greedy-only (:func:`greedy_only`). While such a
@@ -69,7 +69,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 logger = init_logger(__name__)
 
-SWITCH = "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX"
+SWITCH = "VLLM_SM80_TARGET_SHARD_ARGMAX"
 
 # True while the runner samples a greedy-only step (:func:`step`).
 _active = False

@@ -588,7 +588,7 @@ _WORKSPACE = {
     "moe_out_prefill_v2": "moe_workspace_size_prefill_v2",
 }
 
-# VLLM_TRY_MOE_V2: the trial operator judged in moe_out_v2's place.
+# VLLM_EXL3_MOE_V2_RING: the trial operator judged in moe_out_v2's place.
 _TRY_WORKSPACE = {"moe_out_v2_try": "moe_workspace_size_v2_try"}
 
 
@@ -799,7 +799,7 @@ def _exl3_moe_call(
             raise ValueError(f"{name} bits_x2 {a.get('bits_x2')} for routed "
                              f"matrices of bits_x2 {bits}")
         extra = {"bits_x2": bits[0]}
-    # VLLM_TRY_MOE_V2: a moe_out_v2 call of the configuration the flag covers
+    # VLLM_EXL3_MOE_V2_RING: a moe_out_v2 call of the configuration the flag covers
     # judges moe_out_v2_try in its place (and reports whether it gives
     # moe_out_v2's bits).
     cand = name

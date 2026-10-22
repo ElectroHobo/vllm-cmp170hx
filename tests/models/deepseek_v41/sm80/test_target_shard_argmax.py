@@ -40,7 +40,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[4]
-SWITCH = "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX"
+SWITCH = "VLLM_SM80_TARGET_SHARD_ARGMAX"
 NUM_SPEC = 3
 
 

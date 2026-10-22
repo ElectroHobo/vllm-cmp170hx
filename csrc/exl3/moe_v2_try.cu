@@ -1,5 +1,5 @@
-// moe_out_v2_try (VLLM_TRY_MOE_V2): a faster moe_out_v2 for the target model's
-// expert-parallel routed experts, a scratch trial beside the shipped operator.
+// moe_out_v2_try (VLLM_EXL3_MOE_V2_RING): a faster moe_out_v2 for the target model's
+// expert-parallel routed experts, beside moe_out_v2.
 // Same arguments, workspace contract and output bits as moe_out_v2 of
 // csrc/exl3/moe_v2.cu at 7b31d6b252 (bitwise equal on the FP64-checked cases),
 // faster lane GEMMs:
