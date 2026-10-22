@@ -439,6 +439,11 @@ def test_router_warmup_covers_every_served_launch(monkeypatch, experts, sms) -> 
             warm.compile(key)
             warmed |= drain()
         assert warmed == served
+        # Both routes compile as the served route does (sm80_route.py): no
+        # FTZ, no FP contraction; the warmup's launches carry the same options.
+        plain = {("enable_fp_fusion", False), ("enable_reflect_ftz", False)}
+        routes = [k for k in served if k[0].endswith("._route_kernel")]
+        assert routes and all(plain <= set(options) for _, _, options in routes), routes
 
 
 def test_router_warmup_dedups_layers_and_skips_off_sm80(monkeypatch) -> None:

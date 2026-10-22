@@ -14,7 +14,12 @@ of the :func:`gate` call that produced its logits.
 Served configuration: hidden 5120, 384 experts top 6 (target) or 128 experts
 top 3 (drafter), routed scaling 1.5, renormalised, gate_temp 1, image sentinel
 ids [129264, 129269) or none, BF16 x of 1 to :data:`MAX_ROWS` rows
-(:func:`serves`).
+(:func:`serves`). A call of 2048 rows (a whole 2048-token prefill chunk)
+takes the served gate and route (``sm80_gate_gemv`` / the FP32 GEMM, then
+``sm80_route.route_fused``): the same FP32 selection rules on the FP32 GEMM's
+logits, weights rounded in FP32, so one prefill may mix the two. Both routes
+compile without FTZ and FP contraction, as ``sm80_route.py``, so equal FP32
+logits select the same experts.
 
 CUDA graphs and the first eager prefill: :data:`ROUTER_WARMUP` compiles every
 form of both kernels a served call can reach (one call per
@@ -24,6 +29,7 @@ and drafter, before capture (registered by :func:`register_warmup` from
 """
 
 import functools
+import os
 import weakref
 from dataclasses import dataclass, field
 
@@ -53,6 +59,10 @@ _ROUTE_SPLIT = 5
 # Prefill route warps: one row per single-warp program above _LARGE_ROWS.
 _ROUTE_WARPS, _ROUTE_WARPS_LARGE, _LARGE_ROWS = 4, 1, 256
 _KP_MAX = 8
+# The served route's compile options (sm80_route.py): no FTZ, no FP
+# contraction, so its FP32 selection scores are this route's.
+_ROUTE_OPTIONS = ({} if os.environ.get("TRITON_INTERPRET", "0") == "1"
+                  else {"enable_reflect_ftz": False, "enable_fp_fusion": False})
 _SMS: dict = {}
 _LOCKS: dict = {}
 
@@ -168,12 +178,12 @@ def route(
     assert kp <= _KP_MAX, top_k
     if p.exact:
         RG.launch(p.x, weight_bf16, bias, bias_vl, tokens, weights, ids, p.rpart, p.locks, p.gpart, p.logits,
-                  p.gate_rows, p.gsplit, p.gcols, _ROUTE_SPLIT, lo, hi, SCALE, 1e-20)
+                  p.gate_rows, p.gsplit, p.gcols, _ROUTE_SPLIT, lo, hi, SCALE, 1e-20, _ROUTE_OPTIONS)
     else:
         R._route_kernel[(M,)](
             p.logits, p.logits.stride(0), bias, bias_vl, tokens, weights, ids, E, lo, hi, SCALE, 1e-20,
             K=top_k, KP=kp, BLOCK_E=triton.next_power_of_2(E),
-            num_warps=_ROUTE_WARPS_LARGE if M > _LARGE_ROWS else _ROUTE_WARPS)
+            num_warps=_ROUTE_WARPS_LARGE if M > _LARGE_ROWS else _ROUTE_WARPS, **_ROUTE_OPTIONS)
     return weights, ids
 
 

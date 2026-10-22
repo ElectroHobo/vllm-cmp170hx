@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1 MoE route for decode rows (M <= router._EXACT_ROWS) as one Gluon kernel (sm_80).
+"""DeepSeek-V4.1 MoE route for decode rows (M <= sm80_router_mma.EXACT_ROWS) as one Gluon kernel (sm_80).
 
-Same op and arithmetic as the exact branch of the Triton route (sm80_route.py docs): FP32 selection scores
+The selection of the served fused route (sm80_route.py) and of the prefill route (sm80_route_mma.py), with the
+chosen experts' logits recomputed exactly for the weights: FP32 selection scores
 ``sqrt(softplus(l)) + bias`` (``bias_vl`` for image tokens), the ``K`` largest first (equal scores and NaNs lowest
 expert first, NaN above every number), then the chosen experts' logits recomputed exactly from x and the BF16 weight
 rows in FP64 and ``w = s / (sum + eps) * scale`` in FP64 (stable softplus), rounded once to FP32.
@@ -176,8 +177,9 @@ def part_numel(M, split, kp_max):
 
 
 def launch(x, w, bias, bias_vl, input_ids, out_w, out_ids, part, counts, gpart, logits, gate_rows, gsplit, gcols,
-           split, sentinel_lo, sentinel_hi, scale, eps):
-    """Route the M rows of x (one program per row and K slice); see _route_kernel for the buffers."""
+           split, sentinel_lo, sentinel_hi, scale, eps, options):
+    """Route the M rows of x (one program per row and K slice); see _route_kernel for the buffers. ``options``:
+    compile options of the launch."""
     M, hidden = x.shape
     E = w.shape[0]
     k = out_ids.shape[1]
@@ -185,4 +187,5 @@ def launch(x, w, bias, bias_vl, input_ids, out_w, out_ids, part, counts, gpart, 
     _route_kernel[(M, split)](
         gpart, logits, logits.stride(0), gate_rows, x, x.stride(0), w, bias, bias_vl, input_ids, out_w, out_ids, part,
         counts, E, sentinel_lo, sentinel_hi, scale, eps, HIDDEN=hidden, K=k, KP=triton.next_power_of_2(k), NCH=nch,
-        NCHP=triton.next_power_of_2(nch), SPLIT=split, GSPLIT=gsplit, GCOLS=gcols, NW=NUM_WARPS, num_warps=NUM_WARPS)
+        NCHP=triton.next_power_of_2(nch), SPLIT=split, GSPLIT=gsplit, GCOLS=gcols, NW=NUM_WARPS, num_warps=NUM_WARPS,
+        **options)

@@ -539,6 +539,7 @@ def moe_router(a: dict, device: torch.device, _src: Source) -> Call:
         EXACT_ROWS,
         SCALE,
         gate_route,
+        serves,
     )
 
     x = a["x"].to(device).contiguous()
@@ -548,10 +549,6 @@ def moe_router(a: dict, device: torch.device, _src: Source) -> Call:
     n, experts = x.shape[0], w.shape[0]
     w16 = w.to(BF16)
 
-    def cand(rows):
-        wt, ids = gate_route(x[rows], w16, bias, bias_vl, top_k)
-        return _router_dense(wt, ids, experts, torch.float32)
-
     def ref(rows):
         xr = x[rows]
         if sm80_gate_gemv.serves(xr, w):
@@ -560,6 +557,14 @@ def moe_router(a: dict, device: torch.device, _src: Source) -> Call:
             logits = F.linear(xr.float(), w)
         wt, ids = sm80_route.route_fused(logits, bias, top_k, bias_vl=bias_vl,
                                          routed_scaling_factor=SCALE)
+        return _router_dense(wt, ids, experts, torch.float32)
+
+    def cand(rows):
+        # A call the path does not serve (above MAX_ROWS) takes the served
+        # gate and route in the model.
+        if not serves(x[rows]):
+            return ref(rows)
+        wt, ids = gate_route(x[rows], w16, bias, bias_vl, top_k)
         return _router_dense(wt, ids, experts, torch.float32)
 
     logits = x.double() @ w.double().T

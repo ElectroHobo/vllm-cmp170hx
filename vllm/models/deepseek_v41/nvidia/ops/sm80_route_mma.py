@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1 MoE routing after the gate logits as one Triton kernel (sm_80), for prefill rows (M > _EXACT_ROWS;
-decode rows use sm80_route_gluon.py, same selection, weights from exactly recomputed logits).
+"""DeepSeek-V4.1 MoE routing after the gate logits as one Triton kernel (sm_80), for prefill rows (M >
+sm80_router_mma.EXACT_ROWS; decode rows use sm80_route_gluon.py, same selection, weights from exactly recomputed logits).
 
 Per token (one program, the row's experts in one block), from the FP32 gate logits ``l``: the selection scores
 ``s = sqrt(softplus(l))`` in FP32 as the served route computes them (``l`` above 20, else ``log1p(exp(l))``, correctly

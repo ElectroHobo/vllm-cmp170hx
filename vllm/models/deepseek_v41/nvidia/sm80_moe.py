@@ -186,6 +186,14 @@ class Sm80DeepseekV41Gate(GateLinear):
 
     def forward(self, x: torch.Tensor):
         if self.mma and self.bias is None and sm80_router_mma.serves(x):
+            if self.pending is not None:
+                # Only the router consumes a call's Pending; a decode call's
+                # logits stay unwritten until it does.
+                raise RuntimeError(
+                    "VLLM_DEEPSEEK_V41_ROUTER_MMA: the previous gate call was not "
+                    "routed: the expert method reads the router logits itself "
+                    "(a monolithic method), which the decode gate leaves unwritten"
+                )
             logits, self.pending = sm80_router_mma.gate(x, self._weight_bf16())
             return self._return(logits)
         if (
@@ -233,7 +241,20 @@ def _fp32_gate_weight(gate: nn.Module) -> None:
 
 def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
     """VLLM_DEEPSEEK_V41_ROUTER_MMA: the layer's gate and routing run
-    ``ops/sm80_router_mma.py`` for every call it serves."""
+    ``ops/sm80_router_mma.py`` for every call it serves; the calls it does not
+    serve take the gate GEMV or the FP32 gate and the fused route, so both
+    switches are required."""
+    missing = [
+        name
+        for name in ("VLLM_DEEPSEEK_V41_FUSED_ROUTE", "VLLM_DEEPSEEK_V41_GATE_GEMV")
+        if not getattr(envs, name)
+    ]
+    if missing:
+        raise ValueError(
+            "VLLM_DEEPSEEK_V41_ROUTER_MMA needs "
+            + " and ".join(f"{name}=1" for name in missing)
+            + " (the path of the calls it does not serve)"
+        )
     gate = ffn.gate
     if not isinstance(gate, Sm80DeepseekV41Gate) or gate.bias is not None:
         raise TypeError(f"VLLM_DEEPSEEK_V41_ROUTER_MMA: unexpected gate {type(gate).__name__}")
