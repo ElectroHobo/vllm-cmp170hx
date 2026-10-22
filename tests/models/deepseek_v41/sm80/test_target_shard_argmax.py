@@ -381,7 +381,8 @@ def gloo_cases(tmp: str, device: str = "cpu", vocab: int = 97, width: int = 25,
 def check_ranks(ranks: list) -> None:
     """Every rank samples the same; the on arm is torch.argmax's; the arms
     agree wherever the gathered rows hold no NaN."""
-    assert len(ranks) == 4 and all(len(r) == 26 for r in ranks)
+    # 13 cases per logits dtype: FP32 and BF16 on CPU, FP32 only on CUDA.
+    assert len(ranks) == 4 and all(len(r) in (13, 26) and len(r) == len(ranks[0]) for r in ranks)
     for rank in ranks:
         assert rank == ranks[0]
     named = compared = with_nan = filtered = 0
@@ -409,7 +410,8 @@ def check_ranks(ranks: list) -> None:
                 assert [arm["tokens"][r] for arm in (on, off)] == [on["tokens"][r]] * 2
                 assert off["num_sampled"][r] == on["num_sampled"][r]
                 assert off["num_rejected"][r] == on["num_rejected"][r]
-    assert named == 1 and compared >= 50 and with_nan >= 10 and filtered == 12
+    dtypes = len(ranks[0]) // 13
+    assert named == 1 and compared >= 25 * dtypes and with_nan >= 5 * dtypes and filtered == 6 * dtypes
 
 
 def _interpret(code: str) -> object:
