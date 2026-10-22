@@ -120,7 +120,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
-    VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX: bool = False
+    VLLM_DSPARK_SHARD_ARGMAX: bool = False
     VLLM_SM80_TARGET_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
@@ -1097,7 +1097,7 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH", "0"))
     ),
-    # DeepSeek-V4.1 on sm_80, the DSpark drafter's greedy Markov sampling:
+    # The DSpark drafter's greedy Markov sampling (DeepSeek-V4.1 on sm_80):
     # each TP rank takes the argmax of its own vocabulary shard of the draft
     # logits (base logits + Markov bias), and the ranks exchange one
     # (value, index) pair per 4096-column chunk through a 16-byte all-reduce
@@ -1110,8 +1110,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # probabilistic drafting, draft top-k or acceptance estimator). Default
     # OFF: unset, the full-vocabulary all-gather and torch.argmax run. Read in
     # vllm/sm80/spec_decode/shard_argmax.py.
-    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", "0"))
+    "VLLM_DSPARK_SHARD_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARD_ARGMAX", "0"))
     ),
     # Greedy target sampling without the all-gather of the target logits: when
     # every request of a step is greedy (temperature 0)
@@ -1428,6 +1428,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
 # warn_retired_env_vars() and its call below in the next release.
 RETIRED_ENV_VARS: dict[str, str] = {
     # Renamed: shared code is named after the feature, not the model.
+    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": (
+        "renamed to VLLM_DSPARK_SHARD_ARGMAX (read by the shared DSpark "
+        "drafting code)"
+    ),
     "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": (
         "renamed to VLLM_SM80_TARGET_SHARD_ARGMAX (read by the shared "
         "sm_80 worker)"

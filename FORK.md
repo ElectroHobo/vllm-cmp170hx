@@ -158,7 +158,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
 | `vllm/sm80/distributed/step_errors.py` | 166 |
-| `vllm/sm80/envs.py` | 1,627 |
+| `vllm/sm80/envs.py` | 1,631 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -183,7 +183,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/dflash2_model.py` | 425 |
 | `vllm/sm80/spec_decode/dspark_width.py` | 90 |
 | `vllm/sm80/spec_decode/lilicorr_model.py` | 31 |
-| `vllm/sm80/spec_decode/shard_argmax.py` | 288 |
+| `vllm/sm80/spec_decode/shard_argmax.py` | 289 |
 | `vllm/sm80/spec_decode/warmup.py` | 184 |
 | `vllm/sm80/spec_decode/zero_draft.py` | 29 |
 | `vllm/sm80/worker/__init__.py` | 2 |
@@ -194,7 +194,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 231 |
-| **52 files** | **15,372** |
+| **52 files** | **15,377** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -524,7 +524,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_step_error_dispatch.py` | 68 |
 | `tests/sm80/test_triton_mla_sparse_block_stride.py` | 151 |
 | `tests/sm80/update_seams.py` | 173 |
-| `tests/test_retired_env_vars.py` | 160 |
+| `tests/test_retired_env_vars.py` | 162 |
 | `tests/v1/attention/test_glm_metadata_reuse.py` | 228 |
 | `tests/v1/attention/test_indexer_logits_budget_exact.py` | 224 |
 | `tests/v1/attention/test_indexer_prefill_chunk_budget.py` | 177 |
@@ -554,7 +554,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **255 files** | **111,385** |
+| **255 files** | **111,387** |
 
 #### `tools/`
 
@@ -725,7 +725,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEEPSEEK_V41_ATTN_PIPELINE` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS` | `int` | `48` | `'48'` |
 | `VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED` | `bool` | `False` | `'0'` |
-| `VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE` | `bool` | `False` | `'0'` |
@@ -750,6 +749,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEV_AB_SWITCH` | `str` | `''` | `''` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
 | `VLLM_DSPARK_PER_K_WIDTH` | `bool` | `False` | `'0'` |
+| `VLLM_DSPARK_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_DIRECT_READ` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
@@ -871,11 +871,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 196 |
-| Fork-added product lines | 66,097 |
+| Fork-added product lines | 66,102 |
 | Patched upstream files | 102 |
 | Patched upstream lines | +4,886 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 69,721 |
+| Product lines added (new files and patches) | 69,726 |
 | Fork environment variables (flags) | 147 |
 | Unreferenced fork definitions | 6 (56 lines) |

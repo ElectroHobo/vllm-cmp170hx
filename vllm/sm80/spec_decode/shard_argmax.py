@@ -9,7 +9,7 @@ token drafted at step i - 1, and a greedy draft is their argmax. Upstream
 builds the base logits with the vocabulary-parallel head and all-gathers
 them over the TP group (``compute_draft_logits``), only to take that argmax.
 
-With ``VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX`` the drafter's
+With ``VLLM_DSPARK_SHARD_ARGMAX`` the drafter's
 ``compute_logits_local`` keeps each rank's own columns of the base logits,
 and every step:
 
@@ -53,7 +53,7 @@ logger = init_logger(__name__)
 BLOCK = 4096  # columns per chunk; one slot per chunk
 LANES = 8  # BF16 lanes per slot: 4 key bytes, 3 index bytes, 1 zero
 MAX_VOCAB = 1 << 24  # three index bytes
-SWITCH = "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX"
+SWITCH = "VLLM_DSPARK_SHARD_ARGMAX"
 
 
 @triton.jit
@@ -131,8 +131,9 @@ def _pick_kernel(slots_ptr, out_ptr, vocab, SLOTS: tl.constexpr, SLOTS_P2: tl.co
     token = tl.sum(tl.where(s == first, index, 0), axis=0)
     # Summed slots always hold a column below vocab; a CUDA-graph warmup run
     # inside the custom all-reduce's capture context gets an unwritten buffer
-    # back (custom_all_reduce.py: torch.empty_like), so keep its token a
-    # valid embedding row.
+    # back (torch.empty_like: the flags-in-data all-reduce's warmup copy,
+    # vllm/sm80/distributed/communicator.py custom_all_reduce, and upstream's
+    # custom_all_reduce.py), so keep its token a valid embedding row.
     tl.store(out_ptr + row, tl.minimum(tl.maximum(token, 0), vocab - 1))
 
 
@@ -275,7 +276,7 @@ def shard_argmax_sampling(
     sample: Callable[..., None],
 ) -> Callable[..., None]:
     """Decorates ``DSparkSpeculator._sample_sequential``: with
-    ``VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX`` the greedy drafts come from
+    ``VLLM_DSPARK_SHARD_ARGMAX`` the greedy drafts come from
     :func:`sample_sequential`; the switch refuses a speculator it cannot
     serve (:func:`refusal`)."""
 
