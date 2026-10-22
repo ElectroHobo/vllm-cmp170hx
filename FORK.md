@@ -31,9 +31,9 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_scores.py` | 220 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_index_topk.py` | 383 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc.py` | 202 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_finish_v2.py` | 419 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_finish_v2.py` | 420 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py` | 590 |
-| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_side.py` | 158 |
+| `vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_side.py` | 207 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_route.py` | 202 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_route_gluon.py` | 191 |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_route_mma.py` | 79 |
@@ -45,7 +45,7 @@ Kernels used by one model only. Each model keeps its own copy.
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
 | `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **25 files** | **9,622** |
+| **25 files** | **9,672** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -440,7 +440,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused.py` | 302 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_fused_gpu.py` | 173 |
 | `tests/models/deepseek_v41/sm80/test_sm80_mhc_routing.py` | 237 |
-| `tests/models/deepseek_v41/sm80/test_sm80_mhc_side.py` | 368 |
+| `tests/models/deepseek_v41/sm80/test_sm80_mhc_side.py` | 480 |
 | `tests/models/deepseek_v41/sm80/test_sm80_moe_allreduce.py` | 207 |
 | `tests/models/deepseek_v41/sm80/test_sm80_pipeline_lifecycle.py` | 126 |
 | `tests/models/deepseek_v41/sm80/test_sm80_pipeline_rope.py` | 59 |
@@ -554,7 +554,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **255 files** | **111,273** |
+| **255 files** | **111,385** |
 
 #### `tools/`
 
@@ -871,11 +871,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 196 |
-| Fork-added product lines | 66,047 |
+| Fork-added product lines | 66,097 |
 | Patched upstream files | 102 |
 | Patched upstream lines | +4,886 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 69,671 |
+| Product lines added (new files and patches) | 69,721 |
 | Fork environment variables (flags) | 147 |
 | Unreferenced fork definitions | 6 (56 lines) |

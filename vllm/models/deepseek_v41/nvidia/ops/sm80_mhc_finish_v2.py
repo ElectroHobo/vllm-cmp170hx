@@ -395,10 +395,11 @@ class FinishV2Warmup(VllmJitKernel["FinishV2Warmup.Key"]):
         residual = torch.zeros(T, hc, HIDDEN, dtype=bf16, device=dev)
         norm = torch.ones(HIDDEN, dtype=bf16, device=dev)
         carried = torch.full((T, hc), 0.25, dtype=torch.float32, device=dev)
-        # with VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM also the two kinds of CTA
-        # launched apart, as inside a decoder layer's forward
+        # with VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM taken by the decoder layers
+        # (sm80_mhc_side.layer_scope) also the two kinds of CTA launched
+        # apart, as inside a decoder layer's forward
         scopes = [contextlib.nullcontext()]
-        if sm80_mhc_side.ACTIVE:
+        if sm80_mhc_side.IN_USE:
             scopes.append(sm80_mhc_side.LAYER)
         for scope in scopes:
             with scope:

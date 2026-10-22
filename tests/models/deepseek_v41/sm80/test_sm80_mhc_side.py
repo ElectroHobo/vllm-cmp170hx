@@ -4,15 +4,18 @@
 (``VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM``, ``ops/sm80_mhc_side.py``) on CPU.
 
 - The switch is declared and off by default; ``layer_scope`` takes only the
-  fused path with the finish kernel; a decoder layer's forward runs inside
-  its scope.
+  fused path with the finish kernel and refuses microbatching; the finish
+  warmup launches apart only once a layer took the scope; a decoder layer's
+  forward runs inside its scope.
 - The order of work, with the streams, the event and the finish kernels
   replaced by recorders: inside a layer's forward a finish launches its
   layer-input CTAs in place and defers its coefficient CTAs; the all-reduce
   forks them onto the side stream after the current stream's work and joins
   them after its own; without an all-reduce the next mHC call (before its
   kernel A) or the end of the forward launches them inline; outside a
-  forward, or above ``MAX_ROWS`` rows, the one launch of before.
+  forward, or above ``MAX_ROWS`` rows, the one launch of before; an
+  all-reduce or flush on another stream launches them inline on the stream
+  they were deferred on, and waits for it.
 - The bits: the Triton finish launched apart (layer-input CTAs, then the
   coefficient CTAs; outputs filled with NaN first) writes the bits of its one
   launch, in the Triton interpreter, for every call form.
@@ -21,12 +24,17 @@
   coefficient-only and layer-input-only kernels hold between them exactly
   the PART 0 kernel's floating-point arithmetic (PTX ops with their rounding
   suffixes; SASS FP instructions, ptxas's contractions included).
+- On an sm_80 card (skipped without one): the served finish v2, compiled
+  for the card, launched apart (PART 2 in place, PART 1 on the side stream
+  beside an all-reduce, or inline at the forward's end) writes the bits of
+  its one PART 0 launch, every output NaN-filled first, at 1..40 rows.
 
     pytest -q tests/models/deepseek_v41/sm80/test_sm80_mhc_side.py
 """
 
 import collections
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -80,12 +88,34 @@ def test_layer_scope_takes_only_the_fused_finish_kernel(monkeypatch):
     assert side.layer_scope(fused) is None
 
 
+def test_layer_scope_refuses_microbatching_and_marks_the_warmup(monkeypatch):
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_finish_v2 as finish_v2
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused as fused
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side as side
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(fused, "FINISH_KERNEL", True)
+    monkeypatch.setattr(side, "IN_USE", False)
+    monkeypatch.setattr(side, "_microbatching", lambda: True)
+    with pytest.raises(ValueError, match="microbatching"):
+        side.layer_scope(fused)
+    assert side.layer_scope(sm80_mhc) is None  # inert: nothing to refuse
+    assert side.IN_USE is False
+    monkeypatch.setattr(side, "_microbatching", lambda: False)
+    assert side.layer_scope(fused) is side.LAYER and side.IN_USE is True
+    # The finish warmup launches the CTAs apart only for a scope in use.
+    assert "sm80_mhc_side.IN_USE" in inspect.getsource(finish_v2.FinishV2Warmup.compile)
+
+
 def test_layer_forward_runs_inside_its_scope(monkeypatch):
     from vllm.models.deepseek_v41.nvidia import sm80_model
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side as side
 
     seen = []
     monkeypatch.setattr(side, "_deferred", None)
+    main = object()
+    monkeypatch.setattr(side, "current_stream", lambda: main)
     layer = SimpleNamespace(_mhc_side=side.LAYER)
     layer._forward_layer = lambda *a, **k: (seen.append((side._open, a, k)),
                                             side.defer(lambda: seen.append("flushed")))
@@ -216,6 +246,32 @@ def test_finish_v2_goes_apart_the_same_way(side):
                         ("kernel_a", "main"), ("finish_v2", "main", None)]
 
 
+def test_another_streams_all_reduce_launches_them_inline_where_deferred(side):
+    import torch as t
+
+    other = _Stream("other", side.log)
+    with side.side.LAYER:
+        call(side.fused, _args(6))
+        with t.cuda.stream(other):
+            side.side.beside(side.all_reduce, "partial")
+        assert side.side._deferred is None
+    assert side.log == [("kernel_a", "main"), ("finish", "main", (6, 1), 2),
+                        ("finish", "main", (6, 1), 1), ("wait_stream", "other", "main"),
+                        ("all_reduce", "other")]
+
+
+def test_a_flush_on_another_stream_launches_them_where_deferred(side):
+    import torch as t
+
+    other = _Stream("other", side.log)
+    with side.side.LAYER:
+        call(side.fused, _args(6))
+        with t.cuda.stream(other):
+            side.side.flush()
+    assert side.log == [("kernel_a", "main"), ("finish", "main", (6, 1), 2),
+                        ("finish", "main", (6, 1), 1), ("wait_stream", "other", "main")]
+
+
 def test_finish_v2_launch_grid_per_part(monkeypatch):
     from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_finish_v2 as finish_v2
 
@@ -243,6 +299,7 @@ def interpreted_split_bits(T: int = 5, hidden: int = 1056, calls: int = 3) -> di
     fused.post_prenorm = _stand_in_kernel_a
     fused.FINISH_KERNEL, fused.FINISH_V2 = True, False
     side.defers = lambda rows, device: side._open
+    side.current_stream = lambda: None  # CPU tensors: no device stream
     empty = torch.empty
 
     def nan_empty(*args, **kwargs):
@@ -366,3 +423,58 @@ def test_parts_keep_the_finish_code(key):
     assert _ptx_fp(both) == _ptx_fp(coefficients) + _ptx_fp(layer_input)
     assert _sass_fp(lines[0]) == _sass_fp(lines[1]) + _sass_fp(lines[2])
     assert sum(_sass_fp(lines[1]).values()) and sum(_sass_fp(lines[2]).values())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
+    reason="needs an sm_80 card",
+)
+@pytest.mark.parametrize("T", [1, 4, 6, 16, 32, 40])
+def test_finish_v2_apart_on_the_card_writes_the_bits_of_one_launch(monkeypatch, T):
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_fused as fused
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side as side
+
+    monkeypatch.setattr(fused, "FINISH_KERNEL", True)
+    monkeypatch.setattr(fused, "FINISH_V2", True)
+    monkeypatch.setattr(side, "_deferred", None)
+    empty = torch.empty
+
+    def nan_empty(*args, **kwargs):
+        t = empty(*args, **kwargs)
+        return t.fill_(float("nan")) if t.is_floating_point() else t
+
+    monkeypatch.setattr(torch, "empty", nan_empty)
+
+    def joined(a):
+        # PART 2 in place, PART 1 on the side stream beside an all-reduce.
+        with side.LAYER:
+            out = call(fused, a)
+            assert side._deferred is not None
+            side.beside(lambda x: x, None)
+            assert side._deferred is None
+        return out
+
+    def flushed(a):
+        # PART 2 in place, PART 1 inline at the end of the forward.
+        with side.LAYER:
+            out = call(fused, a)
+            assert side._deferred is not None
+        return out
+
+    checked = 0
+    for seed in range(2):
+        for name, a in variants(T, 5120, seed).items():
+            a = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in a.items()}
+            one = call(fused, a)
+            for how in (joined, flushed):
+                apart = how(a)
+                torch.cuda.synchronize()
+                for o, v in one.items():
+                    w = apart[o]
+                    bits = torch.int16 if v.dtype == torch.bfloat16 else torch.int32
+                    where = f"{name}/{o} rows {T} seed {seed} {how.__name__}"
+                    assert not v.isnan().any(), where
+                    assert v.shape == w.shape and torch.equal(v.view(bits), w.view(bits)), where
+                    checked += 1
+    # fused forms: residual + 4 outputs; pre-only forms: 4 outputs
+    assert checked == 2 * 2 * (3 * 5 + 2 * 4)
