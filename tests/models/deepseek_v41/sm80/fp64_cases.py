@@ -588,6 +588,9 @@ _WORKSPACE = {
     "moe_out_prefill_v2": "moe_workspace_size_prefill_v2",
 }
 
+# VLLM_TRY_MOE_V2: the trial operator judged in moe_out_v2's place.
+_TRY_WORKSPACE = {"moe_out_v2_try": "moe_workspace_size_v2_try"}
+
 
 # The routed-expert families and the expert matrices of each expert, in order.
 EXL3_MOE_FAMILIES = tuple(f"exl3_{op}" for op in _WORKSPACE)
@@ -796,21 +799,34 @@ def _exl3_moe_call(
             raise ValueError(f"{name} bits_x2 {a.get('bits_x2')} for routed "
                              f"matrices of bits_x2 {bits}")
         extra = {"bits_x2": bits[0]}
+    # VLLM_TRY_MOE_V2: a moe_out_v2 call of the configuration the flag covers
+    # judges moe_out_v2_try in its place (and reports whether it gives
+    # moe_out_v2's bits).
+    cand = name
+    if name == "moe_out_v2" and ops.moe_v2_try_open(
+        x.shape[1], inter, ids.shape[1], meta.shape[0], emap.numel(), extra["bits_x2"]
+    ):
+        ops.require_moe_v2_try()
+        cand = "moe_out_v2_try"
 
     def run(op, rows):
         xr = x[rows]
         out = torch.full_like(xr, float("nan"))
-        size = getattr(ops, _WORKSPACE[op])(
+        size = getattr(ops, {**_WORKSPACE, **_TRY_WORKSPACE}[op])(
             xr.shape[0], x.shape[1], inter, ids.shape[1], meta.shape[0]
         )
         workspace = torch.full((size,), float("nan"), device=device)
         getattr(ops, op)(
             xr, ids[rows], tw[rows], pointers, meta, emap, inter, out, workspace,
-            swiglu_limit=limit, **(extra if op == name else {}),
+            swiglu_limit=limit, **(extra if op in (name, cand) else {}),
         )
         return out
 
-    whole = run(name, slice(None))
+    whole = run(cand, slice(None))
+    if cand != name:
+        same = bits_equal(whole, run(name, slice(None)))
+        print(f"{prefix} rows {x.shape[0]}: {cand} == {name} bit for bit: {same}",
+              file=sys.stderr)
     ref = run("moe_out", slice(None))
     exact = moe_exact(x, ids, tw, emap, weights, meta, inter, limit)
     n = x.shape[0]
@@ -819,7 +835,7 @@ def _exl3_moe_call(
         subs = [slice(0, lo), slice(n - lo, n)] if n > lo else []
     else:
         subs = [slice(i, i + 1) for i in picks(n)]
-    alone = all(bits_equal(whole[s], run(name, s)) for s in subs)
+    alone = all(bits_equal(whole[s], run(cand, s)) for s in subs)
     return Call(whole, ref, exact, alone)
 
 
