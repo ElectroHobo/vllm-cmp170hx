@@ -164,3 +164,19 @@ def route(
         BLOCK_E=triton.next_power_of_2(E), BLOCK_D=p.block_d, SPLIT=p.split, EXACT=p.exact,
         GSPLIT=p.gsplit, GCOLS=p.gcols, num_warps=_ROUTE_WARPS)
     return weights, ids
+
+
+def gate_route(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    bias_vl: torch.Tensor | None,
+    top_k: int,
+    input_ids: torch.Tensor | None = None,
+    sentinel_lo: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`gate` then :func:`route` of one call; ``weight`` [E, 5120] BF16
+    (or FP32 holding BF16 values)."""
+    w16 = (weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)).contiguous()
+    _, pending = gate(x, w16)
+    return route(pending, w16, bias, bias_vl, input_ids, top_k, sentinel_lo)

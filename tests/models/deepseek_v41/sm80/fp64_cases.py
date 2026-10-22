@@ -78,6 +78,16 @@ unless named in full.
 - ``engram_dequant``: ``sm80_engram_dequant:dequant_engram_rows`` (values,
   scales) -> Triton / ``dequant_engram_rows_reference`` on CPU / the E4M3 x
   E8M0 product in FP64. Exact: bitwise.
+- ``moe_router``: ``sm80_router_mma:gate_route`` (x, weight, bias, bias_vl,
+  top_k): one MoE layer's gate and routing on its captured input x with the
+  layer's gate tensors (``weight`` FP32 holding the checkpoint's BF16
+  values) -> the BF16 tensor-core gate + route (``sm80_router_mma``) / the
+  shipped path (``sm80_gate_gemv`` up to its rows, else the FP32 GEMM, then
+  ``sm80_route.route_fused``) / logits, sqrt(softplus), the biased top-k
+  and the normalised weights in FP64. The output is the [rows, experts]
+  matrix of routing weights at the chosen ids (zero elsewhere), so an id
+  that differs from the FP64 choice costs its whole weight. Text tokens
+  (the image bias is not selected).
 - ``exl3_moe_out``, ``exl3_moe_out_v2``, ``exl3_moe_out_prefill``,
   ``exl3_moe_out_prefill_v2``: ``vllm.sm80.kernels.exl3.ops:moe_out`` /
   ``moe_out_v2`` / ``moe_out_prefill`` / ``moe_out_prefill_v2`` (x,
@@ -510,6 +520,63 @@ def engram_dequant(a: dict, device: torch.device, _src: Source) -> Call:
     ).view(n, dim)
     alone = all(bits_equal(whole[i : i + 1], cand(slice(i, i + 1))) for i in picks(n))
     return Call(whole, dequant_engram_rows_reference(values, scales), exact, alone)
+
+
+# ---------------------------------------------------------------- MoE router
+
+
+def _router_dense(weights: torch.Tensor, ids: torch.Tensor, experts: int, dtype) -> torch.Tensor:
+    """[rows, experts] holding each row's routing weights at its expert ids."""
+    out = torch.zeros(ids.shape[0], experts, dtype=dtype, device=weights.device)
+    return out.scatter_(1, ids.long(), weights.to(dtype))
+
+
+def moe_router(a: dict, device: torch.device, _src: Source) -> Call:
+    import torch.nn.functional as F
+
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv, sm80_route
+    from vllm.models.deepseek_v41.nvidia.ops.sm80_router_mma import (
+        EXACT_ROWS,
+        SCALE,
+        gate_route,
+    )
+
+    x = a["x"].to(device).contiguous()
+    w = a["weight"].to(device).float().contiguous()
+    bias, bias_vl = a["bias"].to(device).contiguous(), a["bias_vl"].to(device).contiguous()
+    top_k = int(a["top_k"])
+    n, experts = x.shape[0], w.shape[0]
+    w16 = w.to(BF16)
+
+    def cand(rows):
+        wt, ids = gate_route(x[rows], w16, bias, bias_vl, top_k)
+        return _router_dense(wt, ids, experts, torch.float32)
+
+    def ref(rows):
+        xr = x[rows]
+        if sm80_gate_gemv.serves(xr, w):
+            logits = sm80_gate_gemv.gate_gemv(xr, w)
+        else:
+            logits = F.linear(xr.float(), w)
+        wt, ids = sm80_route.route_fused(logits, bias, top_k, bias_vl=bias_vl,
+                                         routed_scaling_factor=SCALE)
+        return _router_dense(wt, ids, experts, torch.float32)
+
+    logits = x.double() @ w.double().T
+    scores = torch.logaddexp(logits, torch.zeros_like(logits)).sqrt()
+    ids = (scores + bias.double()).topk(top_k, dim=-1).indices
+    chosen = scores.gather(1, ids)
+    exact = _router_dense(chosen / (chosen.sum(-1, keepdim=True) + 1e-20) * SCALE, ids, experts,
+                          torch.float64)
+    whole = cand(slice(None))
+    # Rows alone: in a call of their own regime (exact recompute up to
+    # EXACT_ROWS rows, the gate's logits above).
+    width = 1 if n <= EXACT_ROWS else EXACT_ROWS + 1
+    alone = True
+    for i in picks(n):
+        lo = min(i, n - width)
+        alone &= bits_equal(whole[i : i + 1], cand(slice(lo, lo + width))[i - lo : i - lo + 1])
+    return Call(whole, ref(slice(None)), exact, alone)
 
 
 # ---------------------------------------------------------------- EXL3 MoE
@@ -1180,6 +1247,7 @@ FAMILIES = {
     "compress": compress,
     "index_keys": index_keys,
     "engram_dequant": engram_dequant,
+    "moe_router": moe_router,
     **{
         f"exl3_{op}": functools.partial(_exl3_moe, op)
         for op in ("moe_out", "moe_out_v2", "moe_out_prefill", "moe_out_prefill_v2")
@@ -1232,6 +1300,9 @@ POINTS = {
     "engram_dequant": (
         "vllm.models.deepseek_v41.nvidia.ops.sm80_engram_dequant:dequant_engram_rows",
         ["values", "scales"]),
+    "moe_router": (
+        "vllm.models.deepseek_v41.nvidia.ops.sm80_router_mma:gate_route",
+        ["x", "weight", "bias", "bias_vl", "top_k"]),
     "exl3_moe_out": ("vllm.sm80.kernels.exl3.ops:moe_out", _MOE_ARGS),
     "exl3_moe_out_v2": ("vllm.sm80.kernels.exl3.ops:moe_out_v2", _MOE_ARGS + ["bits_x2"]),
     "exl3_moe_out_prefill": ("vllm.sm80.kernels.exl3.ops:moe_out_prefill", _MOE_ARGS),
