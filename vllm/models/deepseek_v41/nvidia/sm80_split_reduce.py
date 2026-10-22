@@ -24,8 +24,11 @@ layer's tensors row for row.
 The cut is a multiple of :data:`SLICE_ALIGN` = 512 rows, the routed experts'
 row chunk (``moe_out_prefill_v2``, ``csrc/exl3/moe_prefill_v2.cu``
 ``kChunkRows``) and a multiple of Marlin's 64-row blocks, so the expert
-kernels run the row chunks they run unsplit and decode no weight twice. Each
-slice's sum takes the path the whole message would
+kernels run the row chunks they run unsplit and decode no weight twice. With
+``VLLM_EXL3_MOE_PREFILL_UNCHUNKED`` a call of up to 2048 rows runs as one
+launch sequence, so a split step decodes each touched expert once per slice
+(twice per step) where the unsplit step would decode it once; the results
+are the same. Each slice's sum takes the path the whole message would
 (``DeepseekV41Sm80Attention.reduce_wo_b``, ``Sm80DeepseekV41MoE.reduce``). A
 step splits only when the host-staged and the custom all-reduce take neither
 slice: their messages stay whole on the main stream.

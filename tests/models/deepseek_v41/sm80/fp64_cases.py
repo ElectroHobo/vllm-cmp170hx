@@ -804,9 +804,10 @@ def _exl3_moe_call(
             raise ValueError(f"{name} bits_x2 {a.get('bits_x2')} for routed "
                              f"matrices of bits_x2 {bits}")
         extra = {"bits_x2": bits[0]}
-    # VLLM_EXL3_MOE_V2_RING: a moe_out_v2 call of the configuration the flag covers
-    # judges moe_out_v2_try in its place (and reports whether it gives
-    # moe_out_v2's bits).
+    # VLLM_EXL3_MOE_V2_RING: a moe_out_v2 call of the configuration the flag
+    # covers judges moe_out_v2_try in its place, which must give moe_out_v2's
+    # bits (the case fails otherwise). Calls the served moe_out_v2_fold or
+    # moe_out_v2_try made are captured as exl3_moe_out_v2 (capture_points.py).
     cand = name
     if name == "moe_out_v2" and ops.moe_v2_try_open(
         x.shape[1], inter, ids.shape[1], meta.shape[0], emap.numel(), extra["bits_x2"]
@@ -832,6 +833,9 @@ def _exl3_moe_call(
         same = bits_equal(whole, run(name, slice(None)))
         print(f"{prefix} rows {x.shape[0]}: {cand} == {name} bit for bit: {same}",
               file=sys.stderr)
+        if not same:
+            raise ValueError(f"{prefix} rows {x.shape[0]}: {cand} does not give "
+                             f"{name}'s bits")
     ref = run("moe_out", slice(None))
     exact = moe_exact(x, ids, tw, emap, weights, meta, inter, limit)
     n = x.shape[0]

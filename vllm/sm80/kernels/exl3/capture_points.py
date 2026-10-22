@@ -11,16 +11,23 @@ VLLM_SM80_CAPTURE_DIR; inert when it is unset).
   padded_out, bits_x2, codebook, out_dtype, row_chunk, weight_sha256 of the
   rank's trellis, suh and svh bytes) and the operator that ran.
 - ``moe`` (points ``exl3_moe_out``, ``exl3_moe_out_v2``,
-  ``exl3_moe_out_prefill``: the operator the dispatch chose): every call of
-  Exl3Experts.apply on a registered layer, with the arguments of the FP64
-  case driver's capture point (x, topk_ids, topk_weights, packed_meta,
-  expert_map, intermediate_size, swiglu_limit, and bits_x2 for moe_out_v2)
-  and the output ``out``. The prefix is the layer's module prefix.
+  ``exl3_moe_out_prefill``, ``exl3_moe_out_prefill_v2``: the operator family
+  the dispatch chose; moe_out_v2_fold and moe_out_v2_try, which return
+  moe_out_v2's bits, record as ``exl3_moe_out_v2`` with the operator in
+  meta): every call of Exl3Experts.apply on a registered layer, with the
+  arguments of the FP64 case driver's capture point (x, topk_ids,
+  topk_weights, packed_meta, expert_map, intermediate_size, swiglu_limit, and
+  bits_x2 for moe_out_v2) and the output ``out``. The prefix is the layer's
+  module prefix.
 """
 
 import torch
 
 from vllm.sm80 import capture
+
+# Operators that return another operator's output bits record under its
+# point, so a case driver replays them as that operator.
+_MOE_POINTS = {"moe_out_v2_fold": "moe_out_v2", "moe_out_v2_try": "moe_out_v2"}
 
 
 def register_linear(weight, row_chunk: int, out_dtype: torch.dtype) -> None:
@@ -84,7 +91,11 @@ def moe(
         return
     func = getattr(operator, "func", operator)
     keywords = dict(getattr(operator, "keywords", None) or {})
-    rec = capture.begin("moe", f"exl3_{func.__name__}", facts["prefix"], x.shape[0])
+    name = func.__name__
+    rec = capture.begin(
+        "moe", f"exl3_{_MOE_POINTS.get(name, name)}", facts["prefix"], x.shape[0],
+        operator=name,
+    )
     if rec is None:
         return
     rec.put(

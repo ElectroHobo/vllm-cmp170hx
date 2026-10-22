@@ -201,6 +201,33 @@ def test_moe_point_names_operator(on):
     # The tensor parallel rank and size say which columns of each expert a
     # call held when the routed experts are split (one process: 0 of 1).
     assert (obj["meta"]["tp_rank"], obj["meta"]["tp_size"]) == (0, 1)
+    assert obj["meta"]["operator"] == "moe_out_v2"
+
+
+@pytest.mark.parametrize("name", ["moe_out_v2_fold", "moe_out_v2_try"])
+def test_moe_point_of_an_operator_with_v2_bits_is_v2(on, name):
+    """moe_out_v2_fold and moe_out_v2_try return moe_out_v2's bits: their calls
+    record as exl3_moe_out_v2 (a family the FP64 case driver replays), the
+    operator in meta."""
+    import functools
+
+    def operator(*a, **k):
+        pass
+
+    operator.__name__ = name
+    pointers = torch.zeros(2, 3, 3, dtype=torch.int64)
+    capture_points.register_moe(pointers, "model.layers.3.ffn.experts")
+    _step([1])
+    capture_points.moe(
+        functools.partial(operator, bits_x2=6), torch.ones(1, 4),
+        torch.zeros(1, 6, dtype=torch.int32), torch.ones(1, 6), pointers,
+        torch.zeros(2, 3, 4, dtype=torch.int64), torch.arange(4, dtype=torch.int32),
+        2304, 10.0, torch.zeros(1, 4),
+    )
+    (line,) = _index(on)
+    obj = torch.load(line["path"], weights_only=True)
+    assert obj["family"] == "exl3_moe_out_v2"
+    assert obj["meta"]["operator"] == name and obj["tensors"]["bits_x2"] == 6
 
 
 def test_mhc_proxy_records_call_and_outputs(on):

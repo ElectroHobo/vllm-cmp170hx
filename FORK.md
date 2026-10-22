@@ -63,7 +63,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/deepseek_v41/nvidia/sm80_model.py` | 529 |
 | `vllm/models/deepseek_v41/nvidia/sm80_moe.py` | 427 |
 | `vllm/models/deepseek_v41/nvidia/sm80_pipeline_capture.py` | 184 |
-| `vllm/models/deepseek_v41/nvidia/sm80_split_reduce.py` | 242 |
+| `vllm/models/deepseek_v41/nvidia/sm80_split_reduce.py` | 245 |
 | `vllm/models/deepseek_v41/nvidia/sm80_swa_meta_batch.py` | 445 |
 | `vllm/models/glm5next/nvidia/model_state.py` | 113 |
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
@@ -72,7 +72,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **19 files** | **7,246** |
+| **19 files** | **7,249** |
 
 ### `vllm/sm80/kernels/`
 
@@ -90,7 +90,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/attention/triton_mla_sparse.py` | 593 |
 | `vllm/sm80/kernels/attention/triton_mqa_logits.py` | 628 |
 | `vllm/sm80/kernels/exl3/__init__.py` | 13 |
-| `vllm/sm80/kernels/exl3/capture_points.py` | 100 |
+| `vllm/sm80/kernels/exl3/capture_points.py` | 111 |
 | `vllm/sm80/kernels/exl3/dense_mma.py` | 151 |
 | `vllm/sm80/kernels/exl3/dense_prefill_tc.py` | 354 |
 | `vllm/sm80/kernels/exl3/hybrid.py` | 133 |
@@ -99,7 +99,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/ops.py` | 1,316 |
 | `vllm/sm80/kernels/exl3/override.py` | 128 |
 | `vllm/sm80/kernels/exl3/placement.py` | 131 |
-| `vllm/sm80/kernels/exl3/quant.py` | 1,852 |
+| `vllm/sm80/kernels/exl3/quant.py` | 1,848 |
 | `vllm/sm80/kernels/exl3/replicas.py` | 389 |
 | `vllm/sm80/kernels/exl3/step_phase.py` | 85 |
 | `vllm/sm80/kernels/exl3/utils.py` | 401 |
@@ -134,7 +134,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **54 files** | **18,659** |
+| **54 files** | **18,666** |
 
 ### `vllm/sm80/`
 
@@ -158,7 +158,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
 | `vllm/sm80/distributed/step_errors.py` | 166 |
-| `vllm/sm80/envs.py` | 1,633 |
+| `vllm/sm80/envs.py` | 1,635 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -194,7 +194,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 231 |
-| **52 files** | **15,379** |
+| **52 files** | **15,381** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -328,7 +328,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_chunk_rows.py` | 273 |
 | `tests/kernels/quantization/test_exl3_moe_prefill.py` | 536 |
 | `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
-| `tests/kernels/quantization/test_exl3_moe_prefill_v2.py` | 729 |
+| `tests/kernels/quantization/test_exl3_moe_prefill_v2.py` | 727 |
 | `tests/kernels/quantization/test_exl3_moe_swiglu_clamp.py` | 83 |
 | `tests/kernels/quantization/test_exl3_moe_tp_shapes.py` | 102 |
 | `tests/kernels/quantization/test_exl3_moe_v2.py` | 618 |
@@ -336,11 +336,11 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_v2_fold.py` | 1,029 |
 | `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 594 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
-| `tests/kernels/quantization/test_exl3_moe_v2_switches.py` | 58 |
+| `tests/kernels/quantization/test_exl3_moe_v2_switches.py` | 411 |
 | `tests/kernels/quantization/test_exl3_placement.py` | 202 |
 | `tests/kernels/quantization/test_exl3_replicas.py` | 409 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 119 |
-| `tests/kernels/quantization/test_sm80_capture.py` | 411 |
+| `tests/kernels/quantization/test_sm80_capture.py` | 438 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
 | `tests/kernels/test_ampere_decode.py` | 464 |
 | `tests/kernels/test_ampere_decode_mhc_v3.py` | 392 |
@@ -393,7 +393,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/export_mhc_consumer_cases.py` | 225 |
 | `tests/models/deepseek_v41/sm80/fixtures/config.json` | 184 |
 | `tests/models/deepseek_v41/sm80/fixtures/exl3_headers.json` | 25,297 |
-| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 1,656 |
+| `tests/models/deepseek_v41/sm80/fp64_cases.py` | 1,660 |
 | `tests/models/deepseek_v41/sm80/hybrid_consumer_cases.py` | 281 |
 | `tests/models/deepseek_v41/sm80/hybrid_fixture.py` | 189 |
 | `tests/models/deepseek_v41/sm80/hybrid_linear_cases.py` | 224 |
@@ -554,7 +554,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **255 files** | **111,392** |
+| **255 files** | **111,774** |
 
 #### `tools/`
 
@@ -871,11 +871,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 196 |
-| Fork-added product lines | 66,101 |
+| Fork-added product lines | 66,113 |
 | Patched upstream files | 102 |
 | Patched upstream lines | +4,886 / -804 |
 | Patched upstream product files | 77 |
 | Patched upstream product lines | +3,624 / -253 |
-| Product lines added (new files and patches) | 69,725 |
+| Product lines added (new files and patches) | 69,737 |
 | Fork environment variables (flags) | 147 |
 | Unreferenced fork definitions | 6 (56 lines) |
