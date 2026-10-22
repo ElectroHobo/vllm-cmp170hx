@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The three DSpark adaptive-depth Triton kernels on one sm_80 card, and a CPU
+"""The two DSpark adaptive-depth Triton kernels on one sm_80 card, and a CPU
 proof that these checks catch a broken kernel.
 
 - ``_row_mask_kernel`` (``compute_row_mask``) writes ``reference_row_mask``'s
   ``live_len`` wherever the float32 numpy reference's best score leads by more
   than 1e-5 (the device's exp and log may round differently near a tie), and
   ``row_live`` exactly as its own ``live_len`` lays out, eagerly and replayed
-  from a CUDA graph whose inputs (slots, features, histories, weights, costs,
-  earlier row flags) change in place between replays; raw-confidence,
-  random and draft-logit-statistics policies, K = 1, 3, 5, 7.
-- ``_history_kernel`` (``update_history``) writes bitwise
-  ``reference_history``'s histories, eagerly and replayed.
+  from a CUDA graph whose inputs (slots, features, weights, costs, earlier
+  row flags) change in place between replays; raw-confidence, random and
+  draft-logit-statistics policies, K = 1, 3, 5, 7.
 - ``_publish_kernel``, through the row-mask drafter's ``_sample_sequential``
   inside a captured draft step: replays with new slots, padding requests and
   confidences publish each request's row at its slot (zeros past a narrower
@@ -52,8 +50,6 @@ FAULTS = {
     "publish": ("vllm/sm80/spec_decode/dspark_row_mask_conf.py",
                 "conf = tl.load(conf_ptr + req * conf_stride + cols, mask=cols < width, other=0.0)",
                 "conf = tl.load(conf_ptr + req * conf_stride + cols, mask=cols < max_draft, other=0.0)"),
-    "history": ("vllm/sm80/spec_decode/dspark_row_mask_kernel.py",
-                "tl.where(accepted == d, 1.0, 0.0)", "tl.where(accepted >= d - 1, 1.0, 0.0)"),
 }
 
 
@@ -72,25 +68,22 @@ def _capture(run):
 
 def _features(gen, trial):
     """Random per-slot features and weights; trial 0: raw-confidence policy,
-    1: random weights over the confidence and history, 2: with draft-logit
-    statistics."""
+    1: random weights over the confidence, 2: with draft-logit statistics."""
     conf = torch.rand(MAX_REQS, MAX_DRAFT, generator=gen)
     if trial == 1:
         conf = conf.sqrt().sqrt()  # near-one: keeps more drafts
     stats = torch.stack((torch.rand(MAX_REQS, MAX_DRAFT, generator=gen),
                          torch.rand(MAX_REQS, MAX_DRAFT, generator=gen) * 5.0), dim=1)
-    hist = torch.rand(MAX_REQS, generator=gen)
-    prev = (torch.rand(MAX_REQS, generator=gen) < 0.5).float()
-    weights = torch.zeros(MAX_DRAFT, 6)
+    weights = torch.zeros(MAX_DRAFT, 4)
     if trial == 0:
         weights[:, 1] = 1.0
     else:
-        weights = torch.randn(MAX_DRAFT, 6, generator=gen)
+        weights = torch.randn(MAX_DRAFT, 4, generator=gen)
         weights[:, 0] += 1.5
         weights[:, 1] = weights[:, 1].abs() + 0.5
         if trial == 1:
             weights[:, 2:4] = 0.0
-    return conf, stats, hist, prev, weights, trial == 2
+    return conf, stats, weights, trial == 2
 
 
 def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
@@ -109,7 +102,7 @@ def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
                 idx = torch.zeros(b, dtype=torch.int64, device=device)
 
                 def refresh(trial: int):
-                    conf, stats, hist, prev, weights, _ = _features(
+                    conf, stats, weights, _ = _features(
                         gen, 2 if uses_stats else trial % 2)
                     slots = torch.randperm(MAX_REQS, generator=gen)[:b]
                     conf[slots[0], 0] = 1e-4  # this request keeps no draft
@@ -121,14 +114,12 @@ def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
                     for s in (state, ref):
                         s.conf_by_slot.copy_(conf)
                         s.stats_by_slot.copy_(stats)
-                        s.hist_ema.copy_(hist)
-                        s.prev_full.copy_(prev)
                         s.weights.copy_(weights)
                         s.cost.copy_(cost)
                         s.row_live.copy_(rows)
                         s.live_len.fill_(-3)
                     idx.copy_(slots)
-                    return slots, conf, stats, hist, prev, weights, cost, rows
+                    return slots, conf, stats, weights, cost, rows
 
                 run = lambda: kmod.compute_row_mask(state, idx, b, k)  # noqa: E731
                 g = None
@@ -136,7 +127,7 @@ def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
                     refresh(0)
                     g = _capture(run)
                 for trial in range(3):
-                    slots, conf, stats, hist, prev, weights, cost, rows = refresh(trial)
+                    slots, conf, stats, weights, cost, rows = refresh(trial)
                     if g is not None:
                         g.replay()
                         torch.cuda.synchronize()
@@ -148,7 +139,6 @@ def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
                     assert got[b:].tolist() == [-3] * (MAX_REQS - b), case
                     for r, slot in enumerate(slots.tolist()):
                         _, lead = np_decide(conf[slot].tolist(), stats[slot].tolist(),
-                                            float(hist[slot]), float(prev[slot]),
                                             weights.numpy(), cost[b].tolist(), b, k, uses_stats)
                         if lead > 1e-5:
                             compared += 1
@@ -160,53 +150,8 @@ def check_row_mask(kmod, device: torch.device, graph: bool) -> None:
                         assert 0 <= d <= k, case
                         want[r * (k + 1) + d + 1 : (r + 1) * (k + 1)] = 0
                     assert torch.equal(state.row_live.cpu(), want), case
-                    assert state.active and state.step_drafts == k, case
+                    assert state.active, case
     assert compared > 0
-
-
-def check_history(kmod, device: torch.device, graph: bool) -> None:
-    """``kmod.update_history`` bitwise against ``reference_history`` on CPU
-    copies, eagerly and replayed with new inputs."""
-    gen = torch.Generator().manual_seed(3)
-    for b in (1, 3, MAX_REQS):
-        for k in (1, 3, MAX_DRAFT):
-            state = RowMaskState(MAX_REQS, MAX_TOKENS, MAX_DRAFT, device)
-            ref = RowMaskState(MAX_REQS, MAX_TOKENS, MAX_DRAFT, torch.device("cpu"))
-            idx = torch.zeros(b, dtype=torch.int64, device=device)
-            rejected = torch.zeros(b, dtype=torch.int32, device=device)
-            for s in (state, ref):
-                s.step_drafts, s.ema_decay = k, 0.625
-
-            def refresh():
-                slots = torch.randperm(MAX_REQS, generator=gen)[:b]
-                live = torch.randint(0, k + 1, (MAX_REQS,), generator=gen, dtype=torch.int32)
-                rej = torch.randint(0, k + 1, (b,), generator=gen, dtype=torch.int32)
-                hist = torch.rand(MAX_REQS, generator=gen)
-                prev = (torch.rand(MAX_REQS, generator=gen) < 0.5).float()
-                for s in (state, ref):
-                    s.live_len.copy_(live)
-                    s.hist_ema.copy_(hist)
-                    s.prev_full.copy_(prev)
-                idx.copy_(slots)
-                rejected.copy_(rej)
-                return slots, rej
-
-            run = lambda: kmod.update_history(state, idx, rejected, b)  # noqa: E731
-            g = None
-            if graph:
-                refresh()
-                g = _capture(run)
-            for trial in range(3):
-                slots, rej = refresh()
-                if g is not None:
-                    g.replay()
-                    torch.cuda.synchronize()
-                else:
-                    run()
-                kernel_module.reference_history(ref, slots, rej, b)
-                case = (b, k, trial, graph)
-                assert torch.equal(state.hist_ema.cpu(), ref.hist_ema), case
-                assert torch.equal(state.prev_full.cpu(), ref.prev_full), case
 
 
 class _DraftStep:
@@ -308,8 +253,6 @@ def interpreted_results() -> dict:
         "row_mask/faulty": outcome(check_row_mask, faulty("row_mask")),
         "publish/real": outcome(check_publish, conf_module),
         "publish/faulty": outcome(check_publish, faulty("publish")),
-        "history/real": outcome(check_history, kernel_module),
-        "history/faulty": outcome(check_history, faulty("history")),
     }
 
 
@@ -327,7 +270,7 @@ def interpreted(tmp_path_factory):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("kernel", ("row_mask", "publish", "history"))
+@pytest.mark.parametrize("kernel", ("row_mask", "publish"))
 def test_checks_pass_on_the_kernel_and_fail_on_a_fault(interpreted, kernel):
     assert interpreted[f"{kernel}/real"] == "pass", interpreted
     assert interpreted[f"{kernel}/faulty"].startswith("AssertionError"), interpreted
@@ -344,8 +287,3 @@ def test_cuda_row_mask_kernel_matches_the_reference(graph):
 def test_cuda_publish_in_a_captured_draft_step(graph):
     check_publish(conf_module, torch.device("cuda"), graph)
 
-
-@needs_sm80
-@pytest.mark.parametrize("graph", (False, True))
-def test_cuda_history_kernel_matches_the_reference(graph):
-    check_history(kernel_module, torch.device("cuda"), graph)

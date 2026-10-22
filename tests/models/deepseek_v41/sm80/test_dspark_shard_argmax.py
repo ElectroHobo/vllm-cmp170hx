@@ -407,7 +407,16 @@ def test_kernels_compile_for_sm80():
     tp, chunks = 4, -(-32320 // sa.BLOCK)
     build(sa._chunk_slots_kernel,
           {"logits_ptr": "*fp32", "logits_stride": "i32", "slots_ptr": "*bf16",
-           "n_cols": "i32", "col_start": "i32", "rank": "i32"},
+           "row_stride": "i32", "n_cols": "i32", "col_start": "i32", "rank": "i32"},
           dict(TP=tp, TP_P2=4, CHUNKS=chunks, BLOCK=sa.BLOCK), 8)
-    build(sa._pick_kernel, {"slots_ptr": "*bf16", "out_ptr": "*i64", "vocab": "i32"},
+    build(sa._pick_kernel, {"slots_ptr": "*bf16", "row_stride": "i32", "out_ptr": "*i64",
+                            "vocab": "i32"},
           dict(SLOTS=tp * chunks, SLOTS_P2=32), 1)
+    build(sa._shard_stats_kernel,
+          {"logits_ptr": "*fp32", "logits_stride": "i32", "slots_ptr": "*bf16",
+           "row_stride": "i32", "base": "i32", "n_cols": "i32", "rank": "i32"},
+          dict(TP=tp, TP_P2=4, CHUNKS=chunks, BLOCK=sa.BLOCK), 8)
+    build(sa._combine_stats_kernel,
+          {"slots_ptr": "*bf16", "row_stride": "i32", "base": "i32", "out_ptr": "*fp32",
+           "out_row_stride": "i32", "out_col_stride": "i32"},
+          dict(TP=tp, TP_P2=4), 1)

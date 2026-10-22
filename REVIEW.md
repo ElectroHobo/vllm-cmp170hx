@@ -11,10 +11,12 @@ state, no extra kernel; the runner hooks return at once.
 
 Policy: per draft position i, `p_i = sigmoid(w_i . x_i)` over the features the
 file lists among `bias`, `logit_conf` (log-odds of the confidence head),
-`logit_top1`, `ent` (top-1 probability and entropy of the draft logits; these
-two refuse `VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX` and draft top-k at load),
-`hist_ema` (per request slot, EMA of accepted/verified drafts) and
-`prev_full` (the last round accepted every verified draft). Then
+`logit_top1` and `ent` (top-1 probability and entropy of the full-vocabulary
+draft logits, Markov bias included; refused with draft top-k). With
+`VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX` each rank adds its shard's softmax
+statistics (max, sum e^(l-m), sum e^(l-m) l, as byte lanes) to the BF16
+exchange the argmax already all-reduces, and every rank combines them in rank
+order into the same top-1 probability and entropy (`shard_argmax.py`). Then
 `d = argmax_k E(k) / cost_r(k)`, `E(k) = 1 + sum_{i<=k} prod_{j<=i} p_j`,
 `cost_r(k) = T_b(K) - (T_b(K) - T_b(k)) / b` from the file's cost table
 (ties: larger k). The raw-confidence rule is the policy with weights
@@ -28,17 +30,13 @@ Pieces, all reading `dspark_row_mask.RowMaskState` (fixed-address buffers):
    when listed, the draft-logit statistics) in every draft step; one Triton
    launch inside the draft graph publishes each request's per-position values
    at its state slot (padding requests write nothing; columns past the
-   drafted width are 0). At the start of `propose` (after the step's
-   rejection) `end_step` folds the step into each slot's history. A
-   zero-draft step resets its batch's confidences to 1.0.
+   drafted width are 0). A zero-draft step resets its batch's confidences
+   to 1.0.
 2. `dspark_row_mask_kernel.py`: before the target forward of a uniform
    speculative decode step (one call in the runner), one Triton launch
-   computes every request's `live_len` and `row_live` from its features,
-   history, the weights and the cost row of this step's b and K. Any other
-   step resets every row to live. A slot whose request id changed gets the
-   policy's initial history (host bookkeeping, one small fill only then).
-   After rejection one Triton launch updates `hist_ema`/`prev_full` from
-   `num_rejected` and `live_len`.
+   computes every request's `live_len` and `row_live` from its features, the
+   weights and the cost row of this step's b and verified width K (which may
+   change every step). Any other step resets every row to live.
 3. `sm80_moe.py`, `ops/sm80_route.py`, `ops/sm80_router_mma.py`
    (`sm80_route_gluon.py`, `sm80_route_mma.py`): target routers (marked by
    `adopt_row_mask`; the drafter's never are) give masked rows expert -1 and
@@ -67,11 +65,16 @@ Upstream-owned files: `vllm/v1/worker/gpu/model_runner.py` gets two imports and
 two calls (`begin_target_step` before the target forward, `cap_drafts` before
 rejection), listed in `tools/sm80/upstream_edit_exceptions.yaml`.
 
+A fixed depth k can be forced through the policy file alone: features
+`["bias"]`, weights `+20` for positions `<= k` and `-20` after, costs rising
+1 % per draft; every step then keeps `min(k, K)` drafts.
+
 Tests (CPU): `test_dspark_row_mask_kernel.py` (policy kernel vs a float32
-numpy reference in the interpreter, d in 0..7, padding, history update and
-reset, raw-confidence policy equal to the confidence rule),
+numpy reference in the interpreter, d in 0..7, padding, raw-confidence policy
+equal to the confidence rule, forced depths),
 `test_dspark_row_mask_conf.py` (publish incl. statistics, policy loading and
-refusals, history hook), `test_dspark_row_mask_reject.py` (greedy capped step
+refusals), `test_dspark_shard_argmax_stats.py` (the exchanged statistics equal
+the gathered softmax at 1, 2 and 4 ranks), `test_dspark_row_mask_reject.py` (greedy capped step
 = unmasked step truncated, at k = 7, 5, 3; d = 0 emits row 0's target token;
 all rows live = switch off), `test_row_mask_moe.py`,
 `test_dspark_row_mask_gpu.py` (fault checks). GPU: the CUDA cases of
@@ -80,7 +83,8 @@ moe_out_v2 / moe_out_v2_try / moe_out_v2_fold live rows bitwise) and
 `test_dspark_row_mask_gpu.py`.
 
 Known limits: the cost table is an estimate until re-fitted; `adaptive_k`'s
-and the depth hint's acceptance statistics count masked drafts as rejections;
+and the depth hint's acceptance statistics count masked drafts as rejections
+(a masked round is never "full" for the hint);
 spec-decode counters show masked drafts as proposed and rejected; the
 pipeline-parallel draft tail is not covered.
 

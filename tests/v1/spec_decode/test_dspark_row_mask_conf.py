@@ -219,7 +219,7 @@ def test_load_checks_the_policy_against_the_verified_drafts(make, monkeypatch, t
         (dict(features=["bias", "conf"]), "features"),
         (dict(weights=[[0.0, 1.0]] * 4), "weights needs"),
         (dict(weights=[[0.0]] * MAX_DRAFT), "weights row 0"),
-        (dict(ema_decay=1.5), "ema_decay"),
+        (dict(features=["bias", "hist_ema"]), "features"),
         (dict(costs={"1": {"0": 1, "2": 2}}), "not 0 .. m"),
         (dict(costs={"1": {"0": 2, "1": 1}}), "nondecreasing"),
     ],
@@ -234,69 +234,43 @@ def test_policy_weights_land_in_the_kernel_columns(tmp_path):
     path = _policy(
         tmp_path / "w.json",
         max_depth=7,
-        features=["prev_full", "logit_conf", "bias", "ent"],
+        features=["logit_top1", "logit_conf", "bias", "ent"],
         weights=[[i, 1.0, -i, 0.5] for i in range(7)],
-        ema_init=0.75,
     )
     policy = state_module.load_policy(path, MAX_REQS, MAX_DRAFT, [0] + [3] * MAX_REQS)
     cols = {name: state_module.FEATURES.index(name) for name in state_module.FEATURES}
     assert policy.weights.shape == (MAX_DRAFT, len(state_module.FEATURES))
-    assert policy.weights[:, cols["prev_full"]].tolist() == [0, 1, 2, 3, 4]
+    assert policy.weights[:, cols["logit_top1"]].tolist() == [0, 1, 2, 3, 4]
     assert policy.weights[:, cols["bias"]].tolist() == [0, -1, -2, -3, -4]
     assert policy.weights[:, cols["ent"]].tolist() == [0.5] * 5
-    assert policy.weights[:, cols["hist_ema"]].tolist() == [0.0] * 5
-    assert policy.uses_stats and policy.ema_init == 0.75 and policy.prev_full_init == 0.0
+    assert policy.weights[:, cols["logit_conf"]].tolist() == [1.0] * 5
+    assert policy.uses_stats
 
 
-def test_draft_logit_features_refuse_the_shard_argmax(make, monkeypatch, tmp_path):
+def test_draft_logit_features_keep_statistics_and_refuse_draft_topk(make, monkeypatch, tmp_path):
     path = _policy(tmp_path / "t.json", features=["bias", "logit_top1"])
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", path)
-    monkeypatch.setattr(width_module.envs, "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", True)
-    drafter = make()
-    drafter._draft_topk = None
-    with pytest.raises(ValueError, match="SHARD_ARGMAX"):
+    # With the per-rank argmax sampler too: its exchange carries the statistics.
+    for shard_argmax in (False, True):
+        state_module._reset_for_tests()
+        monkeypatch.setattr(
+            width_module.envs, "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", shard_argmax
+        )
+        drafter = make()
+        drafter._draft_topk = None
         drafter.load_draft_model(None, set())
+        assert tuple(drafter._row_stats.shape) == (MAX_REQS, 2, MAX_DRAFT)
     state_module._reset_for_tests()
-    monkeypatch.setattr(width_module.envs, "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", False)
     drafter = make()
-    drafter._draft_topk = None
-    drafter.load_draft_model(None, set())
-    assert tuple(drafter._row_stats.shape) == (MAX_REQS, 2, MAX_DRAFT)
-    # Without them the shard argmax is fine and no statistics are kept.
+    drafter._draft_topk = 32
+    with pytest.raises(ValueError, match="top-k"):
+        drafter.load_draft_model(None, set())
+    # Without them no statistics are kept.
     state_module._reset_for_tests()
-    monkeypatch.setattr(width_module.envs, "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", True)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", _policy(tmp_path / "c.json"))
     drafter = make()
     drafter.load_draft_model(None, set())
     assert drafter._row_stats is None
-
-
-def test_propose_folds_the_verification_into_the_history(make, monkeypatch):
-    monkeypatch.setattr(
-        upstream.DSparkSpeculator, "propose", lambda self, batch, *a, **k: "drafts",
-        raising=False,
-    )
-    drafter = make()
-    drafter.load_draft_model(None, set())
-    state = drafter._row_mask
-    state.ema_decay = 0.5
-    state.hist_ema.fill_(0.5)
-    state.prev_full.fill_(0.0)
-    # The step's kernel kept 3 and 1 of 3 drafts on slots 6 and 2.
-    state.step_drafts = 3
-    state.live_len[:2] = torch.tensor([3, 1], dtype=torch.int32)
-    batch = SimpleNamespace(num_reqs=2, idx_mapping=torch.tensor([6, 2]))
-    rejected = torch.tensor([0, 3], dtype=torch.int32)
-    t = torch.ones(2, dtype=torch.int32)
-    assert drafter.propose(batch, {}, {}, None, None, t, rejected, None, None, None, None,
-                           num_speculative_tokens=3, remote_tail=False) == "drafts"
-    assert state.hist_ema[[6, 2]].tolist() == [0.75, 0.25]
-    assert state.prev_full[[6, 2]].tolist() == [1.0, 0.0]
-    # Dummy runs never update.
-    drafter.propose(batch, {}, {}, None, None, t, torch.zeros(2, dtype=torch.int32), None,
-                    None, None, None, dummy_run=True, num_speculative_tokens=3)
-    assert state.hist_ema[[6, 2]].tolist() == [0.75, 0.25]
-
 
 def _propose(drafter, slots, num_speculative_tokens):
     batch = SimpleNamespace(

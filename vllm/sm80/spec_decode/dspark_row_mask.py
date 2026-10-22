@@ -18,33 +18,27 @@ Pieces (each in its own module, all reading the one ``RowMaskState``):
   entropy), keyed by request-state slot, into ``conf_by_slot``
   (``stats_by_slot``);
 * before the target forward of a uniform speculative decode step, a kernel
-  turns them, each slot's acceptance history and the cost table into
-  ``live_len`` (batch order) and ``row_live`` (token order); any other step
-  leaves every row live;
+  turns them and the cost table into ``live_len`` (batch order) and
+  ``row_live`` (token order); any other step leaves every row live;
 * the target MoE routing gives rows with ``row_live == 0`` the expert id -1,
   which the EXL3 MoE kernels skip on every rank;
-* the rejection sampler rejects the drafts past ``live_len``;
-* after the step's rejection, one kernel folds each request's accepted and
-  live counts into its slot's history (``hist_ema``, ``prev_full``); a slot
-  given to a new request starts from the policy's initial values.
+* the rejection sampler rejects the drafts past ``live_len``.
 
 The policy file (schema ``dspark-depth-policy/1``)::
 
     {"schema": "dspark-depth-policy/1", "max_depth": 7,
-     "features": ["bias", "logit_conf", "hist_ema", "prev_full"],
+     "features": ["bias", "logit_conf", "logit_top1", "ent"],
      "weights": [[w_1 per feature], ..., [w_max_depth per feature]],
-     "ema_decay": 0.5, "ema_init": 0.75, "prev_full_init": 0.0,
      "costs": {"<batch>": {"<k>": ms, ...}, ...}}
 
 Draft position i (1-based) has the estimated acceptance probability
 ``p_i = sigmoid(sum_f weights[i-1][f] * x_f)`` over the listed features:
 ``bias`` (1), ``logit_conf`` (log-odds of the confidence head's output),
-``logit_top1`` (log-odds of the draft logits' top-1 probability), ``ent``
-(their entropy, nats), ``hist_ema`` and ``prev_full`` (the slot's history).
-Probabilities are clamped to [1e-6, 1 - 1e-6] before the log-odds. The raw
-confidence rule is the policy with weights [0, 1] over [bias, logit_conf].
-``ema_init`` defaults to 0.5, ``prev_full_init`` to 0. ``tau`` and other
-keys are ignored.
+``logit_top1`` (log-odds of the draft logits' top-1 probability) and ``ent``
+(their entropy, nats), both of the full-vocabulary draft logits the greedy
+sampler takes (Markov bias included). Probabilities are clamped to
+[1e-6, 1 - 1e-6] before the log-odds. The raw confidence rule is the policy
+with weights [0, 1] over [bias, logit_conf]. Other keys are ignored.
 
 ``costs`` gives, per batch size b, ``T_b(k)``: the step time in ms when
 every request of a b-request uniform decode batch verifies k drafts; the
@@ -73,7 +67,7 @@ logger = init_logger(__name__)
 SCHEMA = "dspark-depth-policy/1"
 SWITCH = "VLLM_DSPARK_ADAPTIVE_DEPTH"
 # The kernel's feature columns; a policy lists any of them, in any order.
-FEATURES = ("bias", "logit_conf", "logit_top1", "ent", "hist_ema", "prev_full")
+FEATURES = ("bias", "logit_conf", "logit_top1", "ent")
 # Features computed from the draft logits (not the confidence head).
 STATS_FEATURES = ("logit_top1", "ent")
 # Probabilities are clamped to [PROB_EPS, 1 - PROB_EPS] before the log-odds.
@@ -89,9 +83,6 @@ class DepthPolicy:
     # [max_num_reqs + 1, max_draft + 1] float32, T_b(k); NaN where not given.
     cost: torch.Tensor
     uses_stats: bool
-    ema_decay: float
-    ema_init: float
-    prev_full_init: float
 
 
 def _costs_by_batch(path, raw) -> dict[int, list[float]]:
@@ -154,13 +145,6 @@ def load_policy(
         if i < max_draft:
             for name, v in zip(features, values):
                 table[i, FEATURES.index(name)] = v
-    decay = float(raw.get("ema_decay", 0.5))
-    ema_init = float(raw.get("ema_init", 0.5))
-    prev_full_init = float(raw.get("prev_full_init", 0.0))
-    if not 0.0 <= decay <= 1.0:
-        raise ValueError(f"{path}: ema_decay {decay} is outside [0, 1]")
-    if not (math.isfinite(ema_init) and math.isfinite(prev_full_init)):
-        raise ValueError(f"{path}: ema_init and prev_full_init must be finite")
 
     rows = _costs_by_batch(path, raw)
     known = sorted(rows)
@@ -187,9 +171,6 @@ def load_policy(
         weights=table,
         cost=cost,
         uses_stats=any(f in STATS_FEATURES for f in features),
-        ema_decay=decay,
-        ema_init=ema_init,
-        prev_full_init=prev_full_init,
     )
 
 
@@ -213,10 +194,6 @@ class RowMaskState:
     weights: torch.Tensor = field(init=False)
     # T_b(k), [max_num_reqs + 1, max_draft + 1].
     cost: torch.Tensor = field(init=False)
-    # Per slot: EMA of the accepted fraction of verified drafts, and whether
-    # the last round that verified drafts accepted them all.
-    hist_ema: torch.Tensor = field(init=False)
-    prev_full: torch.Tensor = field(init=False)
     # Per request of the current verify step (batch order): drafts kept.
     live_len: torch.Tensor = field(init=False)
     # Per token row of the current target forward: 1 live, 0 masked.
@@ -224,15 +201,7 @@ class RowMaskState:
     # Host flag: row_live may hold a 0 (set by the mask kernel's caller,
     # cleared when the rows are reset to live).
     active: bool = False
-    # Host: the drafts each request of the current step verifies when the
-    # depth kernel ran for it (live_len holds its decisions), else 0.
-    step_drafts: int = 0
     uses_stats: bool = False
-    ema_decay: float = 0.5
-    ema_init: float = 0.5
-    prev_full_init: float = 0.0
-    # Host: the request id each slot last held (history reset on a change).
-    slot_req_ids: list = field(init=False)
 
     def __post_init__(self) -> None:
         d = self.device
@@ -248,27 +217,18 @@ class RowMaskState:
         self.cost = torch.zeros(
             self.max_num_reqs + 1, self.max_draft + 1, dtype=torch.float32, device=d
         )
-        self.hist_ema = torch.zeros(self.max_num_reqs, dtype=torch.float32, device=d)
-        self.prev_full = torch.zeros(self.max_num_reqs, dtype=torch.float32, device=d)
         self.live_len = torch.full(
             (self.max_num_reqs,), self.max_draft, dtype=torch.int32, device=d
         )
         self.row_live = torch.ones(self.max_num_tokens, dtype=torch.int8, device=d)
-        self.slot_req_ids = [None] * self.max_num_reqs
 
     def set_policy(self, policy: DepthPolicy) -> None:
         self.weights.copy_(policy.weights)
         self.cost.copy_(policy.cost)
         self.uses_stats = policy.uses_stats
-        self.ema_decay = policy.ema_decay
-        self.ema_init = policy.ema_init
-        self.prev_full_init = policy.prev_full_init
-        self.hist_ema.fill_(policy.ema_init)
-        self.prev_full.fill_(policy.prev_full_init)
 
     def reset_live(self) -> None:
         """Every row live again (no-op unless a mask was applied)."""
-        self.step_drafts = 0
         if self.active:
             self.row_live.fill_(1)
             self.live_len.fill_(self.max_draft)

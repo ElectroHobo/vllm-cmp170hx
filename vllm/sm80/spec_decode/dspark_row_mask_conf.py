@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSpark adaptive depth, draft side: the per-position features per request
-slot, and the history update after each verification.
+slot.
 
 With ``VLLM_DSPARK_ADAPTIVE_DEPTH`` set, ``create_dspark_speculator`` mixes
 :class:`RowMaskConfidenceMixin` in front of the DSpark speculator class. It
@@ -12,17 +12,15 @@ With ``VLLM_DSPARK_ADAPTIVE_DEPTH`` set, ``create_dspark_speculator`` mixes
   the draft count each batch size verifies;
 * when the policy uses the draft logits' top-1 probability or entropy,
   computes them in every draft step from the logits the greedy sampler
-  takes (``_sample_logits``; refused with the per-rank argmax sampler and
-  draft top-k, which never form the full logits);
+  takes (``_sample_logits``), or, with the per-rank argmax sampler, from
+  each rank's softmax statistics carried in its exchange
+  (``shard_argmax.py``); refused with draft top-k, which truncates them;
 * at the end of every draft step's sequential sampling (the default, top-k
   and per-rank-argmax samplers alike, at any draft width) publishes the
   step's features into ``RowMaskState.conf_by_slot`` (``stats_by_slot``):
   request r's row goes to its request-state slot, its first ``width``
   columns are positions 1 .. width and the columns past the drafted width
   are 0 (a draft that does not exist is never accepted);
-* at the start of every ``propose`` (after the step's rejection sampling)
-  folds the step's verification into each request's slot history
-  (``dspark_row_mask_kernel.end_step``);
 * on a ``propose`` call that drafts nothing (a zero-draft step stores only the
   context K/V, ``zero_draft.py``), resets the batch's slots to 1.0, so no
   later verify step reads an older step's confidences.
@@ -52,14 +50,12 @@ from functools import cache
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.sm80.spec_decode.dspark_row_mask import (
     SWITCH,
     RowMaskState,
     init_row_mask_state,
 )
-from vllm.sm80.spec_decode.dspark_row_mask_kernel import end_step
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
@@ -209,12 +205,6 @@ class RowMaskConfidenceMixin:
         )
         assert state is not None
         if state.uses_stats:
-            if envs.VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX:
-                raise ValueError(
-                    f"{SWITCH}: the policy uses the draft logits' top-1 "
-                    "probability or entropy, which the per-rank argmax sampler "
-                    "(VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX) never forms; unset it."
-                )
             if getattr(self, "_draft_topk", None) is not None:
                 raise ValueError(
                     f"{SWITCH}: the policy uses the draft logits' top-1 "
@@ -250,18 +240,19 @@ class RowMaskConfidenceMixin:
             )
 
     def propose(self, input_batch, *args, **kwargs):
+        result = super().propose(input_batch, *args, **kwargs)
         state = self._row_mask
         if state is None:
-            return super().propose(input_batch, *args, **kwargs)
-        signature = _propose_signature()
-        known = {k: v for k, v in kwargs.items() if k in signature.parameters}
-        arguments = signature.bind_partial(self, input_batch, *args, **known).arguments
-        num_rejected = arguments.get("num_rejected")
-        real = not arguments.get("dummy_run") and not arguments.get("is_profile")
-        if real and num_rejected is not None:
-            end_step(input_batch, num_rejected)
-        result = super().propose(input_batch, *args, **kwargs)
-        if drafts_nothing(self, arguments.get("num_speculative_tokens")):
+            return result
+        if "num_speculative_tokens" in kwargs:
+            width = kwargs["num_speculative_tokens"]
+        else:
+            signature = _propose_signature()
+            known = {k: v for k, v in kwargs.items() if k in signature.parameters}
+            width = signature.bind_partial(self, input_batch, *args, **known).arguments.get(
+                "num_speculative_tokens"
+            )
+        if drafts_nothing(self, width):
             num_reqs = input_batch.num_reqs
             state.conf_by_slot.index_fill_(0, input_batch.idx_mapping[:num_reqs], 1.0)
         return result

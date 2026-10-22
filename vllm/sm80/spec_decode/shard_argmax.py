@@ -22,6 +22,18 @@ and every step:
 4. :func:`pick` takes, per row, the slot with the largest value, the lowest
    slot on ties, and returns its token.
 
+When the drafter keeps the draft logits' top-1 probability and entropy (the
+DSpark adaptive depth policy's ``logit_top1``/``ent`` features,
+``_row_stats``), each rank also writes, behind the chunk slots of the same
+buffer, its shard's softmax statistics of the row: ``m`` (the largest value),
+``s = sum exp(l - m)`` and ``t = sum exp(l - m) * l``, each FP32 word as four
+byte lanes (:func:`shard_stats`). After the sum every rank holds every rank's
+words and combines them in rank order (:func:`combine_stats`):
+``M = max m_r``, ``S = sum s_r exp(m_r - M)``, ``T = sum t_r exp(m_r - M)``,
+top-1 probability ``1 / S`` and entropy ``M + log S - T / S``, the same bits on
+every rank. These equal the gathered row's softmax statistics up to the
+summation order.
+
 Exactness. The draft is torch.argmax's over the gathered row: ATen's
 ``GreaterOrNan`` prefers a NaN to any number, the lower index between two
 NaNs or two equal values, and compares -0.0 equal to +0.0. The kernels
@@ -52,6 +64,7 @@ logger = init_logger(__name__)
 
 BLOCK = 4096  # columns per chunk; one slot per chunk
 LANES = 8  # BF16 lanes per slot: 4 key bytes, 3 index bytes, 1 zero
+STATS_LANES = 16  # BF16 lanes per rank's statistics: 3 FP32 words, 4 bytes each
 MAX_VOCAB = 1 << 24  # three index bytes
 SWITCH = "VLLM_DSPARK_SHARD_ARGMAX"
 
@@ -68,6 +81,7 @@ def _chunk_slots_kernel(
     logits_ptr,
     logits_stride,
     slots_ptr,
+    row_stride,
     n_cols,
     col_start,
     rank,
@@ -105,7 +119,7 @@ def _chunk_slots_kernel(
     vals = tl.where(r[:, None] == rank, byte[None, :], 0)
     ptrs = (
         slots_ptr
-        + row * (TP * CHUNKS * 8)
+        + row * row_stride
         + (r[:, None] * CHUNKS + chunk) * 8
         + lane[None, :]
     )
@@ -113,12 +127,14 @@ def _chunk_slots_kernel(
 
 
 @triton.jit
-def _pick_kernel(slots_ptr, out_ptr, vocab, SLOTS: tl.constexpr, SLOTS_P2: tl.constexpr):
+def _pick_kernel(
+    slots_ptr, row_stride, out_ptr, vocab, SLOTS: tl.constexpr, SLOTS_P2: tl.constexpr
+):
     row = tl.program_id(0)
     s = tl.arange(0, SLOTS_P2)
     lane = tl.arange(0, 8)
     v = tl.load(
-        slots_ptr + row * (SLOTS * 8) + s[:, None] * 8 + lane[None, :],
+        slots_ptr + row * row_stride + s[:, None] * 8 + lane[None, :],
         mask=s[:, None] < SLOTS,
         other=0.0,
     )
@@ -138,28 +154,34 @@ def _pick_kernel(slots_ptr, out_ptr, vocab, SLOTS: tl.constexpr, SLOTS_P2: tl.co
 
 
 def chunk_slots(
-    logits: torch.Tensor, col_start: int, rank: int, tp_size: int, chunks: int
+    logits: torch.Tensor,
+    col_start: int,
+    rank: int,
+    tp_size: int,
+    chunks: int,
+    stats: bool = False,
 ) -> torch.Tensor:
     """This rank's slots of one sampling step.
 
     ``logits`` [rows, n] FP32 holds global columns ``col_start ..
     col_start + n - 1`` (n <= chunks * BLOCK). Returns [rows, tp_size * chunks
-    * LANES] BF16: this rank's ``chunks`` slots filled, every other rank's
-    zero, ready to be summed over the TP group.
+    * LANES] BF16 (with ``stats``, ``tp_size * STATS_LANES`` more lanes holding
+    :func:`shard_stats`): this rank's ``chunks`` slots filled, every other
+    rank's zero, ready to be summed over the TP group.
     """
     rows, n_cols = logits.shape
     if logits.dtype != torch.float32 or logits.stride(-1) != 1:
         raise ValueError("chunk_slots takes FP32 logits with unit column stride")
     if n_cols > chunks * BLOCK or col_start + n_cols > MAX_VOCAB:
         raise ValueError(f"{n_cols} columns from {col_start} exceed the slots")
-    slots = torch.empty(
-        rows, tp_size * chunks * LANES, dtype=torch.bfloat16, device=logits.device
-    )
+    width = tp_size * chunks * LANES + (tp_size * STATS_LANES if stats else 0)
+    slots = torch.empty(rows, width, dtype=torch.bfloat16, device=logits.device)
     if rows:
         _chunk_slots_kernel[(rows, chunks)](
             logits,
             logits.stride(0),
             slots,
+            slots.stride(0),
             n_cols,
             col_start,
             rank,
@@ -169,19 +191,144 @@ def chunk_slots(
             BLOCK=BLOCK,
             num_warps=8,
         )
+        if stats:
+            shard_stats(logits, slots, tp_size * chunks * LANES, rank, tp_size, chunks)
     return slots
 
 
-def pick(slots: torch.Tensor, vocab: int) -> torch.Tensor:
-    """The token of each row of summed slots ([rows, slots * LANES] BF16):
-    the index in the slot with the largest key, the lowest slot on ties,
-    held in 0 .. vocab - 1 (see _pick_kernel)."""
+@triton.jit
+def _shard_stats_kernel(
+    logits_ptr,
+    logits_stride,
+    slots_ptr,
+    row_stride,
+    base,
+    n_cols,
+    rank,
+    TP: tl.constexpr,
+    TP_P2: tl.constexpr,
+    CHUNKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    m = tl.full((), float("-inf"), tl.float32)
+    for c in tl.static_range(CHUNKS):
+        cols = c * BLOCK + offs
+        x = tl.load(logits_ptr + row * logits_stride + cols, mask=cols < n_cols,
+                    other=float("-inf"))
+        m = tl.maximum(m, tl.max(x, axis=0))
+    s = tl.zeros((), tl.float32)
+    t = tl.zeros((), tl.float32)
+    if m > float("-inf"):
+        for c in tl.static_range(CHUNKS):
+            cols = c * BLOCK + offs
+            valid = cols < n_cols
+            x = tl.load(logits_ptr + row * logits_stride + cols, mask=valid, other=0.0)
+            e = tl.where(valid, tl.exp(x - m), 0.0)
+            s += tl.sum(e, axis=0)
+            t += tl.sum(e * x, axis=0)
+    lane = tl.arange(0, 16)
+    word = lane // 4
+    m_bits = m.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    s_bits = s.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    t_bits = t.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    bits = tl.where(word == 0, m_bits, tl.where(word == 1, s_bits, tl.where(word == 2, t_bits, 0)))
+    byte = (bits >> (24 - 8 * (lane % 4)).to(tl.int64)) & 255
+    r = tl.arange(0, TP_P2)
+    vals = tl.where(r[:, None] == rank, byte[None, :], 0)
+    ptrs = slots_ptr + row * row_stride + base + r[:, None] * 16 + lane[None, :]
+    tl.store(ptrs, vals.to(tl.float32).to(tl.bfloat16), mask=r[:, None] < TP)
+
+
+def shard_stats(
+    logits: torch.Tensor, slots: torch.Tensor, base: int, rank: int, tp_size: int, chunks: int
+) -> None:
+    """Write this rank's softmax statistics of each row of ``logits`` (its
+    shard's columns) into lanes ``base + rank * STATS_LANES ..`` of ``slots``,
+    zeros in every other rank's lanes (see the module docstring)."""
+    rows, n_cols = logits.shape
+    if rows:
+        _shard_stats_kernel[(rows,)](
+            logits,
+            logits.stride(0),
+            slots,
+            slots.stride(0),
+            base,
+            n_cols,
+            rank,
+            TP=tp_size,
+            TP_P2=triton.next_power_of_2(tp_size),
+            CHUNKS=chunks,
+            BLOCK=BLOCK,
+            num_warps=8,
+        )
+
+
+@triton.jit
+def _combine_stats_kernel(
+    slots_ptr,
+    row_stride,
+    base,
+    out_ptr,
+    out_row_stride,
+    out_col_stride,
+    TP: tl.constexpr,
+    TP_P2: tl.constexpr,
+):
+    row = tl.program_id(0)
+    r = tl.arange(0, TP_P2)
+    lane = tl.arange(0, 16)
+    v = tl.load(slots_ptr + row * row_stride + base + r[:, None] * 16 + lane[None, :],
+                mask=r[:, None] < TP, other=0.0)
+    byte = v.to(tl.float32).to(tl.int64) << (24 - 8 * (lane % 4)).to(tl.int64)[None, :]
+    word = (lane // 4)[None, :]
+    m = tl.sum(tl.where(word == 0, byte, 0), axis=1).to(tl.int32).to(tl.float32, bitcast=True)
+    s = tl.sum(tl.where(word == 1, byte, 0), axis=1).to(tl.int32).to(tl.float32, bitcast=True)
+    t = tl.sum(tl.where(word == 2, byte, 0), axis=1).to(tl.int32).to(tl.float32, bitcast=True)
+    live = (r < TP) & (s > 0.0)
+    big = tl.max(tl.where(live, m, float("-inf")), axis=0)
+    w = tl.where(live, tl.exp(m - big), 0.0)
+    total = tl.sum(tl.where(live, s * w, 0.0), axis=0)
+    moment = tl.sum(tl.where(live, t * w, 0.0), axis=0)
+    top1 = tl.math.div_rn(1.0, total)
+    ent = big + tl.log(total) - tl.math.div_rn(moment, total)
+    tl.store(out_ptr + row * out_row_stride, top1)
+    tl.store(out_ptr + row * out_row_stride + out_col_stride, ent)
+
+
+def combine_stats(slots: torch.Tensor, base: int, tp_size: int, out: torch.Tensor) -> None:
+    """Per row of summed ``slots``, the top-1 probability and entropy from the
+    ranks' statistics at lane ``base``, into ``out[row, 0]`` and
+    ``out[row, 1]`` (``out`` [rows, 2] FP32, any strides)."""
     rows = slots.shape[0]
-    num_slots = slots.shape[1] // LANES
+    if rows:
+        _combine_stats_kernel[(rows,)](
+            slots,
+            slots.stride(0),
+            base,
+            out,
+            out.stride(0),
+            out.stride(1),
+            TP=tp_size,
+            TP_P2=triton.next_power_of_2(tp_size),
+            num_warps=1,
+        )
+
+
+def pick(slots: torch.Tensor, vocab: int, num_slots: int | None = None) -> torch.Tensor:
+    """The token of each row of summed slots ([rows, >= slots * LANES] BF16):
+    the index in the slot with the largest key, the lowest slot on ties,
+    held in 0 .. vocab - 1 (see _pick_kernel). ``num_slots``: the chunk slots
+    of a row (default: every lane of the row)."""
+    rows = slots.shape[0]
+    if num_slots is None:
+        num_slots = slots.shape[1] // LANES
     out = torch.empty(rows, dtype=torch.int64, device=slots.device)
     if rows:
         _pick_kernel[(rows,)](
             slots,
+            slots.stride(0),
             out,
             vocab,
             SLOTS=num_slots,
@@ -247,6 +394,9 @@ def sample_sequential(speculator, num_reqs: int, head_hidden: torch.Tensor) -> N
     n_cols = min(max(model.logits_processor.org_vocab_size - col_start, 0), width)
     chunks = triton.cdiv(width, BLOCK)
     confidence_markov_embeds = []
+    # The adaptive depth policy's draft-logit features (dspark_row_mask_conf).
+    stats = getattr(s, "_row_stats", None)
+    base = tp_size * chunks * LANES
 
     prev = s.input_buffers.input_ids[s._anchor_idx[:num_reqs]]
     for i in range(n_spec):
@@ -257,10 +407,14 @@ def sample_sequential(speculator, num_reqs: int, head_hidden: torch.Tensor) -> N
         logits_i = local[:, i, :n_cols] + bias[:, col_start : col_start + n_cols]
         if logits_i.dtype != torch.float32:
             logits_i = logits_i.float()  # exact; keeps order, ties and NaN
-        slots = chunk_slots(logits_i, col_start, rank, tp_size, chunks)
+        slots = chunk_slots(
+            logits_i, col_start, rank, tp_size, chunks, stats=stats is not None
+        )
         if tp_size > 1:
             slots = tensor_model_parallel_all_reduce(slots)
-        draft_sampled_i = pick(slots, model.logits_processor.org_vocab_size)
+        draft_sampled_i = pick(slots, model.logits_processor.org_vocab_size, tp_size * chunks)
+        if stats is not None:
+            combine_stats(slots, base, tp_size, stats[:num_reqs, :, i])
         s.draft_tokens[:num_reqs, i] = draft_sampled_i
         prev = draft_sampled_i
 
