@@ -12,7 +12,7 @@ from vllm.models.deepseek_v41.nvidia.ops.sm80_index_topk import SelectionWorkspa
 from .test_sm80_index_topk import config
 from .test_sm80_kernels_gpu import _index_case, _huge_view
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')]
 
 
 @pytest.mark.parametrize('width', [0, 1, 511, 512, 513, 2047, 2048, 2049, 8191, 16385, 262144])

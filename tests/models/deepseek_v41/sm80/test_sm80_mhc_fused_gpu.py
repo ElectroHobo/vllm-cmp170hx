@@ -54,10 +54,13 @@ import torch
 from . import fp64_cases as F
 from .test_sm80_mhc_fused import call, variants
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
-    reason="needs an sm_80 card",
-)
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
+        reason="needs an sm_80 card",
+    ),
+]
 
 HIDDEN = 5120
 CUDA = torch.device("cuda")

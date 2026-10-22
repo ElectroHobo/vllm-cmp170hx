@@ -11,7 +11,7 @@ from vllm.sm80.capture import Record
 
 from .test_hybrid_capture import attention_args, index_args
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")]
 
 
 @pytest.mark.parametrize("op", ["index_scores", "sparse_attention"])

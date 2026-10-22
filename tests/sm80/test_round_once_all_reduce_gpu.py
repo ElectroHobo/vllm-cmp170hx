@@ -34,10 +34,13 @@ SERVED_ENV = {
     "VLLM_HOST_ALLREDUCE": "1",
 }
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 4,
-    reason="needs 4 GPUs",
-)
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.device_count() < 4,
+        reason="needs 4 GPUs",
+    ),
+]
 
 
 def test_grouped_round_once_bits_tp4(tmp_path):

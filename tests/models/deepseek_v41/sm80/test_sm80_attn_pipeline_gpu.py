@@ -16,7 +16,7 @@ from .attn_pipeline_cases import _ideal, _write_guards
 from .test_sm80_index_topk import config
 from .test_sm80_attn_fused_gpu import _within_v2
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')]
 BF16 = torch.bfloat16
 
 

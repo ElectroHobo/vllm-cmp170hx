@@ -15,8 +15,9 @@ from .test_wo_b_allreduce_bits_gpu import SERVED_ENV
 
 SCRIPT = Path(draft.__file__).resolve()
 TREE = SCRIPT.parents[4]
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4,
-                                reason="needs 4 GPUs")
+pytestmark = [pytest.mark.cuda,
+              pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 4,
+                                 reason="needs 4 GPUs")]
 
 
 def test_actual_draft_ids_match_tp4(tmp_path):

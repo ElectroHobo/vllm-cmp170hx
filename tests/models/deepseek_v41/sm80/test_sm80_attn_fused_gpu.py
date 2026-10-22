@@ -29,7 +29,7 @@ from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_fused as fused
 
 from . import fp64_cases as F
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")]
 
 BF16 = torch.bfloat16
 H, D, Q, E = 16, 512, 1280, 64

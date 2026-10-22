@@ -12,11 +12,14 @@ are the DeepSeek-V4.1 routed experts' (hidden 5120, intermediate 2304,
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (8, 0),
-    reason="EXL3 kernels run on SM 8.0 GPUs",
-)
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() != (8, 0),
+        reason="EXL3 kernels run on SM 8.0 GPUs",
+    ),
+]
 
 HIDDEN, INTERMEDIATE, EXPERTS, TOPK, BITS_X2, MUL1 = 5120, 2304, 8, 6, 6, 2
 

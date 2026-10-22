@@ -33,7 +33,7 @@ from tests.kernels.quantization.test_exl3_dense_splitk import (
 )
 from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
-pytestmark = needs_sm80
+pytestmark = [pytest.mark.cuda, needs_sm80]
 
 MEAN_BOUND, MAX_BOUND = 1.10, 1.25
 

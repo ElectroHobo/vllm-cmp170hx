@@ -51,10 +51,13 @@ PIECES_SWITCH = "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE"
 BF16_BACKENDS = ("flags", "custom")
 FP32_BACKENDS = ("nccl",)
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 4,
-    reason="needs 4 GPUs",
-)
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.device_count() < 4,
+        reason="needs 4 GPUs",
+    ),
+]
 
 
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])

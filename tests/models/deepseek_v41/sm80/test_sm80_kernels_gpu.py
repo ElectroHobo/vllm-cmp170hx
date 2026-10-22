@@ -23,7 +23,7 @@ from vllm.models.deepseek_v41.nvidia.ops.sm80_act_quant import fp4_qdq
 from . import test_attn_layers as layers
 from .dsv41_ref import LayerSpec, RefArgs, make_weights, ref_sparse_attn
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")]
 
 BF16 = torch.bfloat16
 
