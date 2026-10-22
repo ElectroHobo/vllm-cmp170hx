@@ -26,12 +26,12 @@ GPU (sm_80; listed for the GPU run):
 
 - the router on CUDA, fused and torch paths: equal bytes, masked rows -1/0;
   a captured routing reads ``row_live`` in place at replay;
-- moe_out, moe_out_v2, the try kernel moe_out_v2_try (VLLM_TRY_MOE_V2) and
+- moe_out, moe_out_v2, the try kernel moe_out_v2_try (VLLM_EXL3_MOE_V2_RING) and
   the folded moe_out_v2_fold (VLLM_EXL3_MOE_V2_FOLD) at hidden 5120 (the
   served routed experts, rank 0 of 4), up to 64 rows (8 requests at depth
   7): every live row's output is the same bits when other rows of the call
   are masked (ids -1), and a masked row's routed output is exact zero;
-- the tensor-core router (VLLM_TRY_ROUTER: ``sm80_router_mma`` gate + Gluon
+- the tensor-core router (VLLM_DEEPSEEK_V41_ROUTER_MMA: ``sm80_router_mma`` gate + Gluon
   route up to 64 rows, Triton route above) masks rows -1/0 and keeps every
   other row's bytes, and reads ``row_live`` in place from a captured graph.
 
@@ -578,7 +578,7 @@ def _router_mask(rows: int) -> torch.Tensor:
 @pytest.mark.parametrize("experts,top_k", ROUTERS)
 @pytest.mark.parametrize("rows", (6, 16, 64, 96))
 def test_cuda_router_try_masks_rows_and_keeps_live_rows_bitwise(experts, top_k, rows):
-    """VLLM_TRY_ROUTER's gate + route (Gluon route up to 64 rows, Triton
+    """VLLM_DEEPSEEK_V41_ROUTER_MMA's gate + route (Gluon route up to 64 rows, Triton
     above): masked rows -1/0, every other row the unmasked call's bytes, and
     an all-live mask the unmasked bytes."""
     from vllm.models.deepseek_v41.nvidia.ops import sm80_router_mma as rm

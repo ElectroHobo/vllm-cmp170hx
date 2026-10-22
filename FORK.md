@@ -53,6 +53,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 
 | Path | Lines |
 |---|---:|
+| `vllm/models/deepseek_v41/nvidia/dspark_depth_policy.json` | 300 |
 | `vllm/models/deepseek_v41/nvidia/hybrid_capture.py` | 364 |
 | `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 1,202 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,314 |
@@ -72,7 +73,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_layout.py` | 190 |
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **19 files** | **7,359** |
+| **20 files** | **7,659** |
 
 ### `vllm/sm80/kernels/`
 
@@ -929,12 +930,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 220 |
-| Fork-added product lines | 72,884 |
+| Fork-added product files | 221 |
+| Fork-added product lines | 73,184 |
 | Patched upstream files | 105 |
 | Patched upstream lines | +4,904 / -804 |
 | Patched upstream product files | 79 |
 | Patched upstream product lines | +3,633 / -253 |
-| Product lines added (new files and patches) | 76,517 |
+| Product lines added (new files and patches) | 76,817 |
 | Fork environment variables (flags) | 150 |
 | Unreferenced fork definitions | 7 (59 lines) |
