@@ -28,6 +28,14 @@ experts, and changes two things before the weights load:
   (``ops/sm80_router_mma.py``: FP64 sums rounded once, closer to the FP64
   routing weights than the FP32 GEMM, not its bytes).
 
+With ``VLLM_DEEPSEEK_V41_ROUTER_MMA`` the gate weight is held once, in BF16:
+the checkpoint's gate weights are BF16-valued (a value BF16 does not hold
+exactly is refused as it loads), so the BF16 weight holds the FP32 weight's
+values and every other reader widens it exactly: the gate GEMV to FP64 in
+the kernel, the FP32 GEMM of the calls the tensor cores do not serve to FP32
+for the call (:meth:`Sm80DeepseekV41Gate._fp32_fallback`). Their logits are
+the bytes of the FP32-held weight's.
+
 The experts and the SwiGLU clamp run in the EXL3 MoE kernels
 (vllm/sm80/kernels/exl3/quant.py, ``swiglu_limit``). With
 ``VLLM_DEEPSEEK_V41_MOE_PREFILL_TC`` the experts may take the tensor-core
@@ -42,10 +50,14 @@ from torch import nn
 import vllm.envs as envs
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
+from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 from vllm.sm80.kernels.exl3.quant import set_moe_prefill_v2
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv, sm80_route, sm80_router_mma
@@ -131,7 +143,7 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
                 raise RuntimeError("VLLM_DEEPSEEK_V41_ROUTER_MMA: router logits are not the gate call's")
             weights, ids = sm80_router_mma.route(
                 pending,
-                gate.weight_bf16,
+                gate.weight,
                 self.e_score_correction_bias,
                 self.bias_vl,
                 input_ids,
@@ -173,7 +185,10 @@ class Sm80DeepseekV41Gate(GateLinear):
     """The adopted gate: FP32 weight, FP32 logits. With ``gemv``
     (VLLM_DEEPSEEK_V41_GATE_GEMV) a call that ``sm80_gate_gemv.serves`` (CUDA,
     BF16, at most ``sm80_gate_gemv.MAX_ROWS`` rows) runs ``gate_gemv``; every
-    other call is ``GateLinear.forward`` (its FP32 fallback)."""
+    other call is ``GateLinear.forward`` (its FP32 fallback). With ``mma``
+    (VLLM_DEEPSEEK_V41_ROUTER_MMA) the weight is held in BF16 (its FP32
+    values exactly) and the calls neither kernel takes run
+    :meth:`_fp32_fallback`."""
 
     # VLLM_DEEPSEEK_V41_GATE_GEMV: decode-sized calls run gate_gemv.
     gemv = False
@@ -182,7 +197,6 @@ class Sm80DeepseekV41Gate(GateLinear):
     # router (``mma_gate``) consumes ``pending``.
     mma = False
     pending = None
-    weight_bf16 = None
 
     def forward(self, x: torch.Tensor):
         if self.mma and self.bias is None and sm80_router_mma.serves(x):
@@ -194,7 +208,7 @@ class Sm80DeepseekV41Gate(GateLinear):
                     "routed: the expert method reads the router logits itself "
                     "(a monolithic method), which the decode gate leaves unwritten"
                 )
-            logits, self.pending = sm80_router_mma.gate(x, self._weight_bf16())
+            logits, self.pending = sm80_router_mma.gate(x, self.weight)
             return self._return(logits)
         if (
             self.gemv
@@ -202,36 +216,36 @@ class Sm80DeepseekV41Gate(GateLinear):
             and sm80_gate_gemv.serves(x, self.weight)
         ):
             return self._return(sm80_gate_gemv.gate_gemv(x, self.weight))
+        if self.weight.dtype != torch.float32:
+            return self._return(self._fp32_fallback(x))
         return super().forward(x)
 
-    def _weight_bf16(self) -> torch.Tensor:
-        """The gate weight's BF16 values (exact: the FP32 weight holds the
-        checkpoint's BF16 values), made on the first, eager call."""
-        if self.weight_bf16 is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("VLLM_DEEPSEEK_V41_ROUTER_MMA: gate weight not prepared before capture")
-            w = self.weight.data
-            w16 = w.to(torch.bfloat16)
-            if not torch.equal(w16.float(), w):
-                raise ValueError("VLLM_DEEPSEEK_V41_ROUTER_MMA: the gate weight is not BF16-valued")
-            self.weight_bf16 = w16.contiguous()
-        return self.weight_bf16
+    def _fp32_fallback(self, x: torch.Tensor) -> torch.Tensor:
+        """``GateLinear.forward``'s FP32 fallback (``x`` in FP32, then
+        ``UnquantizedLinearMethod.apply``) on the FP32 values of the BF16-held
+        weight, widened for this call: the widening is exact, so the GEMM
+        reads the bytes of the FP32-held weight."""
+        x = x.to(torch.float32)
+        weight = self.weight.float()
+        if envs.VLLM_BATCH_INVARIANT and (
+            current_platform.is_cuda_alike() or current_platform.is_xpu()
+        ):
+            return linear_batch_invariant(x, weight, None)
+        return self.quant_method._gemm_impl(self, x, weight, None)
 
 
-def _fp32_gate_weight(gate: nn.Module) -> None:
-    """Hold the gate weight in FP32 so the checkpoint's FP16 values load
-    exactly, route the gate's forward to its FP32 fallback, and make an
-    upstream ``GateLinear`` a :class:`Sm80DeepseekV41Gate` (``gemv`` off)."""
+def _hold_gate_weight(gate: nn.Module, dtype: torch.dtype) -> None:
+    """Hold the gate weight in ``dtype``, route the gate's forward to its FP32
+    fallback, and make an upstream ``GateLinear`` a
+    :class:`Sm80DeepseekV41Gate` (``gemv`` off)."""
     if type(gate) is GateLinear:
         gate.__class__ = Sm80DeepseekV41Gate
     weight = gate.weight
-    if weight.dtype != torch.float32:
-        fp32 = nn.Parameter(
-            torch.empty_like(weight, dtype=torch.float32), requires_grad=False
-        )
+    if weight.dtype != dtype:
+        held = nn.Parameter(torch.empty_like(weight, dtype=dtype), requires_grad=False)
         for key, value in vars(weight).items():
-            setattr(fp32, key, value)
-        gate.weight = fp32
+            setattr(held, key, value)
+        gate.weight = held
     for tier in _GATE_TIERS:
         if getattr(gate, tier, False):
             setattr(gate, tier, False)
@@ -239,11 +253,32 @@ def _fp32_gate_weight(gate: nn.Module) -> None:
         raise ValueError("DeepSeek-V4.1 gates produce FP32 logits")
 
 
+def _fp32_gate_weight(gate: nn.Module) -> None:
+    """:func:`_hold_gate_weight` in FP32, so the checkpoint's FP16 values
+    load exactly."""
+    _hold_gate_weight(gate, torch.float32)
+
+
+def _bf16_valued_loader(loader):
+    """``loader`` for the BF16-held gate weight, refusing a checkpoint tensor
+    whose values BF16 does not hold exactly (the copy would round them)."""
+
+    def load(param: nn.Parameter, loaded_weight: torch.Tensor, *args, **kwargs):
+        if loaded_weight.dtype != torch.bfloat16 and not torch.equal(
+            loaded_weight.to(torch.bfloat16).float(), loaded_weight.float()
+        ):
+            raise ValueError("VLLM_DEEPSEEK_V41_ROUTER_MMA: the gate weight is not BF16-valued")
+        return loader(param, loaded_weight, *args, **kwargs)
+
+    return load
+
+
 def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
     """VLLM_DEEPSEEK_V41_ROUTER_MMA: the layer's gate and routing run
     ``ops/sm80_router_mma.py`` for every call it serves; the calls it does not
     serve take the gate GEMV or the FP32 gate and the fused route, so both
-    switches are required."""
+    switches are required. The gate weight is held in BF16 (by
+    :func:`adopt_moe`) and loads only BF16-valued."""
     missing = [
         name
         for name in ("VLLM_DEEPSEEK_V41_FUSED_ROUTE", "VLLM_DEEPSEEK_V41_GATE_GEMV")
@@ -258,6 +293,13 @@ def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
     gate = ffn.gate
     if not isinstance(gate, Sm80DeepseekV41Gate) or gate.bias is not None:
         raise TypeError(f"VLLM_DEEPSEEK_V41_ROUTER_MMA: unexpected gate {type(gate).__name__}")
+    if not isinstance(gate.quant_method, UnquantizedLinearMethod):
+        raise TypeError(
+            "VLLM_DEEPSEEK_V41_ROUTER_MMA: unexpected gate method "
+            f"{type(gate.quant_method).__name__}"
+        )
+    if gate.weight.dtype != torch.bfloat16:
+        raise TypeError(f"VLLM_DEEPSEEK_V41_ROUTER_MMA: the gate weight is held in {gate.weight.dtype}")
     moe_config = ffn.experts.moe_config
     if moe_config.dp_size > 1 or moe_config.pcp_size > 1 or moe_config.is_sequence_parallel:
         # The route consumes the gate call's own logits tensor and scratch.
@@ -270,6 +312,10 @@ def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
         raise ValueError(f"VLLM_DEEPSEEK_V41_ROUTER_MMA: {reason}")
     if envs.VLLM_SM80_CAPTURE_DIR and "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
         raise ValueError("VLLM_DEEPSEEK_V41_ROUTER_MMA: the hybrid capture records the FP32 gate GEMM; capture with it off")
+    weight = gate.weight
+    weight.weight_loader = _bf16_valued_loader(
+        getattr(weight, "weight_loader", default_weight_loader)
+    )
     gate.mma = True
     router.mma_gate = gate
     sm80_router_mma.register_warmup(router)
@@ -290,7 +336,10 @@ def adopt_moe(ffn: nn.Module, config) -> None:
         raise ValueError("DeepSeek-V4.1 routes every layer with noaux_tc")
     if ffn.scoring_func != "sqrtsoftplus":
         raise ValueError(f"Unsupported DeepSeek-V4.1 scoring: {ffn.scoring_func}")
-    _fp32_gate_weight(ffn.gate)
+    if envs.VLLM_DEEPSEEK_V41_ROUTER_MMA:
+        _hold_gate_weight(ffn.gate, torch.bfloat16)
+    else:
+        _fp32_gate_weight(ffn.gate)
     router = ffn.experts.router
     if type(router) is not FusedTopKBiasRouter or router.num_fused_shared_experts:
         raise TypeError(f"Unexpected DeepSeek-V4.1 router: {type(router).__name__}")

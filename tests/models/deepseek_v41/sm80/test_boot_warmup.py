@@ -380,12 +380,10 @@ def _record_router(monkeypatch, sms: int) -> list[_SpecRecorder]:
 
 
 class _MmaGate:
-    def __init__(self, experts: int):
-        self.weight = torch.zeros(experts, rm.HIDDEN)
-        self.weight_bf16 = self.weight.to(torch.bfloat16)
+    """An adopted gate: its weight held once, in BF16 (sm80_moe)."""
 
-    def _weight_bf16(self) -> torch.Tensor:
-        return self.weight_bf16
+    def __init__(self, experts: int):
+        self.weight = torch.zeros(experts, rm.HIDDEN, dtype=torch.bfloat16)
 
 
 def _router(experts: int, vision: bool) -> SimpleNamespace:
@@ -411,7 +409,7 @@ def test_router_warmup_covers_every_served_launch(monkeypatch, experts, sms) -> 
     ids_all = torch.zeros(rm.MAX_ROWS, dtype=torch.int32)  # the runner's input_ids
     for vision in (False, True):
         router = _router(experts, vision)
-        w16 = router.mma_gate._weight_bf16()
+        w16 = router.mma_gate.weight
         served, by_variant = set(), {}
         for rows in range(1, rm.MAX_ROWS + 1):
             # What Sm80DeepseekV41Gate.forward and the router's

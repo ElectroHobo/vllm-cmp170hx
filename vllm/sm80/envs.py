@@ -997,7 +997,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # DeepSeek-V4.1 on sm_80: the MoE gate and routing of calls of 1 to 2047
     # BF16 rows on the BF16 tensor cores (ops/sm80_router_mma.py): the gate
-    # from a BF16 copy of the gate weight with exact BF16 products, FP32 sums
+    # weight held once, in BF16 (its BF16-valued checkpoint values exactly;
+    # the gate GEMV and the FP32 GEMM widen it exactly, so their bytes are
+    # unchanged), with exact BF16 products, FP32 sums
     # per K chunk and FP64 across chunks, rounded once to FP32; the top-k
     # selected in FP32 as the fused route, the weights in FP64 rounded once,
     # from exactly recomputed logits for calls of up to 64 rows. Not the FP32

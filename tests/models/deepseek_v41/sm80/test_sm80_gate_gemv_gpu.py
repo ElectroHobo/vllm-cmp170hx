@@ -15,6 +15,9 @@
   eager calls between replays); repeated calls are bitwise equal; a warm call
   does not synchronise with the host.
 - The adopted gate takes the kernel up to 64 rows and the FP32 GEMM above.
+- The gate weight held once, in BF16 (VLLM_DEEPSEEK_V41_ROUTER_MMA): the
+  kernel's logits at 1 to 64 rows and the FP32 fallback's (cuBLAS) at 65 to
+  3000 rows are the bytes of the FP32-held gate's, both gates.
 
     pytest -q -s tests/models/deepseek_v41/sm80/test_sm80_gate_gemv_gpu.py
 """
@@ -27,7 +30,7 @@ from vllm.models.deepseek_v41.nvidia.sm80_moe import route
 
 from .test_sm80_gate_gemv import GATES, HIDDEN, activations, gate_weight, judge
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")]
 
 TOP_K = {384: 6, 128: 3}
 
@@ -168,3 +171,30 @@ def test_adopted_gate_takes_the_kernel_up_to_64_rows(monkeypatch):
     for rows in (1, 6, 32, MAX_ROWS):
         assert torch.equal(gate(x[:rows])[0], gate_gemv(x[:rows], gate.weight))
     assert torch.equal(gate(x)[0], x.float() @ gate.weight.T)
+
+
+@pytest.mark.parametrize("experts", GATES)
+def test_bf16_held_gate_gives_the_fp32_held_gates_bytes(monkeypatch, experts):
+    from tests.models.deepseek_v41.sm80 import construct
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+    from vllm.models.deepseek_v41.nvidia import sm80_moe
+
+    construct.set_groups(monkeypatch, 1, 0)
+    # BF16 values (the hybrid checkpoint's gate dtype).
+    ck = gate_weight(experts, 11).to(torch.bfloat16)
+    gates = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        with torch.device("cuda"):
+            gate = GateLinear(HIDDEN, experts, bias=False, out_dtype=torch.float32,
+                              prefix="layers.0.ffn.gate")
+        sm80_moe._hold_gate_weight(gate, dtype)
+        gate.weight.data.copy_(ck)
+        gate.gemv = True
+        gates[dtype] = gate
+    held = gates[torch.bfloat16]
+    assert held.weight.dtype == torch.bfloat16
+    x_all = activations(3000, 12).cuda()
+    for rows in (*range(1, MAX_ROWS + 1), 65, 2047, 2048, 2049, 3000):
+        want = gates[torch.float32](x_all[:rows])[0]
+        got = held(x_all[:rows])[0]
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), rows

@@ -5,7 +5,10 @@
 :func:`gate_gemv` returns the router logits ``x @ weight.T`` for BF16 ``x``
 [M, K] (1 to :data:`MAX_ROWS` rows) and the FP32 gate weight [N, K] as FP32
 [M, N], in place of ``x.float()``, the FP32 GEMM and its split-K reduce. It
-reads ``x`` in BF16 (no FP32 copy) and the weight once.
+reads ``x`` in BF16 (no FP32 copy) and the weight once. A BF16 weight (the
+gate weight held once, in BF16, with VLLM_DEEPSEEK_V41_ROUTER_MMA) is read
+as int32 pairs, as ``x`` is, and widened exactly: the logits are the bytes
+of the same values held in FP32.
 
 Arithmetic: FP64. A BF16 value times an FP32 value needs at most 8 + 24
 significant bits, so every product is exact in FP64; the products are summed
@@ -64,6 +67,8 @@ _PROGRAMS_PER_SM = 2
 _DEFAULT_SMS = 74
 _SCRATCH: dict = {}
 _SMS: dict = {}
+# Gate weight dtypes the kernel reads.
+_WEIGHT_DTYPES = (torch.float32, torch.bfloat16)
 
 
 @triton.jit(do_not_specialize=["M"])
@@ -83,8 +88,11 @@ def _gate_gemv_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    W_PAIRS: tl.constexpr,
 ):
     """``x_ptr``: BF16 x read as int32 pairs (``stride_xm`` in pairs);
+    ``w_ptr``: the FP32 weight, or with ``W_PAIRS`` the BF16 weight read as
+    int32 pairs (``stride_wn`` in pairs);
     ``part_ptr``: FP64 scratch [SPLIT, token blocks, NPAD, BLOCK_T];
     ``count_ptr``: int32 [token blocks, expert blocks], zero on entry and on
     exit."""
@@ -106,13 +114,25 @@ def _gate_gemv_kernel(
     k0 = pid_s * KS
     # Even and odd K positions as two halves: w_even[:, j] = w[:, k + 2j],
     # w_odd[:, j] = w[:, k + 2j + 1], and x[k + 2j], x[k + 2j + 1] from one
-    # int32.
-    w_ptrs = w_ptr + rows_e[:, None] * stride_wn + (k0 + 2 * tl.arange(0, HALF))[None, :]
+    # int32 (a BF16 weight's too).
+    if W_PAIRS:
+        w_ptrs = w_ptr + rows_e[:, None] * stride_wn + (k0 // 2 + tl.arange(0, HALF))[None, :]
+    else:
+        w_ptrs = w_ptr + rows_e[:, None] * stride_wn + (k0 + 2 * tl.arange(0, HALF))[None, :]
     x_ptrs = x_ptr + rows_t[:, None] * stride_xm + (k0 // 2 + tl.arange(0, HALF))[None, :]
     acc = tl.zeros([BLOCK_E, BLOCK_T], dtype=tl.float64)
     for _ in range(KS // BLOCK_K):
-        w_even = tl.load(w_ptrs).to(tl.float64)
-        w_odd = tl.load(w_ptrs + 1).to(tl.float64)
+        if W_PAIRS:
+            # The FP32 values of the BF16 weights, as x's below: exactly the
+            # values an FP32-held weight loads.
+            w_pairs = tl.load(w_ptrs)
+            w_even = (w_pairs << 16).to(tl.float32, bitcast=True).to(tl.float64)
+            w_odd = (w_pairs & -65536).to(tl.float32, bitcast=True).to(tl.float64)
+            w_ptrs += HALF
+        else:
+            w_even = tl.load(w_ptrs).to(tl.float64)
+            w_odd = tl.load(w_ptrs + 1).to(tl.float64)
+            w_ptrs += BLOCK_K
         pairs = tl.load(x_ptrs, mask=mask_t[:, None], other=0)
         # A pair holds x[2j] in its low and x[2j + 1] in its high half; a BF16
         # value is the high half of its FP32 value. Read as int32 so that no
@@ -123,7 +143,6 @@ def _gate_gemv_kernel(
                      out_dtype=tl.float64)
         acc = tl.dot(w_odd, tl.trans(x_odd), acc, input_precision="ieee",
                      out_dtype=tl.float64)
-        w_ptrs += BLOCK_K
         x_ptrs += HALF
     tile = (pid_t * NB * BLOCK_E + offs_e[:, None]) * BLOCK_T + tl.arange(0, BLOCK_T)[None, :]
     tl.store(part_ptr + pid_s * TILE * tl.num_programs(2) + tile, acc, cache_modifier=".cg")
@@ -156,14 +175,14 @@ def supports(num_experts: int, hidden: int) -> str | None:
 def serves(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Whether :func:`gate_gemv` takes this call: a CUDA BF16 ``x`` of 1 to
     :data:`MAX_ROWS` rows whose rows are whole int32 pairs, and a supported
-    contiguous FP32 weight. Host metadata only."""
+    contiguous FP32 or BF16 weight. Host metadata only."""
     return (
         x.is_cuda
         and x.dtype == torch.bfloat16
         and x.dim() == 2
         and 0 < x.shape[0] <= MAX_ROWS
         and _pairs(x)
-        and weight.dtype == torch.float32
+        and weight.dtype in _WEIGHT_DTYPES
         and weight.dim() == 2
         and weight.is_contiguous()
         and weight.shape[1] == x.shape[1]
@@ -224,10 +243,10 @@ def _scratch(device: torch.device, num_experts: int, split: int):
 def gate_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """FP32 logits ``x @ weight.T`` [M, N] computed in FP64 (module
     docstring) for BF16 ``x`` [M, K], M at most :data:`MAX_ROWS`, and the
-    FP32 ``weight`` [N, K]. No host synchronisation (graph-safe)."""
+    FP32 or BF16 ``weight`` [N, K]. No host synchronisation (graph-safe)."""
     M, K = x.shape
     N = weight.shape[0]
-    assert x.dtype == torch.bfloat16 and weight.dtype == torch.float32, (x.dtype, weight.dtype)
+    assert x.dtype == torch.bfloat16 and weight.dtype in _WEIGHT_DTYPES, (x.dtype, weight.dtype)
     assert weight.shape[1] == K and weight.is_contiguous(), weight.shape
     assert M <= MAX_ROWS and _pairs(x), (x.shape, x.stride(), x.storage_offset())
     reason = supports(N, K)
@@ -238,15 +257,16 @@ def gate_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     split = split_for(N, K, _sm_count(x.device))
     part, count = _scratch(x.device, N, split)
     block_t, token_blocks = token_tile(M)
+    w_pairs = weight.dtype == torch.bfloat16
     _gate_gemv_kernel[(triton.cdiv(N, BLOCK_E), split, token_blocks)](
         x.view(torch.int32),
-        weight,
+        weight.view(torch.int32) if w_pairs else weight,
         out,
         part,
         count,
         M,
         x.stride(0) // 2,
-        weight.stride(0),
+        weight.stride(0) // 2 if w_pairs else weight.stride(0),
         out.stride(0),
         N=N,
         K=K,
@@ -254,6 +274,7 @@ def gate_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         BLOCK_T=block_t,
         BLOCK_E=BLOCK_E,
         BLOCK_K=BLOCK_K,
+        W_PAIRS=w_pairs,
         num_warps=4,
         num_stages=3,
     )

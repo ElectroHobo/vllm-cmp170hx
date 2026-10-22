@@ -11,13 +11,15 @@
   except where that value lies within the FP64 summation error of an FP32
   rounding midpoint, and within half an FP32 ulp plus that error of it. The
   error of torch's FP32 ``x.float() @ w.T`` is reported beside it.
+- A BF16 weight (the gate weight VLLM_DEEPSEEK_V41_ROUTER_MMA holds once, in
+  BF16) gives the bytes of the same values held in FP32, both gates.
 - A row's logits do not depend on the other rows of the call; a strided
   input gives the same bytes; the counters are zero after every call and the
   scratch is allocated once.
 - A second call issues no host read and allocates only its output.
-- The kernel compiles for sm_80 (no GPU needed): FP64 MMA, no redundant MMA
-  across warps, one FP64 -> FP32 rounding, acquire-release arrival, no
-  register spills.
+- The kernel compiles for sm_80 (no GPU needed), for an FP32 and a BF16
+  weight: FP64 MMA, no redundant MMA across warps, one FP64 -> FP32
+  rounding, acquire-release arrival, no register spills.
 - The switch is off by default; adoption makes the gate a
   ``Sm80DeepseekV41Gate`` that takes the kernel only with the switch on and
   for calls ``serves`` accepts; the dev A/B switch toggles every gate.
@@ -43,6 +45,8 @@ ROOT = Path(__file__).resolve().parents[4]
 HIDDEN = 5120
 GATES = (384, 128)
 ROWS = tuple(range(1, 49)) + (64,)
+# Row counts of the BF16-weight case: every token tile and token-block count.
+BF16_ROWS = (1, 6, 8, 9, 17, 33, 48, 64)
 
 
 def activations(rows: int, seed: int) -> torch.Tensor:
@@ -99,7 +103,7 @@ def _interpreted() -> dict:
     assert os.environ.get("TRITON_INTERPRET") == "1"
     from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv as g
 
-    result = {"cases": {}, "invariant": {}, "counters_zero": True}
+    result = {"cases": {}, "invariant": {}, "bf16_weight": {}, "counters_zero": True}
     for experts in GATES:
         w = gate_weight(experts, experts)
         x_all = activations(max(ROWS), experts + 1)
@@ -128,6 +132,15 @@ def _interpreted() -> dict:
         result["strided_" + str(experts)] = torch.equal(
             g.gate_gemv(strided, w), rows_alone[6]
         )
+        # The BF16-held weight: the bytes of its values held in FP32.
+        w16 = w.to(torch.bfloat16)
+        result["bf16_weight"][str(experts)] = all(
+            torch.equal(g.gate_gemv(x_all[:r], w16).view(torch.int32),
+                        g.gate_gemv(x_all[:r], w16.float()).view(torch.int32))
+            for r in BF16_ROWS
+        )
+        for part, count in g._SCRATCH.values():
+            result["counters_zero"] &= bool((count == 0).all())
 
     scratch = dict(g._SCRATCH)
     for experts in GATES:
@@ -172,6 +185,10 @@ def test_interpreted_logits_are_the_rounded_fp64_product(interpreted):
               f"{max(c['torch_max_abs'] for c in rows):.3e}, max rel "
               f"{max(c['torch_max_rel'] for c in rows):.3e}")
         print(f"gate {gate}, full FP32 weight, 6 rows: {cases[f'{gate}x6_fp32w']}")
+
+
+def test_interpreted_bf16_weight_gives_the_bytes_of_its_fp32_values(interpreted):
+    assert interpreted["bf16_weight"] == {"384": True, "128": True}
 
 
 def test_interpreted_rows_are_independent_and_strided_input_reads_the_same(interpreted):
@@ -224,10 +241,17 @@ def test_a_call_reads_nothing_on_the_host_and_allocates_its_output_only(monkeypa
     assert allocations(ops.names) == ["empty"], ops.names
     assert [grid for grid, _ in launches] == [(6, 20, 1)] * 2
     assert launches[0][1]["BLOCK_T"] == 8 and launches[0][1]["SPLIT"] == 20
+    assert launches[0][1]["W_PAIRS"] is False
     with Ops() as ops:
         g.gate_gemv(x48, w)
     assert allocations(ops.names) == ["empty"], ops.names
     assert launches[-1][0] == (6, 20, 2) and launches[-1][1]["BLOCK_T"] == 32
+    # A BF16 weight: read as int32 pairs, still no allocation but the output.
+    w16 = w.to(torch.bfloat16)
+    with Ops() as ops:
+        g.gate_gemv(x, w16)
+    assert allocations(ops.names) == ["empty"], ops.names
+    assert launches[-1][1]["W_PAIRS"] is True
     # A first call inside a capture refuses before allocating anything.
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="outside a CUDA graph capture"):
@@ -241,16 +265,17 @@ def _ptxas():
     return os.path.join(os.path.dirname(triton.__file__), "backends/nvidia/bin/ptxas")
 
 
-def test_kernel_compiles_for_sm80(tmp_path):
+@pytest.mark.parametrize("w_pairs", [False, True])
+def test_kernel_compiles_for_sm80(tmp_path, w_pairs):
     import triton
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
 
     from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv as g
 
-    types = {"x_ptr": "*i32", "w_ptr": "*fp32", "out_ptr": "*fp32", "part_ptr": "*fp64",
-             "count_ptr": "*i32", "M": "i32", "stride_xm": "i32", "stride_wn": "i32",
-             "stride_om": "i32"}
+    types = {"x_ptr": "*i32", "w_ptr": "*i32" if w_pairs else "*fp32", "out_ptr": "*fp32",
+             "part_ptr": "*fp64", "count_ptr": "*i32", "M": "i32", "stride_xm": "i32",
+             "stride_wn": "i32", "stride_om": "i32"}
     kern = g._gate_gemv_kernel
     sig = {p: types.get(p, "constexpr") for p in kern.arg_names}
     for experts in GATES:
@@ -258,7 +283,7 @@ def test_kernel_compiles_for_sm80(tmp_path):
         assert (experts, split) in ((384, 20), (128, 40))
         for block_t in (8, 16, 32):
             consts = dict(N=experts, K=HIDDEN, SPLIT=split, BLOCK_T=block_t,
-                          BLOCK_E=g.BLOCK_E, BLOCK_K=g.BLOCK_K)
+                          BLOCK_E=g.BLOCK_E, BLOCK_K=g.BLOCK_K, W_PAIRS=w_pairs)
             c = triton.compile(ASTSource(kern, sig, constexprs=consts),
                                target=GPUTarget("cuda", 80, 32),
                                options={"num_warps": 4, "num_stages": 3})
@@ -314,8 +339,10 @@ def test_serves_takes_decode_calls_only():
     assert not g.serves(Cuda(x, rows=0), w)
     assert not g.serves(Cuda(x.float()), w)
     assert not g.serves(Cuda(torch.empty(6, HIDDEN + 1, dtype=torch.bfloat16)[:, 1:]), w)
+    assert g.serves(Cuda(x), w.bfloat16())  # the BF16-held weight
     assert not g.serves(Cuda(x), w.half())
     assert not g.serves(Cuda(x), torch.empty(HIDDEN, 384).T)
+    assert not g.serves(Cuda(x), torch.empty(HIDDEN, 384, dtype=torch.bfloat16).T)
 
 
 def _gate(monkeypatch, experts=8, hidden=64):

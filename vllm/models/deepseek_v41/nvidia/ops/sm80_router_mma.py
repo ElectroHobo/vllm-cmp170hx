@@ -19,13 +19,15 @@ takes the served gate and route (``sm80_gate_gemv`` / the FP32 GEMM, then
 ``sm80_route.route_fused``): the same FP32 selection rules on the FP32 GEMM's
 logits, weights rounded in FP32, so one prefill may mix the two. Both routes
 compile without FTZ and FP contraction, as ``sm80_route.py``, so equal FP32
-logits select the same experts.
+logits select the same experts. Both kernels read the layer's gate weight
+itself, held once in BF16 (``sm80_moe``).
 
 CUDA graphs and the first eager prefill: :data:`ROUTER_WARMUP` compiles every
 form of both kernels a served call can reach (one call per
 :func:`launch_variant` in 1..MAX_ROWS) for every adopted layer shape, target
 and drafter, before capture (registered by :func:`register_warmup` from
-``sm80_moe._adopt_router_mma``).
+``sm80_moe._adopt_router_mma``), and logs the device bytes the BF16-held gate
+weights free on the rank.
 """
 
 import functools
@@ -35,6 +37,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     triton_scalar_specialization_rep,
@@ -43,6 +46,8 @@ from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_mma as G
 from vllm.models.deepseek_v41.nvidia.ops import sm80_route_gluon as RG
 from vllm.models.deepseek_v41.nvidia.ops import sm80_route_mma as R
 from vllm.triton_utils import triton
+
+logger = init_logger(__name__)
 
 HIDDEN = 5120
 EXPERTS_TOP_K = {384: 6, 128: 3}
@@ -254,6 +259,15 @@ def _tensor_class(t: torch.Tensor | None) -> tuple | None:
     return None if t is None else (t.dtype, t.data_ptr() % 16 == 0)
 
 
+def held_gate_bytes(routers) -> tuple[int, int, int]:
+    """(gates, bytes held, bytes freed) of the adopted routers' gate weights:
+    each is held once, in BF16, where the gate held its FP32 weight and a
+    BF16 copy of it (the freed bytes: 4 a value)."""
+    weights = {id(r.mma_gate): r.mma_gate.weight for r in routers}.values()
+    held = sum(w.numel() * w.element_size() for w in weights)
+    return len(weights), held, sum(w.numel() * 4 for w in weights)
+
+
 class RouterWarmup(VllmJitKernel["RouterWarmup.Key"]):
     """Boot-time compile of :func:`gate` and :func:`route` for each adopted
     layer shape at :func:`warmup_rows` (one call per :func:`launch_variant`
@@ -273,7 +287,16 @@ class RouterWarmup(VllmJitKernel["RouterWarmup.Key"]):
 
     def get_warmup_keys(self) -> list["RouterWarmup.Key"]:
         keys: dict = {}
-        for router in list(_ADOPTED):
+        routers = list(_ADOPTED)
+        if routers:
+            gates, held, freed = held_gate_bytes(routers)
+            logger.info_once(
+                "DeepSeek-V4.1 sm_80: %d MoE gate weights held once, in BF16 (%d bytes); "
+                "%d bytes of FP32 gate weights freed on this rank "
+                "(VLLM_DEEPSEEK_V41_ROUTER_MMA=1)",
+                gates, held, freed,
+            )
+        for router in routers:
             weight = router.mma_gate.weight
             if not _sm80(weight.device):
                 continue
@@ -286,7 +309,7 @@ class RouterWarmup(VllmJitKernel["RouterWarmup.Key"]):
 
     def compile(self, compile_key: "RouterWarmup.Key") -> None:
         router, rows = compile_key.router, compile_key.rows
-        w16 = router.mma_gate._weight_bf16()
+        w16 = router.mma_gate.weight
         dev = w16.device
         x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
         input_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
