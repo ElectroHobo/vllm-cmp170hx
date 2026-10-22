@@ -3,6 +3,7 @@
 """Bindings for the shipped BF16 EXL3 extension."""
 
 import importlib
+import weakref
 from functools import lru_cache
 
 import torch
@@ -1015,8 +1016,13 @@ def moe_out_prefill_v2(
 ) -> None:
     """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of
     a MOE_PREFILL_V2_CONFIGS configuration; see csrc/exl3/moe_prefill_v2.cu.
-    ``bits_x2`` is the one bit width of every routed matrix of the layer."""
+    ``bits_x2`` is the one bit width of every routed matrix of the layer.
+    A call whose experts are stored in another format is refused on the host
+    (_check_moe_prefill_v2_formats), never launched."""
     ensure_extension()
+    _check_moe_prefill_v2_formats(
+        packed_ptrs, packed_meta, x.shape[1], intermediate_size, bits_x2
+    )
     op = torch.ops._exl3_C.moe_out_prefill_v2
     if (
         _try_moe_prefill(x.shape[1], intermediate_size, topk_ids.shape[1],
@@ -1041,6 +1047,63 @@ def moe_out_prefill_v2(
     )
 
 
+# (id(packed_meta), id(packed_ptrs)) -> (their data pointers, the
+# (hidden, intermediate, bits_x2) their formats were checked against); an entry
+# goes when either tensor does.
+_moe_prefill_v2_checked: dict[tuple[int, int], tuple[int, int, set]] = {}
+
+
+def _check_moe_prefill_v2_formats(
+    packed_ptrs: torch.Tensor,
+    packed_meta: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    bits_x2: int,
+) -> None:
+    """Refuse on the host a moe_out_prefill_v2 call whose local experts are not
+    every one stored as (hidden_size, intermediate_size, bits_x2), codebook 2,
+    with 16-byte aligned trellis bases: the kernels hold that layout at compile
+    time and would stop the device on any other (their route kernel's check).
+    The two tensors are read once per pair and format, on the first call, which
+    must not be under CUDA graph capture (warmup_moe_prefill_v2 checks every
+    layer's pair before any capture)."""
+    key = (id(packed_meta), id(packed_ptrs))
+    fmt = (hidden_size, intermediate_size, bits_x2)
+    entry = _moe_prefill_v2_checked.get(key)
+    pointers = (packed_meta.data_ptr(), packed_ptrs.data_ptr())
+    if entry is not None and entry[:2] == pointers and fmt in entry[2]:
+        return
+    if packed_meta.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "EXL3 MoE prefill: unsupported call under CUDA graph capture: the "
+            "experts' formats were not checked on the host first "
+            "(warmup_moe_prefill_v2)"
+        )
+    want = moe_v2_expert_meta(hidden_size, intermediate_size, bits_x2)
+    meta = packed_meta.tolist()
+    trellis = packed_ptrs[..., 0].tolist()
+    for local, (stored, bases) in enumerate(zip(meta, trellis)):
+        for projection in range(3):
+            if stored[projection] != want[projection]:
+                raise RuntimeError(
+                    f"EXL3 MoE prefill: unsupported call: local expert {local} "
+                    f"projection {projection} is stored as {stored[projection]}, "
+                    f"not {want[projection]}"
+                )
+            if bases[projection] % 16:
+                raise RuntimeError(
+                    f"EXL3 MoE prefill: unsupported call: local expert {local} "
+                    f"projection {projection} trellis base is not 16-byte aligned"
+                )
+    if entry is None or entry[:2] != pointers:
+        entry = (*pointers, set())
+        if key not in _moe_prefill_v2_checked:
+            for tensor in (packed_meta, packed_ptrs):
+                weakref.finalize(tensor, _moe_prefill_v2_checked.pop, key, None)
+        _moe_prefill_v2_checked[key] = entry
+    entry[2].add(fmt)
+
+
 # (device, hidden, intermediate, bits_x2) warmed by warmup_moe_prefill_v2.
 _moe_prefill_v2_warm: set[tuple] = set()
 
@@ -1062,8 +1125,12 @@ def warmup_moe_prefill_v2(
     operator launches the same kernels at every row count (route tiles are
     chosen on the device), so one call of MOE_PREFILL_MIN_ROWS rows, all with
     local routes, loads every kernel it can launch for the layer's bits_x2.
-    The temporary buffers are freed again.
+    The temporary buffers are freed again. Every layer's experts have their
+    formats checked on the host here, warmed key or not.
     """
+    _check_moe_prefill_v2_formats(
+        packed_ptrs, packed_meta, hidden_size, intermediate_size, bits_x2
+    )
     device = packed_ptrs.device
     key = (device, hidden_size, intermediate_size, bits_x2)
     if key in _moe_prefill_v2_warm:

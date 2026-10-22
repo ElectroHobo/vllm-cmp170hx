@@ -15,7 +15,8 @@ set; the dispatch in Exl3Experts.apply by rows and scheduler phase at both
 moe_out row chunks (512 and 2048): calls of 65..2048 rows in prefill steps
 take the operator whole, everything else keeps the base rule; and the
 workspace contract (no larger than the served MoE workspace at 512-row
-chunks).
+chunks); the operator refusing on the host, before any launch, a call whose
+experts are stored in another format or with an unaligned trellis base.
 
 GPU (SM 8.0), each at bits_x2 6 and 4, on synthetic experts with 16-byte
 aligned trellis bases (the gate requires it): the off path is bitwise the
@@ -109,6 +110,41 @@ def test_gate_opens_for_both_bit_widths_only():
         assert why, name
     assert "bits_x2 8" in closed["drafter bits_x2 8"]
     assert "local expert 40" in closed["mixed widths"]
+
+
+def test_operator_refuses_other_formats_before_launch(monkeypatch):
+    # A call whose experts are stored in another format than the call's
+    # (hidden, intermediate, bits_x2), or with an unaligned trellis base, is
+    # refused on the host; the kernels would stop the device on it.
+    launched = []
+    monkeypatch.setattr(exl3_ops, "ensure_extension", lambda: None)
+    monkeypatch.setattr(
+        torch.ops._exl3_C,
+        "moe_out_prefill_v2",
+        lambda *args: launched.append(args[6:8]),
+        raising=False,
+    )
+    meta = torch.tensor(_meta(6), dtype=torch.int64)
+    pointers = torch.full((LOCAL, 3, 3), 4096, dtype=torch.int64)
+    x = torch.empty((65, HIDDEN), dtype=torch.bfloat16)
+    ids = torch.zeros((65, TOPK), dtype=torch.int32)
+
+    def call(intermediate, bits_x2, ptrs=pointers):
+        exl3_ops.moe_out_prefill_v2(
+            x, ids, None, ptrs, meta, None, intermediate, None, None, bits_x2=bits_x2
+        )
+
+    call(INTERMEDIATE, 6)
+    assert launched == [(INTERMEDIATE, 6)]
+    for intermediate, bits_x2 in ((INTERMEDIATE, 4), (640, 6), (512, 4)):
+        with pytest.raises(RuntimeError, match="unsupported"):
+            call(intermediate, bits_x2)
+    unaligned = pointers.clone()
+    unaligned[5, 1, 0] += 8
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        call(INTERMEDIATE, 6, unaligned)
+    call(INTERMEDIATE, 6)
+    assert launched == [(INTERMEDIATE, 6)] * 2
 
 
 def _config(tp=4, pp=1, spec=None, max_num_seqs=8, k=3):
@@ -613,10 +649,15 @@ def test_operator_refuses_calls_it_does_not_cover(synthetic):
             x, ids, weights, *args, INTERMEDIATE, out, small, bits_x2=synthetic.bits_x2
         )
     workspace = torch.empty(size, device=x.device)
-    # Shapes and widths without kernels are refused on the host. A width with
-    # kernels but not the layer's would stop the device (the kernels check
-    # packed_meta); the gate hands the operator the layer's own.
-    for bits_x2, intermediate in ((8, INTERMEDIATE), (10, INTERMEDIATE), (6, 640)):
+    # Shapes and widths without kernels, and those with kernels but not the
+    # layer's stored format, are refused on the host before any launch.
+    other = 4 if synthetic.bits_x2 == 6 else 6
+    for bits_x2, intermediate in (
+        (8, INTERMEDIATE),
+        (10, INTERMEDIATE),
+        (6, 640),
+        (other, INTERMEDIATE),
+    ):
         with pytest.raises(RuntimeError, match="unsupported"):
             exl3_ops.moe_out_prefill_v2(
                 x, ids, weights, *args, intermediate, out, workspace, bits_x2=bits_x2
