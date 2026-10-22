@@ -87,7 +87,7 @@ def test_nan_rows_rank_nan_first_like_torch(experts, top_k):
 
 @pytest.mark.parametrize("experts,top_k", ROUTERS)
 def test_row_mask_with_nan_rows(experts, top_k):
-    # The row mask (VLLM_DSPARK_ROW_MASK) on finite and NaN rows: masked rows
+    # The row mask (VLLM_DSPARK_ADAPTIVE_DEPTH) on finite and NaN rows: masked rows
     # take id -1 and weight +0.0 whatever their logits; live rows, NaN ones
     # included, keep the unmasked kernel's bytes.
     logits, bias, bias_vl, input_ids = cuda_case(12, experts, 9)

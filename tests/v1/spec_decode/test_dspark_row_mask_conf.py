@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU contracts for the draft side of VLLM_DSPARK_ROW_MASK
-(dspark_row_mask_conf.py).
+"""CPU contracts for the draft side of VLLM_DSPARK_ADAPTIVE_DEPTH
+(dspark_row_mask_conf.py) and the policy file (dspark_row_mask.load_policy).
 
 The publish kernel runs in the Triton interpreter (a subprocess with
 ``TRITON_INTERPRET=1``), driven through the mixin's ``_sample_sequential``
-over the plain and the per-width drafter: each request's confidences land at
-its request-state slot, graph padding requests write nothing, columns past a
-narrower draft width are zero, and the drafted tokens are untouched.
+over the plain and the per-width drafter: each request's confidences (and
+draft-logit statistics, when the policy uses them) land at its request-state
+slot, graph padding requests write nothing, columns past a narrower draft
+width are zero, and the drafted tokens are untouched.
 """
 
 import json
@@ -63,12 +64,19 @@ def _head():
     return SimpleNamespace(proj=SimpleNamespace(weight=torch.ones(1, 8)))
 
 
-def _cost_table(path: Path) -> str:
-    path.write_text(json.dumps({
-        "schema": "dspark-row-mask-costs/1",
-        "max_draft": MAX_DRAFT,
-        "by_batch": {"1": [1, 2, 3, 4, 5, 6], "8": [2, 3, 4, 5, 6, 7]},
-    }))
+def _policy(path: Path, **changes) -> str:
+    policy = {
+        "schema": "dspark-depth-policy/1",
+        "max_depth": MAX_DRAFT,
+        "features": ["bias", "logit_conf"],
+        "weights": [[0.0, 1.0]] * MAX_DRAFT,
+        "costs": {
+            "1": {str(k): 1 + k for k in range(MAX_DRAFT + 1)},
+            "8": {str(k): 2 + k for k in range(MAX_DRAFT + 1)},
+        },
+    }
+    policy.update(changes)
+    path.write_text(json.dumps(policy))
     return str(path)
 
 
@@ -84,8 +92,9 @@ def make(monkeypatch, tmp_path):
     monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", _init_cpu)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", "")
+    monkeypatch.setattr(width_module.envs, "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", False)
     monkeypatch.setattr(
-        width_module.envs, "VLLM_DSPARK_ROW_MASK", _cost_table(tmp_path / "c.json")
+        width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", _policy(tmp_path / "p.json")
     )
 
     def build(head=_head, draft_sample_method="greedy"):
@@ -105,12 +114,12 @@ def make(monkeypatch, tmp_path):
 
 
 def test_switch_off_keeps_the_class_and_creates_no_state(monkeypatch):
-    monkeypatch.delenv("VLLM_DSPARK_ROW_MASK", raising=False)
-    assert FORK_ENV_VARS["VLLM_DSPARK_ROW_MASK"]() == ""
+    monkeypatch.delenv("VLLM_DSPARK_ADAPTIVE_DEPTH", raising=False)
+    assert FORK_ENV_VARS["VLLM_DSPARK_ADAPTIVE_DEPTH"]() == ""
     monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", _init_cpu)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", "")
-    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ROW_MASK", "")
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", "")
     monkeypatch.setattr(
         upstream.DSparkSpeculator,
         "load_draft_model",
@@ -171,6 +180,122 @@ def test_load_refuses_a_drafter_without_a_head(make):
     with pytest.raises(ValueError, match="no confidence head"):
         drafter.load_draft_model(None, set())
     assert state_module.get_row_mask_state() is None
+
+
+def test_load_checks_the_policy_against_the_verified_drafts(make, monkeypatch, tmp_path):
+    # K(1..3) = 5: a batch-1 cost row of k = 0 .. 3 cannot price them.
+    short = {"1": {str(k): 1 + k for k in range(4)}, "8": {str(k): 2 + k for k in range(6)}}
+    monkeypatch.setattr(
+        width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", _policy(tmp_path / "s.json", costs=short)
+    )
+    drafter = make()
+    with pytest.raises(ValueError, match="verifies 5 drafts"):
+        drafter.load_draft_model(None, set())
+    # Batches 4 .. 8 verify 3: k = 0 .. 3 at batch 8 (and so, interpolated
+    # from batch 3, at 4 .. 7) suffices.
+    state_module._reset_for_tests()
+    fits = {
+        "1": {str(k): 1 + k for k in range(6)},
+        "3": {str(k): 1.5 + k for k in range(6)},
+        "8": {str(k): 2 + k for k in range(4)},
+    }
+    monkeypatch.setattr(
+        width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", _policy(tmp_path / "f.json", costs=fits)
+    )
+    make().load_draft_model(None, set())
+    cost = state_module.get_row_mask_state().cost
+    assert cost[1].tolist() == [1, 2, 3, 4, 5, 6]
+    assert cost[2].tolist() == [1.25 + k for k in range(6)]
+    # Batch 4: 1/5 of the way from batch 3 to 8 on k = 0 .. 3; nothing past.
+    assert cost[4, :4].tolist() == pytest.approx([1.6 + k for k in range(4)])
+    assert bool(cost[4, 4:].isnan().all())
+
+
+@pytest.mark.parametrize(
+    "changes, match",
+    [
+        (dict(schema="dspark-row-mask-costs/1"), "schema"),
+        (dict(max_depth=4), "max_depth"),
+        (dict(features=["bias", "conf"]), "features"),
+        (dict(weights=[[0.0, 1.0]] * 4), "weights needs"),
+        (dict(weights=[[0.0]] * MAX_DRAFT), "weights row 0"),
+        (dict(ema_decay=1.5), "ema_decay"),
+        (dict(costs={"1": {"0": 1, "2": 2}}), "not 0 .. m"),
+        (dict(costs={"1": {"0": 2, "1": 1}}), "nondecreasing"),
+    ],
+)
+def test_malformed_policies_are_refused(tmp_path, changes, match):
+    path = _policy(tmp_path / "bad.json", **changes)
+    with pytest.raises(ValueError, match=match):
+        state_module.load_policy(path, MAX_REQS, MAX_DRAFT, [0] + [3] * MAX_REQS)
+
+
+def test_policy_weights_land_in_the_kernel_columns(tmp_path):
+    path = _policy(
+        tmp_path / "w.json",
+        max_depth=7,
+        features=["prev_full", "logit_conf", "bias", "ent"],
+        weights=[[i, 1.0, -i, 0.5] for i in range(7)],
+        ema_init=0.75,
+    )
+    policy = state_module.load_policy(path, MAX_REQS, MAX_DRAFT, [0] + [3] * MAX_REQS)
+    cols = {name: state_module.FEATURES.index(name) for name in state_module.FEATURES}
+    assert policy.weights.shape == (MAX_DRAFT, len(state_module.FEATURES))
+    assert policy.weights[:, cols["prev_full"]].tolist() == [0, 1, 2, 3, 4]
+    assert policy.weights[:, cols["bias"]].tolist() == [0, -1, -2, -3, -4]
+    assert policy.weights[:, cols["ent"]].tolist() == [0.5] * 5
+    assert policy.weights[:, cols["hist_ema"]].tolist() == [0.0] * 5
+    assert policy.uses_stats and policy.ema_init == 0.75 and policy.prev_full_init == 0.0
+
+
+def test_draft_logit_features_refuse_the_shard_argmax(make, monkeypatch, tmp_path):
+    path = _policy(tmp_path / "t.json", features=["bias", "logit_top1"])
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", path)
+    monkeypatch.setattr(width_module.envs, "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", True)
+    drafter = make()
+    drafter._draft_topk = None
+    with pytest.raises(ValueError, match="SHARD_ARGMAX"):
+        drafter.load_draft_model(None, set())
+    state_module._reset_for_tests()
+    monkeypatch.setattr(width_module.envs, "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", False)
+    drafter = make()
+    drafter._draft_topk = None
+    drafter.load_draft_model(None, set())
+    assert tuple(drafter._row_stats.shape) == (MAX_REQS, 2, MAX_DRAFT)
+    # Without them the shard argmax is fine and no statistics are kept.
+    state_module._reset_for_tests()
+    monkeypatch.setattr(width_module.envs, "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX", True)
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", _policy(tmp_path / "c.json"))
+    drafter = make()
+    drafter.load_draft_model(None, set())
+    assert drafter._row_stats is None
+
+
+def test_propose_folds_the_verification_into_the_history(make, monkeypatch):
+    monkeypatch.setattr(
+        upstream.DSparkSpeculator, "propose", lambda self, batch, *a, **k: "drafts",
+        raising=False,
+    )
+    drafter = make()
+    drafter.load_draft_model(None, set())
+    state = drafter._row_mask
+    state.ema_decay = 0.5
+    state.hist_ema.fill_(0.5)
+    state.prev_full.fill_(0.0)
+    # The step's kernel kept 3 and 1 of 3 drafts on slots 6 and 2.
+    state.step_drafts = 3
+    state.live_len[:2] = torch.tensor([3, 1], dtype=torch.int32)
+    batch = SimpleNamespace(num_reqs=2, idx_mapping=torch.tensor([6, 2]))
+    rejected = torch.tensor([0, 3], dtype=torch.int32)
+    t = torch.ones(2, dtype=torch.int32)
+    assert drafter.propose(batch, {}, {}, None, None, t, rejected, None, None, None, None,
+                           num_speculative_tokens=3, remote_tail=False) == "drafts"
+    assert state.hist_ema[[6, 2]].tolist() == [0.75, 0.25]
+    assert state.prev_full[[6, 2]].tolist() == [1.0, 0.0]
+    # Dummy runs never update.
+    drafter.propose(batch, {}, {}, None, None, t, torch.zeros(2, dtype=torch.int32), None,
+                    None, None, None, dummy_run=True, num_speculative_tokens=3)
+    assert state.hist_ema[[6, 2]].tolist() == [0.75, 0.25]
 
 
 def _propose(drafter, slots, num_speculative_tokens):
@@ -240,10 +365,13 @@ def kernel_cases() -> dict:
     out: dict = {}
 
     def sample(self, num_reqs, head_hidden):
-        # Stands for the head: (requests, width) block of the current view.
+        # Stands for the head: (requests, width) block of the current view;
+        # with statistics, the sampler's per-position writes.
         width = self.num_speculative_steps
         self.draft_tokens[:num_reqs, :width] = self.next_tokens[:num_reqs, :width]
         self.draft_token_confidence_probs[:num_reqs] = self.next_conf[:num_reqs, :width]
+        if self._row_stats is not None:
+            self._row_stats[:num_reqs, :, :width] = self.next_stats[:num_reqs, :, :width]
 
     upstream.DSparkSpeculator._sample_sequential = sample
 
@@ -271,10 +399,14 @@ def kernel_cases() -> dict:
         d.next_conf = torch.rand(MAX_REQS, MAX_DRAFT, generator=g) + 0.5
         d.next_conf[len(slots):] = 9.0  # what padding rows of the graph compute
         d.next_tokens = torch.randint(0, 1000, (MAX_REQS, MAX_DRAFT), generator=g)
+        d.next_stats = torch.rand(MAX_REQS, 2, MAX_DRAFT, generator=g) + 0.5
+        d.next_stats[len(slots):] = 9.0
         d._sample_sequential(padded, None)
         assert d.draft_token_confidence_probs.shape == (MAX_REQS, MAX_DRAFT)
         return {
             "conf_by_slot": d._row_mask.conf_by_slot.tolist(),
+            "stats_by_slot": d._row_mask.stats_by_slot.tolist(),
+            "stats": d.next_stats[:, :, :width].tolist(),
             "head": d.next_conf[:, :width].tolist(),
             "drafts": d.draft_tokens[:padded, :width].tolist(),
             "want_drafts": d.next_tokens[:padded, :width].tolist(),
@@ -287,6 +419,11 @@ def kernel_cases() -> dict:
     per_k = drafter(width_module.PerKDSparkSpeculator)
     out["per_k_wide"] = step(per_k, [0, 5, 2, 7], MAX_DRAFT, padded=4)
     out["per_k_narrow"] = step(per_k, [5, 2], 3, padded=4)
+
+    stats = drafter(width_module.PerKDSparkSpeculator)
+    stats._row_stats = torch.full((MAX_REQS, 2, MAX_DRAFT), -1.0)
+    out["stats_wide"] = step(stats, [3, 0], MAX_DRAFT, padded=3)
+    out["stats_narrow"] = step(stats, [0, 6], 3, padded=3)
     return out
 
 
@@ -334,3 +471,20 @@ def test_a_narrower_width_zero_fills_the_rest(kernels):
 def test_drafted_tokens_are_unchanged(kernels):
     for case in kernels.values():
         assert case["drafts"] == case["want_drafts"]
+
+
+def test_statistics_publish_at_the_slot_and_zero_fill(kernels):
+    wide, narrow = kernels["stats_wide"], kernels["stats_narrow"]
+    for r, slot in enumerate([3, 0]):
+        assert wide["stats_by_slot"][slot][0] == pytest.approx(wide["stats"][r][0])
+        assert wide["stats_by_slot"][slot][1] == pytest.approx(wide["stats"][r][1])
+    for r, slot in enumerate([0, 6]):
+        for j in (0, 1):
+            assert narrow["stats_by_slot"][slot][j] == pytest.approx(
+                narrow["stats"][r][j] + [0.0, 0.0])
+    # Slot 3 keeps the wide step's row; padding and untouched slots stay 0.
+    assert narrow["stats_by_slot"][3][0] == pytest.approx(wide["stats"][0][0])
+    for slot in (1, 2, 4, 5, 7):
+        assert narrow["stats_by_slot"][slot] == [[0.0] * MAX_DRAFT] * 2
+    # Without statistics nothing is written.
+    assert kernels["plain"]["stats_by_slot"] == [[[0.0] * MAX_DRAFT] * 2] * MAX_REQS

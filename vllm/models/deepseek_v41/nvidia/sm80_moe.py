@@ -36,7 +36,7 @@ the kernel, the FP32 GEMM of the calls the tensor cores do not serve to FP32
 for the call (:meth:`Sm80DeepseekV41Gate._fp32_fallback`). Their logits are
 the bytes of the FP32-held weight's.
 
-With ``VLLM_DSPARK_ROW_MASK`` (the DSpark verification row mask,
+With ``VLLM_DSPARK_ADAPTIVE_DEPTH`` (the DSpark verification row mask,
 ``vllm/sm80/spec_decode/dspark_row_mask.py``) the routers of the target's
 layers (:func:`adopt_row_mask`; never the drafter's) give every row whose
 ``row_live`` entry is 0 expert id -1 and weight 0: the EXL3 MoE kernels skip
@@ -134,7 +134,7 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
     fused_route = False
     # VLLM_DEEPSEEK_V41_ROUTER_MMA: the adopted gate whose pending call this router routes.
     mma_gate = None
-    # VLLM_DSPARK_ROW_MASK: a target layer's router (adopt_row_mask).
+    # VLLM_DSPARK_ADAPTIVE_DEPTH: a target layer's router (adopt_row_mask).
     row_mask = False
 
     def _row_live(self, tokens: int, *, is_cuda: bool) -> torch.Tensor | None:
@@ -147,13 +147,13 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
         if state is None:
             if is_cuda and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "VLLM_DSPARK_ROW_MASK: create the row mask state before CUDA "
+                    "VLLM_DSPARK_ADAPTIVE_DEPTH: create the row mask state before CUDA "
                     "graph capture (a graph captured without it never masks)"
                 )
             return None
         if tokens > state.row_live.numel():
             raise ValueError(
-                f"VLLM_DSPARK_ROW_MASK: {tokens} rows exceed the row mask's "
+                f"VLLM_DSPARK_ADAPTIVE_DEPTH: {tokens} rows exceed the row mask's "
                 f"{state.row_live.numel()}"
             )
         return state.row_live
@@ -369,7 +369,7 @@ def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
 
 
 def adopt_row_mask(layers) -> None:
-    """With ``VLLM_DSPARK_ROW_MASK``, mark the routers of these decoder
+    """With ``VLLM_DSPARK_ADAPTIVE_DEPTH``, mark the routers of these decoder
     layers (the target model's, after :func:`adopt_moe`) to apply the
     verification row mask. The DSpark drafter's layers are never given: its
     rows are not the target's verify rows."""
@@ -382,7 +382,7 @@ def adopt_row_mask(layers) -> None:
         router.row_mask = True
     logger.info_once(
         "DeepSeek-V4.1 sm_80: the target's MoE routing gives verify rows the "
-        "DSpark row mask holds masked no routed expert (VLLM_DSPARK_ROW_MASK)",
+        "DSpark row mask holds masked no routed expert (VLLM_DSPARK_ADAPTIVE_DEPTH)",
         scope="global",
     )
 

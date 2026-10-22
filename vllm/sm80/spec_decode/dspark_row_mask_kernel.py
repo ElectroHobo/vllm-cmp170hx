@@ -1,34 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSpark verification row mask: the per-step decision kernel.
+"""DSpark adaptive depth: the per-step decision kernel and the history update.
 
 Before the target forward of a uniform speculative decode step (every request
 verifies K > 0 drafts in K + 1 rows, no prefill rows), one Triton program per
-request turns its confidences and the cost table into ``live_len`` and
-``row_live`` (see ``dspark_row_mask``). For request r of a b-request step with
-confidences p_1 .. p_K from ``conf_by_slot[idx_mapping[r]]``, in FP32::
+request turns its draft-step features, its slot's history, the policy weights
+and the cost table into ``live_len`` and ``row_live`` (see
+``dspark_row_mask``). For request r of a b-request step, slot
+``s = idx_mapping[r]``, in FP32::
 
+    x_i       = [1, logit(c_i), logit(t_i), e_i, hist_ema[s], prev_full[s]]
+    p_i       = 1 / (1 + exp(-(sum_f w[i-1][f] * x_i[f])))      (f in order)
     E(k)      = 1 + sum_{i <= k} prod_{j <= i} p_j
     cost_r(k) = T_b(K) - (T_b(K) - T_b(k)) / b
     live_len  = argmax_{k = 0 .. K} E(k) / cost_r(k)     (ties: larger k)
 
-and rows ``r*(K+1) + j`` are live iff ``j <= live_len``. Rows past the step's
+with ``c_i`` the confidence head's output, ``t_i`` and ``e_i`` the draft
+logits' top-1 probability and entropy (read only when the policy uses them),
+``logit(q) = log(q') - log(1 - q')`` for ``q' = clamp(q, 1e-6, 1 - 1e-6)``.
+Rows ``r*(K+1) + j`` are live iff ``j <= live_len``. Rows past the step's
 ``b*(K+1)`` up to the widest step the state can mask are set live (an earlier
 wider step may have masked them); rows past that are never written.
 
 Any other step leaves every row live (``RowMaskState.reset_live``). The kernel
 runs eagerly on the current stream, after the previous step's draft (which
-wrote ``conf_by_slot`` on the same stream) and before the target forward or
+wrote the features on the same stream) and before the target forward or
 graph replay that reads ``row_live`` in place. No host synchronisation.
+
+After the step's rejection sampling (in the draft step's ``propose``), one
+program per request with ``d = live_len[r] > 0`` and ``a = min(K -
+num_rejected[r], d)`` accepted drafts sets ``hist_ema[s] = decay *
+hist_ema[s] + (1 - decay) * (a / d)`` and ``prev_full[s] = (a == d)``.
 """
 
 from __future__ import annotations
 
 import os
 
+import numpy as np
 import torch
 
-from vllm.sm80.spec_decode.dspark_row_mask import RowMaskState, get_row_mask_state
+from vllm.sm80.spec_decode.dspark_row_mask import (
+    FEATURES,
+    PROB_EPS,
+    RowMaskState,
+    get_row_mask_state,
+)
 from vllm.triton_utils import tl, triton
 
 __all__ = [
@@ -36,13 +53,16 @@ __all__ = [
     "begin_step",
     "begin_target_step",
     "compute_row_mask",
+    "end_step",
     "reference_row_mask",
     "uniform_num_drafts",
+    "update_history",
 ]
 
 # Drafts per request the kernel serves (its unrolled loop).
 MAX_DRAFTS = 8
 _BLOCK_ROWS = triton.next_power_of_2(MAX_DRAFTS + 1)
+_NF = len(FEATURES)
 # The Triton interpreter (CPU tests) runs the kernel on CPU tensors and
 # launches without the CUDA compile options.
 _INTERPRET = os.environ.get("TRITON_INTERPRET", "0") == "1"
@@ -53,10 +73,21 @@ def _mask_span(state: RowMaskState) -> int:
     return min(state.max_num_reqs * (state.max_draft + 1), state.max_num_tokens)
 
 
+@triton.jit
+def _log_odds(q, EPS: tl.constexpr):
+    q = tl.minimum(tl.maximum(q, EPS), 1.0 - EPS)
+    return tl.log(q) - tl.log(1.0 - q)
+
+
 @triton.jit(do_not_specialize=["num_reqs", "num_drafts"])
 def _row_mask_kernel(
     conf_ptr,
     conf_stride,
+    stats_ptr,
+    stats_stride,
+    w_ptr,
+    hist_ptr,
+    prev_ptr,
     cost_ptr,
     cost_stride,
     idx_ptr,
@@ -66,6 +97,9 @@ def _row_mask_kernel(
     num_drafts,
     span,
     MAX_K: tl.constexpr,
+    NF: tl.constexpr,
+    USE_STATS: tl.constexpr,
+    EPS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_TAIL: tl.constexpr,
 ):
@@ -74,7 +108,10 @@ def _row_mask_kernel(
     if r < num_reqs:
         slot = tl.load(idx_ptr + r).to(tl.int64)
         conf_row = conf_ptr + slot * conf_stride
+        stats_row = stats_ptr + slot * stats_stride
         cost_row = cost_ptr + num_reqs * cost_stride
+        hist = tl.load(hist_ptr + slot)
+        prev = tl.load(prev_ptr + slot)
         b = num_reqs.to(tl.float32)
         t_full = tl.load(cost_row + num_drafts)
         t_zero = tl.load(cost_row)
@@ -84,7 +121,18 @@ def _row_mask_kernel(
         expected = tl.full((), 1.0, dtype=tl.float32)
         for k in tl.static_range(1, MAX_K + 1):
             ok = k <= num_drafts
-            p = tl.load(conf_row + (k - 1), mask=ok, other=1.0)
+            w = w_ptr + (k - 1) * NF
+            c = tl.load(conf_row + (k - 1), mask=ok, other=0.5)
+            z = tl.load(w, mask=ok, other=0.0)
+            z = z + tl.load(w + 1, mask=ok, other=0.0) * _log_odds(c, EPS)
+            if USE_STATS:
+                top1 = tl.load(stats_row + (k - 1), mask=ok, other=0.5)
+                ent = tl.load(stats_row + MAX_K + (k - 1), mask=ok, other=0.0)
+                z = z + tl.load(w + 2, mask=ok, other=0.0) * _log_odds(top1, EPS)
+                z = z + tl.load(w + 3, mask=ok, other=0.0) * ent
+            z = z + tl.load(w + 4, mask=ok, other=0.0) * hist
+            z = z + tl.load(w + 5, mask=ok, other=0.0) * prev
+            p = tl.math.div_rn(1.0, 1.0 + tl.exp(-z))
             t_k = tl.load(cost_row + k, mask=ok, other=1.0)
             prod = prod * p
             expected = expected + prod
@@ -111,14 +159,24 @@ def _check(state: RowMaskState, idx_mapping: torch.Tensor, num_reqs: int, num_dr
     assert idx_mapping.dim() == 1 and idx_mapping.shape[0] >= num_reqs, idx_mapping.shape
 
 
+def _log_odds_torch(q: torch.Tensor) -> torch.Tensor:
+    q = q.clamp(PROB_EPS, 1.0 - PROB_EPS)
+    return torch.log(q) - torch.log(1.0 - q)
+
+
 def reference_row_mask(
     state: RowMaskState, idx_mapping: torch.Tensor, num_reqs: int, num_drafts: int
 ) -> None:
     """:func:`compute_row_mask` in torch, the same FP32 operations in the same
-    order (bitwise the kernel's result)."""
+    order."""
     _check(state, idx_mapping, num_reqs, num_drafts)
     n, k_full = num_reqs, num_drafts
-    conf = state.conf_by_slot[idx_mapping[:n].long(), :k_full]
+    slots = idx_mapping[:n].long()
+    conf = state.conf_by_slot[slots, :k_full]
+    stats = state.stats_by_slot[slots, :, :k_full]
+    hist = state.hist_ema[slots]
+    prev = state.prev_full[slots]
+    w = state.weights
     row = state.cost[n]
     b = torch.tensor(float(n), dtype=torch.float32, device=row.device)
     t_full = row[k_full]
@@ -128,7 +186,15 @@ def reference_row_mask(
     prod = one.clone()
     expected = one.clone()
     for k in range(1, k_full + 1):
-        prod = prod * conf[:, k - 1]
+        wk = w[k - 1]
+        z = wk[0] + wk[1] * _log_odds_torch(conf[:, k - 1])
+        if state.uses_stats:
+            z = z + wk[2] * _log_odds_torch(stats[:, 0, k - 1])
+            z = z + wk[3] * stats[:, 1, k - 1]
+        z = z + wk[4] * hist
+        z = z + wk[5] * prev
+        p = torch.div(one, 1.0 + torch.exp(-z))
+        prod = prod * p
         expected = expected + prod
         cost = t_full - torch.div(t_full - row[k], b)
         score = torch.div(expected, cost)
@@ -141,6 +207,7 @@ def reference_row_mask(
     state.row_live[:end] = (j[None, :] <= best_k[:, None]).to(torch.int8).reshape(-1)
     state.row_live[end : _mask_span(state)] = 1
     state.active = True
+    state.step_drafts = k_full
 
 
 def compute_row_mask(
@@ -159,6 +226,11 @@ def compute_row_mask(
     _row_mask_kernel[(num_reqs + 1,)](
         state.conf_by_slot,
         state.conf_by_slot.stride(0),
+        state.stats_by_slot,
+        state.stats_by_slot.stride(0),
+        state.weights,
+        state.hist_ema,
+        state.prev_full,
         state.cost,
         state.cost.stride(0),
         idx_mapping,
@@ -167,13 +239,100 @@ def compute_row_mask(
         num_reqs,
         num_drafts,
         span,
-        MAX_K=MAX_DRAFTS,
+        MAX_K=state.max_draft,
+        NF=_NF,
+        USE_STATS=state.uses_stats,
+        EPS=PROB_EPS,
         BLOCK_ROWS=_BLOCK_ROWS,
         BLOCK_TAIL=triton.next_power_of_2(span),
         num_warps=1,
         **options,
     )
     state.active = True
+    state.step_drafts = num_drafts
+
+
+@triton.jit(do_not_specialize=["num_drafts"])
+def _history_kernel(
+    idx_ptr,
+    num_rejected_ptr,
+    live_len_ptr,
+    hist_ptr,
+    prev_ptr,
+    num_drafts,
+    decay,
+):
+    r = tl.program_id(0)
+    d = tl.load(live_len_ptr + r)
+    if d > 0:
+        slot = tl.load(idx_ptr + r).to(tl.int64)
+        accepted = num_drafts - tl.load(num_rejected_ptr + r).to(tl.int32)
+        accepted = tl.minimum(tl.maximum(accepted, 0), d)
+        frac = tl.math.div_rn(accepted.to(tl.float32), d.to(tl.float32))
+        hist = tl.load(hist_ptr + slot)
+        hist = decay * hist + (1.0 - decay) * frac
+        tl.store(hist_ptr + slot, hist)
+        tl.store(prev_ptr + slot, tl.where(accepted == d, 1.0, 0.0))
+
+
+def reference_history(
+    state: RowMaskState, idx_mapping: torch.Tensor, num_rejected: torch.Tensor, num_reqs: int
+) -> None:
+    """:func:`update_history` in torch (the same FP32 operations)."""
+    d = state.live_len[:num_reqs]
+    upd = d > 0
+    slots = idx_mapping[:num_reqs].long()[upd]
+    d = d[upd]
+    accepted = (state.step_drafts - num_rejected[:num_reqs].to(torch.int32))[upd]
+    accepted = torch.minimum(accepted.clamp(min=0), d)
+    frac = torch.div(accepted.float(), d.float())
+    decay = torch.tensor(state.ema_decay, dtype=torch.float32)
+    hist = decay * state.hist_ema[slots] + (1.0 - decay) * frac
+    state.hist_ema[slots] = hist
+    state.prev_full[slots] = (accepted == d).float()
+
+
+def update_history(
+    state: RowMaskState, idx_mapping: torch.Tensor, num_rejected: torch.Tensor, num_reqs: int
+) -> None:
+    """Fold this step's verification into each request's slot history; only
+    after a step whose depths the kernel decided (``step_drafts`` > 0).
+    ``num_rejected`` [num_reqs] (device): drafts rejected, the masked ones
+    included."""
+    if state.step_drafts <= 0 or num_reqs <= 0:
+        return
+    if not (state.live_len.is_cuda or _INTERPRET):
+        reference_history(state, idx_mapping, num_rejected, num_reqs)
+        return
+    options = {} if _INTERPRET else {"enable_fp_fusion": False}
+    _history_kernel[(num_reqs,)](
+        idx_mapping,
+        num_rejected,
+        state.live_len,
+        state.hist_ema,
+        state.prev_full,
+        state.step_drafts,
+        state.ema_decay,
+        num_warps=1,
+        **options,
+    )
+
+
+def reset_new_slots(state: RowMaskState, input_batch) -> None:
+    """Give the slots whose request changed since they were last seen the
+    policy's initial history (host bookkeeping; one small fill only on a
+    step that brings a new request)."""
+    n = input_batch.num_reqs
+    slots = np.asarray(input_batch.idx_mapping_np[:n])
+    fresh = []
+    for slot, req_id in zip(slots.tolist(), input_batch.req_ids[:n]):
+        if state.slot_req_ids[slot] != req_id:
+            state.slot_req_ids[slot] = req_id
+            fresh.append(slot)
+    if fresh:
+        index = torch.tensor(fresh, dtype=torch.int64).to(state.hist_ema.device, non_blocking=True)
+        state.hist_ema.index_fill_(0, index, state.ema_init)
+        state.prev_full.index_fill_(0, index, state.prev_full_init)
 
 
 def uniform_num_drafts(state: RowMaskState, input_batch, dummy_run: bool) -> int:
@@ -198,6 +357,8 @@ def uniform_num_drafts(state: RowMaskState, input_batch, dummy_run: bool) -> int
 def begin_step(state: RowMaskState, input_batch, dummy_run: bool) -> None:
     """The mask for this step's target forward: computed on a uniform
     speculative decode step, every row live on any other."""
+    if not dummy_run:
+        reset_new_slots(state, input_batch)
     k = uniform_num_drafts(state, input_batch, dummy_run)
     if k:
         compute_row_mask(state, input_batch.idx_mapping, input_batch.num_reqs, k)
@@ -207,7 +368,15 @@ def begin_step(state: RowMaskState, input_batch, dummy_run: bool) -> None:
 
 def begin_target_step(input_batch, dummy_run: bool) -> None:
     """Runner entry, right before the target forward: :func:`begin_step` on
-    the shared state; nothing when the row mask is off."""
+    the shared state; nothing when adaptive depth is off."""
     state = get_row_mask_state()
     if state is not None:
         begin_step(state, input_batch, dummy_run)
+
+
+def end_step(input_batch, num_rejected: torch.Tensor) -> None:
+    """Draft-step entry, after the step's rejection: :func:`update_history`
+    on the shared state; nothing when adaptive depth is off."""
+    state = get_row_mask_state()
+    if state is not None:
+        update_history(state, input_batch.idx_mapping, num_rejected, input_batch.num_reqs)

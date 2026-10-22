@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSpark row mask: the drafts on masked verify rows are rejected
+"""DSpark adaptive depth: the drafts on masked verify rows are rejected
 (``vllm/sm80/spec_decode/dspark_row_mask_reject.py``).
 
 ``cap_drafts`` marks the logits rows whose token row the mask left without
@@ -8,10 +8,13 @@ routed experts; the rejection sampler verifies those drafts as -1 proposals.
 The full ``RejectionSampler`` runs with its Triton kernels in the interpreter
 (a subprocess with ``TRITON_INTERPRET=1``):
 
-- greedy: for every live_len L in 0..K and every unmasked acceptance a in
-  0..K, the capped step emits the unmasked step's tokens truncated to
-  min(a, L) accepted drafts plus the target argmax at row min(a, L), while
-  the masked rows hold other logits; num_rejected counts the capped drafts;
+- greedy, at steps verifying k = 7, 5 and 3 drafts of a 7-draft drafter: for
+  every live_len L in 0..k and every unmasked acceptance a in 0..k, the
+  capped step emits the unmasked step's tokens truncated to min(a, L)
+  accepted drafts plus the target argmax at row min(a, L) (L = 0: exactly the
+  target token of row 0), while the masked rows hold other logits;
+  num_rejected counts the capped drafts; with every row live the step is the
+  switch-off step;
 - probabilistic (one-hot drafts): the capped step equals a step that
   proposed only the first L drafts (same seeds, positions and live rows);
 - -1 placeholder drafts (a step starting inside the prefill) give the same
@@ -36,7 +39,7 @@ import torch
 pytestmark = pytest.mark.cpu_test
 
 ROOT = Path(__file__).resolve().parents[3]
-K = 5
+K = 7
 VOCAB = 64
 PREFILL = 4
 START = 40  # position of row 0 of a request past its prefill
@@ -128,8 +131,9 @@ def _run(sampler, logits, batch, invalid_drafts):
     return [s[:n] for s, n in zip(sampled, num)], out.num_rejected.tolist()
 
 
-def greedy_cases() -> dict:
-    """Run in the Triton interpreter."""
+def greedy_cases(k: int = K) -> dict:
+    """Run in the Triton interpreter: a step verifying ``k`` of a ``K``-draft
+    drafter's drafts."""
     assert os.environ.get("TRITON_INTERPRET") == "1"
     from vllm.sm80.spec_decode import dspark_row_mask as rm
     from vllm.sm80.spec_decode.dspark_row_mask_reject import cap_drafts
@@ -137,22 +141,22 @@ def greedy_cases() -> dict:
     g = torch.Generator().manual_seed(0)
     # (a, L) for every unmasked acceptance a and live_len L, then two
     # requests whose step starts inside the prefill (all drafts -1).
-    pairs = [(a, n) for a in range(K + 1) for n in range(K + 1)]
+    pairs = [(a, n) for a in range(k + 1) for n in range(k + 1)]
     placeholders = [0, 3]
     num_reqs = len(pairs) + len(placeholders)
-    logits = torch.randn(num_reqs * (K + 1), VOCAB, generator=g)
+    logits = torch.randn(num_reqs * (k + 1), VOCAB, generator=g)
     argmax = logits.argmax(-1).tolist()
     drafts, starts = [], []
     for r, (a, _) in enumerate(pairs):
-        top = argmax[r * (K + 1) : (r + 1) * (K + 1)]
-        d = [int(x) for x in torch.randint(0, VOCAB, (K,), generator=g)]
+        top = argmax[r * (k + 1) : (r + 1) * (k + 1)]
+        d = [int(x) for x in torch.randint(0, VOCAB, (k,), generator=g)]
         d[:a] = top[:a]
-        if a < K:
+        if a < k:
             d[a] = (top[a] + 1) % VOCAB
         drafts.append(d)
         starts.append(START + r)
     for _ in placeholders:
-        drafts.append([int(x) for x in torch.randint(0, VOCAB, (K,), generator=g)])
+        drafts.append([int(x) for x in torch.randint(0, VOCAB, (k,), generator=g)])
         starts.append(PREFILL - 1)
     batch = _batch(drafts, starts)
     sampler = _sampler(num_reqs, 0.0, torch.arange(num_reqs, dtype=torch.int64))
@@ -163,7 +167,7 @@ def greedy_cases() -> dict:
     uncapped, uncapped_rej = _run(sampler, logits, batch, off)
 
     state = _state(int(batch.cu_num_logits_np[-1]), num_reqs)
-    _apply_mask(state, live, K + 1)
+    _apply_mask(state, live, k + 1)
     rm._STATE = state
     try:
         invalid = cap_drafts(batch.logits_indices, None)
@@ -174,7 +178,22 @@ def greedy_cases() -> dict:
     # The masked rows took no routed expert: other logits, never read.
     masked_logits[rows] = torch.randn(int(rows.sum()), VOCAB, generator=g)
     capped, capped_rej = _run(sampler, masked_logits, batch, invalid)
+
+    # Every row live (a policy keeping every draft): the mask is applied but
+    # adds nothing, and the step is the switch-off step.
+    state = _state(int(batch.cu_num_logits_np[-1]), num_reqs)
+    state.active = True
+    rm._STATE = state
+    try:
+        all_live = cap_drafts(batch.logits_indices, None)
+    finally:
+        rm._reset_for_tests()
+    kept, kept_rej = _run(sampler, logits, batch, all_live)
     return {
+        "k": k,
+        "all_live_invalid": all_live.tolist(),
+        "kept": kept,
+        "kept_rej": kept_rej,
         "off_is_none": off is None,
         "pairs": pairs,
         "argmax": argmax,
@@ -258,9 +277,17 @@ def _interpret(name: str) -> dict:
     return json.loads(line[len("RESULT ") :])
 
 
-@pytest.fixture(scope="module")
-def greedy():
-    return _interpret("greedy_cases")
+@pytest.fixture(scope="module", params=(K, 5, 3), ids=lambda k: f"k{k}")
+def greedy(request):
+    return _interpret("greedy_cases" if request.param == K else f"greedy_k{request.param}")
+
+
+def greedy_k5() -> dict:
+    return greedy_cases(5)
+
+
+def greedy_k3() -> dict:
+    return greedy_cases(3)
 
 
 @pytest.fixture(scope="module")
@@ -271,6 +298,7 @@ def random():
 def test_greedy_capped_step_is_the_unmasked_step_truncated(greedy):
     assert greedy["off_is_none"]
     argmax = greedy["argmax"]
+    K = greedy["k"]  # noqa: N806
     for r, (a, n) in enumerate(greedy["pairs"]):
         full = greedy["uncapped"][r]
         assert len(full) == a + 1  # the drafts were built to accept a
@@ -283,6 +311,7 @@ def test_greedy_capped_step_is_the_unmasked_step_truncated(greedy):
 
 
 def test_invalid_rows_are_the_masked_rows(greedy):
+    K = greedy["k"]  # noqa: N806
     assert greedy["invalid"] == [v == 0 for v in greedy["row_live"]]
     for r, (_, n) in enumerate(greedy["pairs"]):
         row = greedy["invalid"][r * (K + 1) : (r + 1) * (K + 1)]
@@ -290,6 +319,7 @@ def test_invalid_rows_are_the_masked_rows(greedy):
 
 
 def test_placeholder_drafts_are_unaffected(greedy):
+    K = greedy["k"]  # noqa: N806
     argmax = greedy["argmax"]
     base = len(greedy["pairs"])
     for i, _ in enumerate(greedy["placeholders"]):
@@ -297,6 +327,21 @@ def test_placeholder_drafts_are_unaffected(greedy):
         assert greedy["uncapped"][r] == [argmax[r * (K + 1)]]
         assert greedy["capped"][r] == greedy["uncapped"][r]
         assert greedy["capped_rej"][r] == greedy["uncapped_rej"][r] == K
+
+
+def test_zero_depth_emits_the_target_token_of_row_0(greedy):
+    K = greedy["k"]  # noqa: N806
+    argmax = greedy["argmax"]
+    for r, (a, n) in enumerate(greedy["pairs"]):
+        if n == 0:
+            assert greedy["capped"][r] == [argmax[r * (K + 1)]], a
+            assert greedy["capped_rej"][r] == K
+
+
+def test_every_row_live_is_the_switch_off_step(greedy):
+    assert greedy["all_live_invalid"] == [False] * len(greedy["all_live_invalid"])
+    assert greedy["kept"] == greedy["uncapped"]
+    assert greedy["kept_rej"] == greedy["uncapped_rej"]
 
 
 def test_random_capped_draft_is_no_proposal(random):
@@ -313,10 +358,13 @@ def test_switch_off_returns_the_input(monkeypatch):
     from vllm.sm80.spec_decode import dspark_row_mask as rm
     from vllm.sm80.spec_decode.dspark_row_mask_reject import cap_drafts
 
-    monkeypatch.delenv("VLLM_DSPARK_ROW_MASK", raising=False)
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_DSPARK_ADAPTIVE_DEPTH", raising=False)
+    monkeypatch.setattr(envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", "", raising=False)
     rm._reset_for_tests()
     assert rm.init_row_mask_state(
-        max_num_reqs=2, max_num_tokens=12, max_draft=K, device="cpu"
+        max_num_reqs=2, max_num_tokens=12, max_draft=K, device="cpu", verify_drafts=[0, K, K]
     ) is None
     grammar = torch.tensor([False, True, False])
     indices = torch.arange(3)

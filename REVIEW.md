@@ -1,70 +1,88 @@
-# DSpark per-round verification row mask (default off)
+# DSpark adaptive verification depth per request (default off)
 
-`VLLM_DSPARK_ROW_MASK=<dspark-row-mask-costs/1 JSON>` lets each DSpark verify
-step keep, per request, only the drafts its trained confidence head makes
-worth verifying. The rows past them take no routed expert in the target's MoE
-layers, which shrinks the busiest rank's distinct experts, and their drafts
-count as rejected. Empty (the default) changes nothing: no class wrap, no state,
-no extra kernel; the runner hooks return at once.
+`VLLM_DSPARK_ADAPTIVE_DEPTH=<dspark-depth-policy/1 JSON>` lets each DSpark
+verify step keep, per request, only the drafts a depth policy makes worth
+verifying, chosen on the GPU every step with no host round trip. The step's
+physical width K (the scheduler's, for example `VLLM_DSPARK_DEPTH_HINT` with
+adaptive_k) is unchanged; each request gets a logical depth `d <= K`. Rows
+past `d` take no routed expert in the target's MoE layers, and their drafts
+count as rejected. Empty (the default) changes nothing: no class wrap, no
+state, no extra kernel; the runner hooks return at once.
+
+Policy: per draft position i, `p_i = sigmoid(w_i . x_i)` over the features the
+file lists among `bias`, `logit_conf` (log-odds of the confidence head),
+`logit_top1`, `ent` (top-1 probability and entropy of the draft logits; these
+two refuse `VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX` and draft top-k at load),
+`hist_ema` (per request slot, EMA of accepted/verified drafts) and
+`prev_full` (the last round accepted every verified draft). Then
+`d = argmax_k E(k) / cost_r(k)`, `E(k) = 1 + sum_{i<=k} prod_{j<=i} p_j`,
+`cost_r(k) = T_b(K) - (T_b(K) - T_b(k)) / b` from the file's cost table
+(ties: larger k). The raw-confidence rule is the policy with weights
+`[0, 1]` over `[bias, logit_conf]`. The load checks the cost table covers
+every draft count each batch size can verify (adaptive_k load widths, the
+per-batch-size table, or num_speculative_tokens).
 
 Pieces, all reading `dspark_row_mask.RowMaskState` (fixed-address buffers):
 
-1. `dspark_row_mask_conf.py`: the drafter computes its confidence head in
-   every draft step and one Triton launch inside the draft graph publishes
-   each request's per-position outputs into `conf_by_slot` at the request's
-   state slot (from `sample_idx_mapping`, which `prepare_dflash_inputs`
-   rewrites before every replay; padding requests write nothing; columns past
-   the drafted width are 0). A zero-draft step (no draft step runs) resets its
-   batch's slots to 1.0, so no later verify reads stale confidences.
+1. `dspark_row_mask_conf.py`: the drafter computes its confidence head (and,
+   when listed, the draft-logit statistics) in every draft step; one Triton
+   launch inside the draft graph publishes each request's per-position values
+   at its state slot (padding requests write nothing; columns past the
+   drafted width are 0). At the start of `propose` (after the step's
+   rejection) `end_step` folds the step into each slot's history. A
+   zero-draft step resets its batch's confidences to 1.0.
 2. `dspark_row_mask_kernel.py`: before the target forward of a uniform
-   speculative decode step (one call in the runner, eager on the forward
-   stream before the graph replay), one Triton launch computes per request
-   `live_len = argmax_k E(k) / cost_r(k)`, with
-   `E(k) = 1 + sum_{i<=k} prod_{j<=i} p_j` and
-   `cost_r(k) = T_b(K) - (T_b(K) - T_b(k)) / b` from the cost table, and
-   writes `row_live` (rows `0..live_len` of each request live). Any other
-   step resets every row to live.
-3. `sm80_moe.py`, `ops/sm80_route.py`: target routers (marked by
-   `adopt_row_mask` in `DeepseekV4Model.adopt`; the drafter's layers are never
-   marked) give masked rows expert id -1 and weight +0.0: inside the fused
-   route kernel (`ROW_MASK` constexpr, no extra launch) or with `masked_fill`
-   on the torch path. The EXL3 MoE kernels skip id -1 at every stage.
-4. `dspark_row_mask_reject.py`: in the runner's `sample`, masked rows are
-   ORed into the rejection sampler's existing `invalid_drafts`, so drafts past
-   `live_len` are verified as -1 (rejected; the token at row `live_len` is the
-   target's). `num_rejected` then excludes them from the drafter's context.
+   speculative decode step (one call in the runner), one Triton launch
+   computes every request's `live_len` and `row_live` from its features,
+   history, the weights and the cost row of this step's b and K. Any other
+   step resets every row to live. A slot whose request id changed gets the
+   policy's initial history (host bookkeeping, one small fill only then).
+   After rejection one Triton launch updates `hist_ema`/`prev_full` from
+   `num_rejected` and `live_len`.
+3. `sm80_moe.py`, `ops/sm80_route.py`, `ops/sm80_router_mma.py`
+   (`sm80_route_gluon.py`, `sm80_route_mma.py`): target routers (marked by
+   `adopt_row_mask`; the drafter's never are) give masked rows expert -1 and
+   weight +0.0 inside the fused route kernel, both route kernels of the
+   tensor-core router (`VLLM_TRY_ROUTER`, `ROW_MASK` constexpr, no extra
+   launch; the boot warmup compiles the masked form), or with `masked_fill`
+   on the torch path. The EXL3 MoE kernels, the try kernel
+   (`VLLM_TRY_MOE_V2`) and the folded path (`VLLM_EXL3_MOE_V2_FOLD`) skip id
+   -1 at every stage (`local_expert`/`by_assignment`, source reading; GPU
+   tests below).
+4. `dspark_row_mask_reject.py`: masked rows are ORed into the rejection
+   sampler's `invalid_drafts`, so drafts past `live_len` verify as -1.
 
-Exactness: a row's routed-expert output in `moe_out`/`moe_out_v2` depends only
-on that row (kernel reading; GPU test listed below), causal attention never
-reads a later row, and the all-reduces are per row, so rows `0..live_len` are
-bit-identical to the unmasked step. With greedy target sampling the emitted
-tokens are the unmasked step's truncated at `min(accepted, live_len)` drafts
-plus the target token at that row. Masked rows' KV and compressor-ring writes
-are positions past the accepted length, handled as for rejected rows. Sampled
-(probabilistic) drafts are refused at drafter load (the cap would bias the
-verified distribution), and so is `VLLM_DSPARK_CONFIDENCE_DUMP` together with
-the mask (the dump would label the cut drafts as rejected by the target).
+Exactness: rows `0..live_len` are bit-identical to the unmasked step (a row's
+routed output depends only on that row; GPU tests), so greedy output is the
+unmasked output truncated at `min(accepted, live_len)` drafts plus the target
+token of that row. With every row live the step equals the switch-off step.
+Sampled drafts are refused at load, and so is `VLLM_DSPARK_CONFIDENCE_DUMP`
+together with the switch.
+
+Also on this branch: the confidence dump (with draft-logit top-1/entropy),
+the EXL3 step-phase gate fix for block drafters, the MoE prefill v2 row floor
+and `VLLM_DSPARK_DEPTH_HINT` (cherry-picked).
 
 Upstream-owned files: `vllm/v1/worker/gpu/model_runner.py` gets two imports and
-two calls: `begin_target_step(input_batch, dummy_run)` after
-`step_timing.forward_start()` (the mask must be written before the target
-forward) and `cap_drafts(input_batch.logits_indices, invalid_drafts)` before
-rejection sampling (after the forward, so the forward's inputs keep the real
-drafts). Both return immediately with the switch off; both are listed in
-`tools/sm80/upstream_edit_exceptions.yaml` (hunks 75b463763419, 645d5ea70245)
-with their removal plan. Seam rows pin `prepare_dflash_inputs` and
-`RejectionSampler.__call__`.
+two calls (`begin_target_step` before the target forward, `cap_drafts` before
+rejection), listed in `tools/sm80/upstream_edit_exceptions.yaml`.
 
-Tests (CPU): `test_dspark_row_mask_conf.py`, `test_dspark_row_mask_kernel.py`,
-`test_row_mask_moe.py`, `test_dspark_row_mask_reject.py`, the fused-route
-test, seams. GPU, not run: `test_row_mask_moe.py`'s CUDA cases (fused vs torch
-bytes, graph replay reading `row_live` in place, live rows of `moe_out` and
-`moe_out_v2` bit-identical with other rows masked at 6/24/48 rows).
+Tests (CPU): `test_dspark_row_mask_kernel.py` (policy kernel vs a float32
+numpy reference in the interpreter, d in 0..7, padding, history update and
+reset, raw-confidence policy equal to the confidence rule),
+`test_dspark_row_mask_conf.py` (publish incl. statistics, policy loading and
+refusals, history hook), `test_dspark_row_mask_reject.py` (greedy capped step
+= unmasked step truncated, at k = 7, 5, 3; d = 0 emits row 0's target token;
+all rows live = switch off), `test_row_mask_moe.py`,
+`test_dspark_row_mask_gpu.py` (fault checks). GPU: the CUDA cases of
+`test_row_mask_moe.py` (route kernels incl. the router try, moe_out /
+moe_out_v2 / moe_out_v2_try / moe_out_v2_fold live rows bitwise) and
+`test_dspark_row_mask_gpu.py`.
 
-Known limits: the cost table is an estimate until re-fitted from measured
-per-depth step times. `adaptive_k`'s acceptance statistics would count masked
-drafts as rejections. Spec-decode counters show masked drafts as proposed and
-rejected. The pipeline-parallel remote draft tail is not covered (not served).
+Known limits: the cost table is an estimate until re-fitted; `adaptive_k`'s
+and the depth hint's acceptance statistics count masked drafts as rejections;
+spec-decode counters show masked drafts as proposed and rejected; the
+pipeline-parallel draft tail is not covered.
 
 # Grouped MXFP8 wo_a as one Triton GEMM
 

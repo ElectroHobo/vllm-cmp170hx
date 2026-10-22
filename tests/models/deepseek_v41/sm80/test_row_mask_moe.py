@@ -8,15 +8,16 @@
 CPU:
 
 - ``adopt_row_mask`` marks the routers of the layers it is given (the
-  target's) only with ``VLLM_DSPARK_ROW_MASK``; routers it is not given (the
+  target's) only with ``VLLM_DSPARK_ADAPTIVE_DEPTH``; routers it is not given (the
   DSpark drafter's) stay unmarked.
 - torch path: a marked router gives every row whose ``row_live`` entry is 0
   expert id -1 and weight +0.0, and every other row the bytes of the unmasked
   routing; with every row live, and for an unmarked router whatever
   ``row_live`` holds, the bytes are the unmasked routing's.
 - switch off: the routing runs exactly the ops of ``route`` and its cast.
-- fused path: the router hands the state's ``row_live`` to ``route_fused``
-  only when marked; the kernel in the Triton interpreter masks those rows and
+- fused path and the tensor-core router try: the router hands the state's
+  ``row_live`` to ``route_fused`` / ``sm80_router_mma.route`` only when
+  marked; the kernel in the Triton interpreter masks those rows and
   leaves every other row's bytes as without ``row_live``.
 - a marked router refuses CUDA graph capture before the state exists (the
   graph would never read the mask).
@@ -25,9 +26,14 @@ GPU (sm_80; listed for the GPU run):
 
 - the router on CUDA, fused and torch paths: equal bytes, masked rows -1/0;
   a captured routing reads ``row_live`` in place at replay;
-- moe_out and moe_out_v2 at hidden 5120 (the served routed experts, rank 0
-  of 4): every live row's output is the same bits when other rows of the
-  call are masked (ids -1), and a masked row's routed output is exact zero.
+- moe_out, moe_out_v2, the try kernel moe_out_v2_try (VLLM_TRY_MOE_V2) and
+  the folded moe_out_v2_fold (VLLM_EXL3_MOE_V2_FOLD) at hidden 5120 (the
+  served routed experts, rank 0 of 4), up to 64 rows (8 requests at depth
+  7): every live row's output is the same bits when other rows of the call
+  are masked (ids -1), and a masked row's routed output is exact zero;
+- the tensor-core router (VLLM_TRY_ROUTER: ``sm80_router_mma`` gate + Gluon
+  route up to 64 rows, Triton route above) masks rows -1/0 and keeps every
+  other row's bytes, and reads ``row_live`` in place from a captured graph.
 
     pytest -q tests/models/deepseek_v41/sm80/test_row_mask_moe.py
 """
@@ -45,10 +51,12 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 ROOT = Path(__file__).resolve().parents[4]
 ROUTERS = ((384, 6), (128, 3))
-COSTS = {
-    "schema": "dspark-row-mask-costs/1",
-    "max_draft": 5,
-    "by_batch": {"1": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]},
+POLICY = {
+    "schema": "dspark-depth-policy/1",
+    "max_depth": 5,
+    "features": ["bias", "logit_conf"],
+    "weights": [[0.0, 1.0]] * 5,
+    "costs": {"1": {str(k): 10.0 + k for k in range(6)}},
 }
 MAX_TOKENS = 64
 K = 5
@@ -119,25 +127,26 @@ def same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def _switch(monkeypatch, value: str) -> None:
-    """Set VLLM_DSPARK_ROW_MASK in the environment and on ``vllm.envs``: a test
+    """Set VLLM_DSPARK_ADAPTIVE_DEPTH in the environment and on ``vllm.envs``: a test
     elsewhere that monkeypatched the module attribute leaves a plain attribute
     behind, which then shadows the environment."""
     import vllm.envs as envs
 
-    monkeypatch.setenv("VLLM_DSPARK_ROW_MASK", value)
-    monkeypatch.setattr(envs, "VLLM_DSPARK_ROW_MASK", value, raising=False)
+    monkeypatch.setenv("VLLM_DSPARK_ADAPTIVE_DEPTH", value)
+    monkeypatch.setattr(envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", value, raising=False)
 
 
 @pytest.fixture
 def state(monkeypatch, tmp_path):
     from vllm.sm80.spec_decode import dspark_row_mask
 
-    path = tmp_path / "costs.json"
-    path.write_text(json.dumps(COSTS))
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(POLICY))
     _switch(monkeypatch, str(path))
     dspark_row_mask._reset_for_tests()
     s = dspark_row_mask.init_row_mask_state(
-        max_num_reqs=8, max_num_tokens=MAX_TOKENS, max_draft=K, device=torch.device("cpu")
+        max_num_reqs=8, max_num_tokens=MAX_TOKENS, max_draft=K, device=torch.device("cpu"),
+        verify_drafts=[0] + [K] * 8,
     )
     yield s
     dspark_row_mask._reset_for_tests()
@@ -320,6 +329,32 @@ def test_fused_path_gets_row_live_only_when_marked(state, monkeypatch):
     assert seen[1] is state.row_live
 
 
+def test_router_try_path_gets_row_live_only_when_marked(state, monkeypatch):
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_router_mma
+    from vllm.models.deepseek_v41.nvidia.sm80_moe import adopt_row_mask
+
+    seen = []
+
+    def fake_route(pending, w16, bias, bias_vl, input_ids, top_k, sentinel_lo, row_live=None):
+        seen.append(row_live)
+        n = pending.logits.shape[0]
+        return torch.zeros(n, top_k), torch.zeros(n, top_k, dtype=torch.int32)
+
+    monkeypatch.setattr(sm80_router_mma, "route", fake_route)
+    router = make_router(384, 6, 7)
+    logits = SimpleNamespace(dtype=torch.float32, is_cuda=True, shape=(TOKENS, 384))
+    gate = SimpleNamespace(pending=None, weight_bf16=None)
+    router.mma_gate = gate
+    gate.pending = SimpleNamespace(logits=logits)
+    router._compute_routing(None, logits, None)
+    adopt_row_mask([layer_of(router)])
+    gate.pending = SimpleNamespace(logits=logits)
+    router._compute_routing(None, logits, None)
+    assert seen[0] is None
+    assert seen[1] is state.row_live
+    assert gate.pending is None
+
+
 def interpreted_row_mask_results() -> dict:
     """In the Triton interpreter: per case, whether the masked rows are -1/0
     and every other row has the bytes of the call without ``row_live``."""
@@ -400,12 +435,13 @@ def test_interpreted_kernel_masks_rows_and_keeps_live_rows_bitwise():
 def cuda_state(monkeypatch, tmp_path):
     from vllm.sm80.spec_decode import dspark_row_mask
 
-    path = tmp_path / "costs.json"
-    path.write_text(json.dumps(COSTS))
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(POLICY))
     _switch(monkeypatch, str(path))
     dspark_row_mask._reset_for_tests()
     s = dspark_row_mask.init_row_mask_state(
-        max_num_reqs=8, max_num_tokens=MAX_TOKENS, max_draft=K, device=torch.device("cuda")
+        max_num_reqs=8, max_num_tokens=MAX_TOKENS, max_draft=K, device=torch.device("cuda"),
+        verify_drafts=[0] + [K] * 8,
     )
     yield s
     dspark_row_mask._reset_for_tests()
@@ -478,13 +514,36 @@ def served_experts(request):
     experts.release()
 
 
+def _try(experts, x, ids, weights):
+    from functools import partial
+
+    from tests.kernels.quantization.test_exl3_moe_v2_hidden5120 import _run
+    from vllm.sm80.kernels.exl3 import ops as exl3_ops
+
+    exl3_ops.require_moe_v2_try()
+    return _run(partial(exl3_ops.moe_out_v2_try, bits_x2=experts.bits_x2), experts, x, ids,
+                weights, exl3_ops.moe_workspace_size_v2_try)
+
+
+def _fold(experts, x, ids, weights):
+    from functools import partial
+
+    from tests.kernels.quantization.test_exl3_moe_v2_hidden5120 import _run
+    from vllm.sm80.kernels.exl3 import ops as exl3_ops
+
+    exl3_ops.require_moe_v2_fold()
+    return _run(partial(exl3_ops.moe_out_v2_fold, bits_x2=experts.bits_x2), experts, x, ids,
+                weights, exl3_ops.moe_workspace_size_v2)
+
+
 @needs_sm80
-@pytest.mark.parametrize("op", ("moe_out", "moe_out_v2"))
-@pytest.mark.parametrize("rows", (6, TOKENS - 2, 48))
+@pytest.mark.parametrize("op", ("moe_out", "moe_out_v2", "moe_out_v2_try", "moe_out_v2_fold"))
+@pytest.mark.parametrize("rows", (6, TOKENS - 2, 48, 64))
 def test_live_rows_do_not_depend_on_masked_rows(served_experts, op, rows):
     from tests.kernels.quantization.test_exl3_moe_v2_hidden5120 import _case, _v1, _v2
 
-    run = _v1 if op == "moe_out" else _v2
+    run = {"moe_out": _v1, "moe_out_v2": _v2, "moe_out_v2_try": _try,
+           "moe_out_v2_fold": _fold}[op]
     x, ids, weights = _case("uniform", rows, 1021 + rows)
     live = torch.ones(rows, dtype=torch.bool)
     for r in range(0, rows, K + 1):  # every request keeps (r // 6) % 6 drafts
@@ -497,3 +556,86 @@ def test_live_rows_do_not_depend_on_masked_rows(served_experts, op, rows):
     masked = run(served_experts, x, m_ids, m_weights)
     assert same_bits(masked[live].view(torch.int16), whole[live].view(torch.int16))
     assert bool((masked[~live].view(torch.int16) == 0).all())
+
+
+def _router_inputs(rows: int, experts: int, seed: int):
+    g = torch.Generator().manual_seed(seed)
+    x = (torch.randn(rows, 5120, generator=g) * 0.5).to(torch.bfloat16).cuda()
+    w = (torch.randn(experts, 5120, generator=g) * 0.02).to(torch.bfloat16).cuda()
+    bias = (torch.randn(experts, generator=g) * 0.1).cuda()
+    return x, w, bias
+
+
+def _router_mask(rows: int) -> torch.Tensor:
+    live = torch.ones(max(rows, MAX_TOKENS) + 8, dtype=torch.int8)
+    for r in range(0, rows, 8):  # 8 rows per request at depth 7, (r // 8) % 8 kept
+        live[r + (r // 8) % 8 + 1 : r + 8] = 0
+    live[rows:] = 0  # past the call: never read
+    return live.cuda()
+
+
+@needs_sm80
+@pytest.mark.parametrize("experts,top_k", ROUTERS)
+@pytest.mark.parametrize("rows", (6, 16, 64, 96))
+def test_cuda_router_try_masks_rows_and_keeps_live_rows_bitwise(experts, top_k, rows):
+    """VLLM_TRY_ROUTER's gate + route (Gluon route up to 64 rows, Triton
+    above): masked rows -1/0, every other row the unmasked call's bytes, and
+    an all-live mask the unmasked bytes."""
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_router_mma as rm
+
+    x, w, bias = _router_inputs(rows, experts, rows + experts)
+    row_live = _router_mask(rows)
+
+    def call(mask):
+        _, pending = rm.gate(x, w)
+        return rm.route(pending, w, bias, None, None, top_k, 0, row_live=mask)
+
+    base_w, base_i = call(None)
+    got_w, got_i = call(row_live)
+    ones_w, ones_i = call(torch.ones_like(row_live))
+    torch.cuda.synchronize()
+    live = (row_live[:rows] != 0).cpu()
+    base_w, base_i, got_w, got_i = (t.cpu() for t in (base_w, base_i, got_w, got_i))
+    assert bool((~live).any())
+    assert same_bits(got_w[live], base_w[live]) and same_bits(got_i[live], base_i[live])
+    assert bool((got_i[~live] == -1).all())
+    assert bool((got_w[~live].view(torch.int32) == 0).all())
+    assert same_bits(ones_w.cpu(), base_w) and same_bits(ones_i.cpu(), base_i)
+
+
+@needs_sm80
+@pytest.mark.parametrize("rows", (16, 96))
+def test_cuda_captured_router_try_reads_row_live_in_place(rows):
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_router_mma as rm
+
+    x, w, bias = _router_inputs(rows, 384, 5 + rows)
+    row_live = torch.ones(MAX_TOKENS * 2, dtype=torch.int8, device="cuda")
+    _, pending = rm.gate(x, w)
+    want_w, want_i = rm.route(pending, w, bias, None, None, 6, 0)
+
+    def run():
+        _, p = rm.gate(x, w)
+        return rm.route(p, w, bias, None, None, 6, 0, row_live=row_live)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_w, out_i = run()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert same_bits(out_w, want_w) and same_bits(out_i, want_i)
+    mask = _router_mask(rows)
+    row_live[: mask.numel()].copy_(mask)
+    graph.replay()
+    torch.cuda.synchronize()
+    live = row_live[:rows] != 0
+    assert same_bits(out_w[live], want_w[live]) and same_bits(out_i[live], want_i[live])
+    assert bool((out_i[~live] == -1).all()) and bool((out_w[~live].view(torch.int32) == 0).all())
+    row_live.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert same_bits(out_w, want_w) and same_bits(out_i, want_i)

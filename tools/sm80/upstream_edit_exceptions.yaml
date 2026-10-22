@@ -183,8 +183,8 @@ exceptions:
     (276b0ee249b6) The existing optional KV-allocation observer brackets actual temporary profiling or serving KV construction. It must remain around this allocation scope, not around the later graph-capture method.
     (20c6cc21da36) The existing optional profiling stage recorder is constructed at the memory-profile boundary and used by its nested stages. It cannot be initialized at model construction without changing its measured interval.
     (ba753e35fcca) The existing failed-input delivery consumes per-step model failure tokens with the actual request query offsets when constructing asynchronous output. Capture-time registration cannot supply those per-request values.
-    (75b463763419) The DSpark row mask's live lengths must be written after the step's batch and draft counts are final and before the target forward or its graph replay reads them; no runner hook sits between input preparation and the forward. The call returns at once with VLLM_DSPARK_ROW_MASK unset.
-    (645d5ea70245) The row mask's drafts past each live length must join the rejection sampler's invalid drafts after the target forward (whose inputs keep the real drafts) and before rejection; no sampler hook exists there. The call returns its argument at once with VLLM_DSPARK_ROW_MASK unset.
+    (75b463763419) The DSpark row mask's live lengths must be written after the step's batch and draft counts are final and before the target forward or its graph replay reads them; no runner hook sits between input preparation and the forward. The call returns at once with VLLM_DSPARK_ADAPTIVE_DEPTH unset.
+    (645d5ea70245) The row mask's drafts past each live length must join the rejection sampler's invalid drafts after the target forward (whose inputs keep the real drafts) and before rejection; no sampler hook exists there. The call returns its argument at once with VLLM_DSPARK_ADAPTIVE_DEPTH unset.
   owner: >-
     (ff7a814b29b9) pipeline draft-tail lifecycle
     (9b96f0854408) pipeline folded draft projection

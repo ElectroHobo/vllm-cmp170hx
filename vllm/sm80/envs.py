@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     VLLM_DFLASH_BOUNDARY_CACHE: bool = False
     VLLM_DSPARK_PER_K_WIDTH: bool = False
     VLLM_DSPARK_CONFIDENCE_DUMP: str = ""
-    VLLM_DSPARK_ROW_MASK: str = ""
+    VLLM_DSPARK_ADAPTIVE_DEPTH: str = ""
     VLLM_DSPARK_DEPTH_HINT: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
@@ -564,12 +564,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_CONFIDENCE_DUMP": lambda: os.getenv(
         "VLLM_DSPARK_CONFIDENCE_DUMP", ""
     ),
-    # A dspark-row-mask-costs/1 JSON file: each DSpark verify step keeps per
-    # request only the drafts its confidence head makes worth verifying; the
-    # rows past them take no routed expert and their drafts count as
-    # rejected (dspark_row_mask.py). Greedy output is the unmasked output
-    # truncated at the kept drafts. Empty: off.
-    "VLLM_DSPARK_ROW_MASK": lambda: os.getenv("VLLM_DSPARK_ROW_MASK", ""),
+    # A dspark-depth-policy/1 JSON file: each DSpark verify step keeps per
+    # request only the drafts the policy (draft-step features and the
+    # request's acceptance history, against the step cost table) makes worth
+    # verifying; the rows past them take no routed expert and their drafts
+    # count as rejected (dspark_row_mask.py). Greedy output is the unmasked
+    # output truncated at the kept drafts. Empty: off.
+    "VLLM_DSPARK_ADAPTIVE_DEPTH": lambda: os.getenv("VLLM_DSPARK_ADAPTIVE_DEPTH", ""),
     # Trial: DSpark verify width from each request's last verified round, per
     # load (vllm/sm80/spec_decode/dspark_depth_hint.py); empty is off.
     "VLLM_DSPARK_DEPTH_HINT": lambda: os.getenv("VLLM_DSPARK_DEPTH_HINT", ""),
