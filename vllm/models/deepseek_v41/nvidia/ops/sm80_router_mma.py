@@ -3,15 +3,18 @@
 """DeepSeek-V4.1 MoE gate + routing on the BF16 tensor cores (sm_80), as two
 launches that share their scratch: :func:`gate` (``sm80_gate_mma.py``: exact
 BF16 products, FP32 sums per K chunk, FP64 across chunks, one FP32 rounding)
-and :func:`route` (``sm80_route_mma.py``: FP32 selection as the served route,
-weights in FP64 rounded once, from exactly recomputed logits up to
-:data:`EXACT_ROWS` rows). For decode rows with split K the gate leaves its
-FP64 partials and the route completes them, so :func:`route` must consume the
-:class:`Pending` of the :func:`gate` call that produced its logits.
+and :func:`route`: FP32 selection as the served route, weights in FP64
+rounded once; up to :data:`EXACT_ROWS` rows the Gluon kernel
+(``sm80_route_gluon.py``) recomputes the chosen experts' logits exactly,
+above it the Triton kernel (``sm80_route_mma.py``) takes them from the gate's
+logits. For decode rows with split K the gate leaves its FP64 partials and
+the route completes them, so :func:`route` must consume the :class:`Pending`
+of the :func:`gate` call that produced its logits.
 
 Served configuration: hidden 5120, 384 experts top 6 (target) or 128 experts
 top 3 (drafter), routed scaling 1.5, renormalised, gate_temp 1, image sentinel
-ids [129264, 129269), BF16 x of 1 to :data:`MAX_ROWS` rows (:func:`serves`).
+ids [129264, 129269) or none, BF16 x of 1 to :data:`MAX_ROWS` rows
+(:func:`serves`).
 """
 
 from dataclasses import dataclass
@@ -19,6 +22,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_mma as G
+from vllm.models.deepseek_v41.nvidia.ops import sm80_route_gluon as RG
 from vllm.models.deepseek_v41.nvidia.ops import sm80_route_mma as R
 from vllm.triton_utils import triton
 
@@ -31,9 +35,11 @@ MAX_ROWS = 2047
 # Rows whose weights come from the exactly recomputed logits; above, from the
 # gate's FP32 logits.
 EXACT_ROWS = 64
-_ROUTE_WARPS = 4
-# Large prefill calls route one row per single-warp program.
-_ROUTE_WARPS_LARGE, _LARGE_ROWS = 1, 256
+# K slices of the decode route's recompute (5 x 1024, one program per row and
+# slice).
+_ROUTE_SPLIT = 5
+# Prefill route warps: one row per single-warp program above _LARGE_ROWS.
+_ROUTE_WARPS, _ROUTE_WARPS_LARGE, _LARGE_ROWS = 4, 1, 256
 _KP_MAX = 8
 _SMS: dict = {}
 _LOCKS: dict = {}
@@ -84,16 +90,6 @@ def _locks(device: torch.device) -> torch.Tensor:
     return _LOCKS[key]
 
 
-def _route_split(M: int, K: int) -> int:
-    """SPLIT of the route: exact rows recompute the chosen logits over 5 K
-    slices of 1024 (one program per row and slice); prefill rows take one
-    program per row."""
-    if M <= EXACT_ROWS:
-        assert K % 5 == 0 and (K // 5) & (K // 5 - 1) == 0, K
-        return 5
-    return 1
-
-
 @dataclass
 class Pending:
     """One gate call's state for its :func:`route`."""
@@ -107,7 +103,6 @@ class Pending:
     gsplit: int
     gate_rows: int
     gcols: int
-    split: int
 
 
 def gate(x: torch.Tensor, weight_bf16: torch.Tensor) -> tuple[torch.Tensor, Pending]:
@@ -115,15 +110,15 @@ def gate(x: torch.Tensor, weight_bf16: torch.Tensor) -> tuple[torch.Tensor, Pend
     :class:`Pending` defers them to :func:`route`)."""
     M, K = x.shape
     E = weight_bf16.shape[0]
+    assert K % _ROUTE_SPLIT == 0 and (K // _ROUTE_SPLIT) & (K // _ROUTE_SPLIT - 1) == 0, K
     sms = _sms(x.device)
-    split = _route_split(M, K)
+    exact = M <= EXACT_ROWS
     ng = G.part_numel(M, E, K, sms)
-    nr = M * split * _KP_MAX if split > 1 else 0
+    nr = RG.part_numel(M, _ROUTE_SPLIT, _KP_MAX) if exact else 0
     scratch = torch.empty(2 * (ng + nr) + M * E, dtype=torch.float32, device=x.device)
     gpart = scratch[: 2 * ng].view(torch.float64)
     rpart = scratch[2 * ng : 2 * (ng + nr)].view(torch.float64)
     logits = scratch[2 * (ng + nr) :].view(M, E)
-    exact = M <= EXACT_ROWS
     block_t, block_e, _, gsplit, tb, _, _ = G.config(M, E, K, sms)
     defer = exact and gsplit > 1
     locks = _locks(x.device)
@@ -131,7 +126,7 @@ def gate(x: torch.Tensor, weight_bf16: torch.Tensor) -> tuple[torch.Tensor, Pend
     return logits, Pending(
         x=x, logits=logits, gpart=gpart, rpart=rpart, locks=locks, exact=exact,
         gsplit=gsplit if defer else 1, gate_rows=tb * block_t,
-        gcols=triton.cdiv(E, block_e) * block_e, split=split,
+        gcols=triton.cdiv(E, block_e) * block_e,
     )
 
 
@@ -159,12 +154,14 @@ def route(
         tokens, lo, hi = input_ids, sentinel_lo, sentinel_lo + (SENTINEL_HI - SENTINEL_LO)
     kp = triton.next_power_of_2(top_k)
     assert kp <= _KP_MAX, top_k
-    R._route_kernel[(M, p.split)](
-        p.logits, p.logits.stride(0), p.x, p.x.stride(0), weight_bf16, bias, bias_vl, tokens, weights, ids,
-        p.rpart, p.locks, p.gpart, p.gate_rows, E, lo, hi, SCALE, 1e-20, HIDDEN=HIDDEN, K=top_k, KP=kp,
-        BLOCK_E=triton.next_power_of_2(E), SPLIT=p.split, EXACT=p.exact,
-        GSPLIT=p.gsplit, GCOLS=p.gcols,
-        num_warps=_ROUTE_WARPS_LARGE if M > _LARGE_ROWS else _ROUTE_WARPS)
+    if p.exact:
+        RG.launch(p.x, weight_bf16, bias, bias_vl, tokens, weights, ids, p.rpart, p.locks, p.gpart, p.logits,
+                  p.gate_rows, p.gsplit, p.gcols, _ROUTE_SPLIT, lo, hi, SCALE, 1e-20)
+    else:
+        R._route_kernel[(M,)](
+            p.logits, p.logits.stride(0), bias, bias_vl, tokens, weights, ids, E, lo, hi, SCALE, 1e-20,
+            K=top_k, KP=kp, BLOCK_E=triton.next_power_of_2(E),
+            num_warps=_ROUTE_WARPS_LARGE if M > _LARGE_ROWS else _ROUTE_WARPS)
     return weights, ids
 
 
