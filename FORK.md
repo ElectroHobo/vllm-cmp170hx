@@ -432,7 +432,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_dspark_draft_identity_gpu.py` | 35 |
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax.py` | 422 |
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax_stats.py` | 111 |
-| `tests/models/deepseek_v41/sm80/test_engram_early_gather.py` | 196 |
+| `tests/models/deepseek_v41/sm80/test_engram_early_gather.py` | 226 |
 | `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,757 |
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica.py` | 459 |
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica_gpu.py` | 113 |
@@ -607,7 +607,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **283 files** | **120,135** |
+| **283 files** | **120,165** |
 
 #### `tools/`
 
