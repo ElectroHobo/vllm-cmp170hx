@@ -296,7 +296,10 @@ def _rank_main(rank: int, tp: int, init_file: str, result_file: str,
 
     results = []
     nan, inf = float("nan"), float("inf")
-    for dtype in (torch.float32, torch.bfloat16):
+    # The served target logits are FP32; stock CUDA top-k/top-p (the gather
+    # fallback's rows) asserts FP32, so BF16 logits run on CPU only.
+    dtypes = (torch.float32,) if str(device).startswith("cuda") else (torch.float32, torch.bfloat16)
+    for dtype in dtypes:
         # Adversarial rows, one request each (Sampler).
         rows = named_rows(vocab, width)
         full = torch.stack([r for r, _ in rows.values()]).to(dtype)
