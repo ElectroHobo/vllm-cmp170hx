@@ -343,7 +343,7 @@ def test_router_try_path_gets_row_live_only_when_marked(state, monkeypatch):
     monkeypatch.setattr(sm80_router_mma, "route", fake_route)
     router = make_router(384, 6, 7)
     logits = SimpleNamespace(dtype=torch.float32, is_cuda=True, shape=(TOKENS, 384))
-    gate = SimpleNamespace(pending=None, weight_bf16=None)
+    gate = SimpleNamespace(pending=None, weight=None)
     router.mma_gate = gate
     gate.pending = SimpleNamespace(logits=logits)
     router._compute_routing(None, logits, None)
