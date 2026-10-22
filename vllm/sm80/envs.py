@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_PER_K_WIDTH: bool = False
     VLLM_DSPARK_CONFIDENCE_DUMP: str = ""
     VLLM_DSPARK_ROW_MASK: str = ""
+    VLLM_DSPARK_DEPTH_HINT: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
@@ -569,6 +570,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # rejected (dspark_row_mask.py). Greedy output is the unmasked output
     # truncated at the kept drafts. Empty: off.
     "VLLM_DSPARK_ROW_MASK": lambda: os.getenv("VLLM_DSPARK_ROW_MASK", ""),
+    # Trial: DSpark verify width from each request's last verified round, per
+    # load (vllm/sm80/spec_decode/dspark_depth_hint.py); empty is off.
+    "VLLM_DSPARK_DEPTH_HINT": lambda: os.getenv("VLLM_DSPARK_DEPTH_HINT", ""),
     # Diagnostics (step-cost calibration): a file holding a depth; while it
     # holds one inside the adaptive_k load width, every step verifies that
     # depth.

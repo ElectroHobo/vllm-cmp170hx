@@ -175,6 +175,9 @@ def register() -> None:
     register_triton_mla_sparse_backend()
     register_moe_layers()
     log_marlin_decode_v2_gate()
+    from vllm.sm80.spec_decode.dspark_depth_hint import install as install_depth_hint
+
+    install_depth_hint()
 
 
 def is_registered() -> bool:
