@@ -3,6 +3,7 @@
 """Bindings for the shipped BF16 EXL3 extension."""
 
 import importlib
+import os
 from functools import lru_cache
 
 import torch
@@ -639,6 +640,97 @@ def moe_out_v2_fold(
     )
 
 
+# VLLM_TRY_MOE_V2=1 (scratch trial, default off): the target model's
+# expert-parallel moe_out_v2 calls of exactly this configuration (hidden,
+# intermediate, top-k, local experts, global experts), bits_x2 6 or 4, 1..64
+# rows, take _exl3_C::moe_out_v2_try (csrc/exl3/moe_v2_try.cu) instead of
+# moe_out_v2 or moe_out_v2_fold: same arguments and output bits.
+MOE_V2_TRY_CONFIG = (5120, 2304, 6, 96, 384)
+MOE_V2_TRY_BITS = (6, 4)
+_moe_v2_try_fake_registered = False
+
+
+def moe_v2_try_open(
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    local_experts: int,
+    global_experts: int,
+    bits_x2: int,
+) -> bool:
+    """VLLM_TRY_MOE_V2 is set and the layer is the configuration it covers."""
+    return (
+        os.environ.get("VLLM_TRY_MOE_V2", "0") == "1"
+        and (hidden_size, intermediate_size, top_k, local_experts, global_experts)
+        == MOE_V2_TRY_CONFIG
+        and bits_x2 in MOE_V2_TRY_BITS
+    )
+
+
+def require_moe_v2_try() -> None:
+    """Refuse a library without moe_out_v2_try and register the operator's
+    fake implementation once per process."""
+    global _moe_v2_try_fake_registered
+    ensure_extension()
+    try:
+        torch._C._dispatch_find_schema_or_throw("_exl3_C::moe_out_v2_try", "")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "VLLM_TRY_MOE_V2 needs _exl3_C::moe_out_v2_try: rebuild the EXL3 "
+            "extension from this tree (python csrc/exl3/build_standalone.py "
+            f"--out vllm), or unset the flag. Detail: {exc}"
+        ) from exc
+    if not _moe_v2_try_fake_registered:
+        torch.library.register_fake("_exl3_C::moe_out_v2_try")(_moe_v2_fake)
+        _moe_v2_try_fake_registered = True
+
+
+@lru_cache(maxsize=None)
+def moe_workspace_size_v2_try(
+    max_rows: int,
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    local_experts: int,
+) -> int:
+    ensure_extension()
+    return torch.ops._exl3_C.moe_workspace_size_v2_try(
+        max_rows, hidden_size, intermediate_size, topk, local_experts
+    )
+
+
+def moe_out_v2_try(
+    x,
+    topk_ids,
+    topk_weights,
+    packed_ptrs,
+    packed_meta,
+    expert_map,
+    intermediate_size: int,
+    out,
+    workspace,
+    swiglu_limit: float = 0.0,
+    *,
+    bits_x2: int,
+) -> None:
+    """moe_out_v2's arguments and output bits (VLLM_TRY_MOE_V2; callers check
+    moe_v2_try_open and require_moe_v2_try first)."""
+    ensure_extension()
+    torch.ops._exl3_C.moe_out_v2_try(
+        x,
+        topk_ids,
+        topk_weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        bits_x2,
+        out,
+        workspace,
+        swiglu_limit,
+    )
+
+
 def require_moe_v2_draft() -> None:
     """Refuse a library without the drafter's bits_x2 8 moe_out_v2 kernels
     (built from a tree before them; its moe_v2_draft_force_rows marks them)."""
@@ -668,7 +760,7 @@ def moe_v2_draft_force_rows(rows: int) -> None:
     torch.ops._exl3_C.moe_v2_draft_force_rows(rows)
 
 
-# (device, hidden, intermediate, bits_x2, fold) warmed by warmup_moe_v2.
+# (device, hidden, intermediate, bits_x2, fold, trial) warmed by warmup_moe_v2.
 _moe_v2_warm: set[tuple] = set()
 
 
@@ -683,9 +775,10 @@ def warmup_moe_v2(
     bits_x2: int,
     swiglu_limit: float = 0.0,
     fold: bool = False,
+    trial: bool = False,
 ) -> None:
-    """Run moe_out_v2 (fold: moe_out_v2_fold) per device, shape and bits_x2
-    before any CUDA graph capture.
+    """Run moe_out_v2 (fold: moe_out_v2_fold; trial: moe_out_v2_try) per
+    device, shape and bits_x2 before any CUDA graph capture.
 
     Each lane kernel instance's first call queries the SM count and the
     kernel's occupancy and keeps them (moe_v2.cu launch_lane). The operator
@@ -696,10 +789,10 @@ def warmup_moe_v2(
     The temporary buffers are freed again.
     """
     device = packed_ptrs.device
-    key = (device, hidden_size, intermediate_size, bits_x2, fold)
+    key = (device, hidden_size, intermediate_size, bits_x2, fold, trial)
     if key in _moe_v2_warm:
         return
-    operator = moe_out_v2_fold if fold else moe_out_v2
+    operator = moe_out_v2_try if trial else moe_out_v2_fold if fold else moe_out_v2
     rows = MOE_V2_MAX_ROWS
     ids = torch.tensor(
         [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
@@ -707,13 +800,18 @@ def warmup_moe_v2(
     weights = torch.full((rows, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
     x = torch.ones((rows, hidden_size), dtype=torch.bfloat16, device=device)
     out = torch.empty_like(x)
-    workspace = torch.empty(
+    sizes = [
         moe_workspace_size_v2(
             rows, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
-        ),
-        dtype=torch.float32,
-        device=device,
-    )
+        )
+    ]
+    if trial:
+        sizes.append(
+            moe_workspace_size_v2_try(
+                rows, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
+            )
+        )
+    workspace = torch.empty(max(sizes), dtype=torch.float32, device=device)
     for count in (1, rows):
         operator(
             x[:count],

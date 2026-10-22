@@ -1127,6 +1127,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 layer, gate_metadata, max_rows, workspace, draft=True
             )
             moe_v2_draft = bool(moe_v2_rows)
+        # VLLM_TRY_MOE_V2: the target layers' moe_out_v2 calls of the covered
+        # configuration take moe_out_v2_try (before moe_out_v2_fold).
+        moe_v2_try = False
+        if moe_v2_rows and not moe_v2_draft:
+            moe_v2_try, workspace = self._moe_v2_try(
+                layer, moe_v2_rows, moe_v2_bits_x2, workspace
+            )
         prefill_decode_len = 0
         if envs.VLLM_EXL3_MOE_PREFILL_TC:
             prefill_decode_len, workspace = self._moe_prefill(
@@ -1161,6 +1168,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             and not moe_v2_draft
             and envs.VLLM_EXL3_MOE_V2_FOLD,
             moe_v2_draft=moe_v2_draft,
+            moe_v2_try=moe_v2_try,
             prefill_decode_len=prefill_decode_len,
             prefill_v2_bits_x2=prefill_v2_bits_x2,
             prefill_v2_decode_len=prefill_v2_decode_len,
@@ -1275,6 +1283,52 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "(three launches per call, the same output bits).",
             )
         return rows, bits_x2, workspace
+
+    def _moe_v2_try(self, layer, rows: int, bits_x2: int, workspace: int):
+        """(True, a workspace size that fits moe_out_v2_try too) when
+        VLLM_TRY_MOE_V2 is set and the layer is its configuration, after
+        warming the operator; else (False, workspace)."""
+        from vllm.sm80.kernels.exl3 import ops as exl3_ops
+
+        if not exl3_ops.moe_v2_try_open(
+            self.hidden_size,
+            self.intermediate_size,
+            layer.top_k,
+            self.local_experts,
+            layer.global_num_experts,
+            bits_x2,
+        ):
+            return False, workspace
+        exl3_ops.require_moe_v2_try()
+        workspace = max(
+            workspace,
+            exl3_ops.moe_workspace_size_v2_try(
+                rows,
+                self.hidden_size,
+                self.intermediate_size,
+                layer.top_k,
+                self.local_experts,
+            ),
+        )
+        exl3_ops.warmup_moe_v2(
+            layer.exl3_ptrs,
+            layer.exl3_meta,
+            layer.exl3_expert_map,
+            self.global_expert_ids,
+            self.hidden_size,
+            self.intermediate_size,
+            layer.top_k,
+            bits_x2,
+            self.swiglu_limit,
+            trial=True,
+        )
+        logger.info_once(
+            "EXL3 MoE v2 trial kernel active (VLLM_TRY_MOE_V2): moe_out_v2_try "
+            "for MoE calls of 1..%d rows of the covered layers (the same output "
+            "bits as moe_out_v2).",
+            rows,
+        )
+        return True, workspace
 
     def _moe_prefill(self, layer, metadata, max_rows: int, workspace: int):
         """The most tokens one request has in a decode step, above which a
@@ -1457,6 +1511,8 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
     # VLLM_EXL3_MOE_V2_DRAFT: the moe_out_v2 calls are the DSpark drafter's
     # (bits_x2 8 kernels of their own, never folded).
     moe_v2_draft = False
+    # VLLM_TRY_MOE_V2: the moe_out_v2 calls take moe_out_v2_try.
+    moe_v2_try = False
 
     def __init__(
         self,
@@ -1471,6 +1527,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         moe_v2_bits_x2=0,
         moe_v2_fold=False,
         moe_v2_draft=False,
+        moe_v2_try=False,
         prefill_decode_len=0,
         prefill_v2_bits_x2=0,
         prefill_v2_decode_len=0,
@@ -1491,6 +1548,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.moe_v2_bits_x2 = moe_v2_bits_x2
         self.moe_v2_fold = moe_v2_fold
         self.moe_v2_draft = moe_v2_draft
+        self.moe_v2_try = moe_v2_try
         # Nonzero (VLLM_EXL3_MOE_PREFILL_TC with its gate open): calls of more
         # than 64 rows in a step that schedules some request more than this
         # many tokens take moe_out_prefill.
@@ -1584,7 +1642,12 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         expert_tokens_meta,
         apply_router_weight_on_input,
     ):
-        from vllm.sm80.kernels.exl3.ops import moe_out, moe_out_v2, moe_out_v2_fold
+        from vllm.sm80.kernels.exl3.ops import (
+            moe_out,
+            moe_out_v2,
+            moe_out_v2_fold,
+            moe_out_v2_try,
+        )
 
         rows = hidden_states.shape[0]
         if rows > self.max_rows:
@@ -1597,7 +1660,11 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             raise ValueError("EXL3 MoE requires unquantized, unweighted BF16 inputs")
         if 0 < rows <= self.moe_v2_rows:
             operator = partial(
-                moe_out_v2_fold if self.moe_v2_fold else moe_out_v2,
+                moe_out_v2_try
+                if self.moe_v2_try
+                else moe_out_v2_fold
+                if self.moe_v2_fold
+                else moe_out_v2,
                 bits_x2=self.moe_v2_bits_x2,
             )
         else:
