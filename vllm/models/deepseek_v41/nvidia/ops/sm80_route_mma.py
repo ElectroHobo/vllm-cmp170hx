@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""DeepSeek-V4.1 MoE routing after the gate logits as one Triton kernel (sm_80).
+
+Per token (one program, the row's experts in one block), from the FP32 gate logits ``l``: the selection scores
+``s = sqrt(softplus(l))`` in FP32 as the served route computes them (``l`` above 20, else ``log1p(exp(l))``, correctly
+rounded square root); ``b = s + bias`` (``bias_vl`` for tokens in ``[sentinel_lo, sentinel_hi)``); the ``K`` largest
+``b``, largest first, equal values lowest expert first. ``w = s[ids] / (sum + eps) * scale`` is evaluated in FP64
+(stable softplus ``max(l, 0) + log1p(exp(-|l|))``) and rounded once. With ``EXACT`` (decode rows, where the
+incumbent's logits are its FP64 GEMV's) the chosen experts' logits are first recomputed from x and the BF16 weight
+rows in FP64 (every BF16 x BF16 product exact, the FP64 sum ~1e-16 relative), so the weights are the correctly
+rounded FP32 values; without it (prefill rows, where the incumbent's logits come from the FP32 SGEMM) the weights use
+the gate's FP32 logits of the chosen experts. A NaN biased score ranks above every number (as torch.topk), NaNs
+lowest expert first, so ids stay in range.
+"""
+from triton.language.extra import libdevice
+
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _sqrt_softplus64(x):
+    return libdevice.sqrt(tl.maximum(x, 0.0) + libdevice.log1p(libdevice.exp(-tl.abs(x))))
+
+
+@triton.jit
+def _sqrt_softplus32(x):
+    return tl.sqrt_rn(tl.where(x > 20.0, x, libdevice.log1p(libdevice.exp(x))))
+
+
+@triton.jit
+def _route_kernel(
+    logits_ptr,
+    logits_stride,
+    x_ptr,
+    x_stride,
+    w_ptr,
+    bias_ptr,
+    bias_vl_ptr,
+    token_ptr,
+    weights_ptr,
+    ids_ptr,
+    part_ptr,
+    count_ptr,
+    gpart_ptr,
+    gate_rows,
+    num_experts,
+    sentinel_lo,
+    sentinel_hi,
+    scale,
+    eps,
+    HIDDEN: tl.constexpr,
+    K: tl.constexpr,
+    KP: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SPLIT: tl.constexpr,
+    EXACT: tl.constexpr,
+    GSPLIT: tl.constexpr,
+    GCOLS: tl.constexpr,
+):
+    """GSPLIT > 1: the gate deferred its split-K completion; row t's logits are the FP64 partials
+    ``gpart[s, t, :]`` ([GSPLIT, gate_rows, GCOLS]) added in order s = 0 .. GSPLIT-1 and rounded once to FP32."""
+    t = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_E)
+    valid = offs < num_experts
+    if GSPLIT > 1:
+        lg64 = tl.zeros([BLOCK_E], dtype=tl.float64)
+        for gs in tl.static_range(GSPLIT):
+            lg64 += tl.load(gpart_ptr + (gs * gate_rows + t) * GCOLS + offs, mask=valid, other=0.0)
+        lg = lg64.to(tl.float32)
+    else:
+        lg = tl.load(logits_ptr + t * logits_stride + offs, mask=valid, other=0.0)
+    token = tl.load(token_ptr + t)
+    image = (token >= sentinel_lo) & (token < sentinel_hi)
+    bias = tl.load(bias_ptr + offs, mask=valid, other=0.0)
+    bias_vl = tl.load(bias_vl_ptr + offs, mask=valid, other=0.0)
+    bias = tl.where(image, bias_vl, bias)
+    biased = _sqrt_softplus32(lg) + bias
+    # One int64 key per expert: the FP32 score's bits mapped to an order-preserving int32 (NaN above every number)
+    # in the high half, BLOCK_E - 1 - expert in the low half, so one max per pick takes the largest score, lowest
+    # expert first among equal scores and NaNs.
+    bits = biased.to(tl.int32, bitcast=True)
+    order = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+    order = tl.where(biased != biased, 0x7FFFFFFF, order)
+    key = (order.to(tl.int64) << 32) | (BLOCK_E - 1 - offs).to(tl.int64)
+    key = tl.where(valid, key, -0x7FFFFFFFFFFFFFFF)
+
+    lane = tl.arange(0, KP)
+    ids = tl.zeros([KP], dtype=tl.int32)
+    for j in tl.static_range(K):
+        top = tl.max(key, 0)
+        pick = BLOCK_E - 1 - (top & 0xFFFFFFFF).to(tl.int32)
+        pick = tl.minimum(pick, num_experts - 1)
+        ids = tl.where(lane == j, pick, ids)
+        key = tl.where(offs == pick, -0x7FFFFFFFFFFFFFFF, key)
+
+    keep = lane < K
+    if not EXACT:
+        chosen = tl.load(logits_ptr + t * logits_stride + ids).to(tl.float64)
+        scores = _sqrt_softplus64(chosen)
+        total = tl.sum(tl.where(keep, scores, 0.0), 0)
+        weights = scores / (total + eps) * scale
+        tl.store(weights_ptr + t * K + lane, weights.to(tl.float32), mask=keep)
+        tl.store(ids_ptr + t * K + lane, ids, mask=keep)
+        return
+    # The chosen experts' logits in FP64 from x and the BF16 weight rows; program (t, s) sums slice s of the row.
+    DS: tl.constexpr = HIDDEN // SPLIT
+    s = tl.program_id(1)
+    offs_d = s * DS + tl.arange(0, BLOCK_D)
+    w_rows = w_ptr + ids.to(tl.int64)[:, None] * HIDDEN + offs_d[None, :]
+    x_row = x_ptr + t * x_stride + offs_d
+    acc = tl.zeros([KP, BLOCK_D], dtype=tl.float64)
+    for d in tl.static_range(0, DS, BLOCK_D):
+        wv = tl.load(w_rows + d).to(tl.float64)
+        xv = tl.load(x_row + d).to(tl.float64)
+        acc += wv * xv[None, :]
+    dots = tl.sum(acc, 1)
+    if SPLIT > 1:
+        # Each slice's FP64 partial goes to scratch; the last program of row t to arrive (acquire-release counter)
+        # adds them in slice order 0 .. SPLIT-1 and resets the counter: order-independent, graph-replayable.
+        tl.store(part_ptr + (t * SPLIT + s) * KP + lane, dots, cache_modifier=".cg")
+        tl.debug_barrier()
+        arrived = tl.atomic_add(count_ptr + t, 1, sem="acq_rel", scope="gpu")
+        if arrived == SPLIT - 1:
+            dots = tl.zeros([KP], dtype=tl.float64)
+            for i in range(SPLIT):
+                dots += tl.load(part_ptr + (t * SPLIT + i) * KP + lane, cache_modifier=".cg")
+            scores = _sqrt_softplus64(dots)
+            total = tl.sum(tl.where(keep, scores, 0.0), 0)
+            weights = scores / (total + eps) * scale
+            tl.store(weights_ptr + t * K + lane, weights.to(tl.float32), mask=keep)
+            tl.store(ids_ptr + t * K + lane, ids, mask=keep)
+            tl.store(count_ptr + t, 0)
+    else:
+        scores = _sqrt_softplus64(dots)
+        total = tl.sum(tl.where(keep, scores, 0.0), 0)
+        weights = scores / (total + eps) * scale
+        tl.store(weights_ptr + t * K + lane, weights.to(tl.float32), mask=keep)
+        tl.store(ids_ptr + t * K + lane, ids, mask=keep)

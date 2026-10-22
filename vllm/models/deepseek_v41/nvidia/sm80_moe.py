@@ -31,6 +31,8 @@ prefill operator ``moe_out_prefill_v2`` for prefill calls (its gate decides
 when the weights have loaded).
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -44,7 +46,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.sm80.kernels.exl3.quant import set_moe_prefill_v2
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
-from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv, sm80_route
+from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv, sm80_route, sm80_router_mma
 from vllm.models.deepseek_v41.nvidia.sm80_attention import (
     large_round_once_all_reduce,
     prefill_all_reduce,
@@ -106,6 +108,8 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
     gate_temp = 1.0
     # VLLM_DEEPSEEK_V41_FUSED_ROUTE: route() as one kernel (ops/sm80_route.py).
     fused_route = False
+    # VLLM_TRY_ROUTER: the adopted gate whose pending call this router routes.
+    mma_gate = None
 
     def _compute_routing(
         self,
@@ -117,6 +121,23 @@ class Sm80DeepseekV41Router(FusedTopKBiasRouter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if router_logits.dtype != torch.float32:
             raise ValueError("DeepSeek-V4.1 routing needs FP32 router logits")
+        gate = self.mma_gate
+        if gate is not None and gate.pending is not None:
+            pending, gate.pending = gate.pending, None
+            if pending.logits is not router_logits:
+                raise RuntimeError("VLLM_TRY_ROUTER: router logits are not the gate call's")
+            weights, ids = sm80_router_mma.route(
+                pending,
+                gate.weight_bf16,
+                self.e_score_correction_bias,
+                self.bias_vl,
+                input_ids,
+                self.top_k,
+                self.image_sentinel_lo,
+            )
+            if indices_type is None or indices_type == torch.int32:
+                return weights, ids
+            return weights, ids.to(indices_type)
         if self.fused_route and router_logits.is_cuda:
             weights, ids = sm80_route.route_fused(
                 router_logits,
@@ -154,7 +175,16 @@ class Sm80DeepseekV41Gate(GateLinear):
     # VLLM_DEEPSEEK_V41_GATE_GEMV: decode-sized calls run gate_gemv.
     gemv = False
 
+    # VLLM_TRY_ROUTER: calls that sm80_router_mma.serves run its gate; the
+    # router (``mma_gate``) consumes ``pending``.
+    mma = False
+    pending = None
+    weight_bf16 = None
+
     def forward(self, x: torch.Tensor):
+        if self.mma and self.bias is None and sm80_router_mma.serves(x):
+            logits, self.pending = sm80_router_mma.gate(x, self._weight_bf16())
+            return self._return(logits)
         if (
             self.gemv
             and self.bias is None
@@ -162,6 +192,19 @@ class Sm80DeepseekV41Gate(GateLinear):
         ):
             return self._return(sm80_gate_gemv.gate_gemv(x, self.weight))
         return super().forward(x)
+
+    def _weight_bf16(self) -> torch.Tensor:
+        """The gate weight's BF16 values (exact: the FP32 weight holds the
+        checkpoint's BF16 values), made on the first, eager call."""
+        if self.weight_bf16 is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("VLLM_TRY_ROUTER: gate weight not prepared before capture")
+            w = self.weight.data
+            w16 = w.to(torch.bfloat16)
+            if not torch.equal(w16.float(), w):
+                raise ValueError("VLLM_TRY_ROUTER: the gate weight is not BF16-valued")
+            self.weight_bf16 = w16.contiguous()
+        return self.weight_bf16
 
 
 def _fp32_gate_weight(gate: nn.Module) -> None:
@@ -183,6 +226,34 @@ def _fp32_gate_weight(gate: nn.Module) -> None:
             setattr(gate, tier, False)
     if gate.out_dtype != torch.float32:
         raise ValueError("DeepSeek-V4.1 gates produce FP32 logits")
+
+
+def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
+    """VLLM_TRY_ROUTER: the layer's gate and routing run
+    ``ops/sm80_router_mma.py`` for every call it serves."""
+    gate = ffn.gate
+    if not isinstance(gate, Sm80DeepseekV41Gate) or gate.bias is not None:
+        raise TypeError(f"VLLM_TRY_ROUTER: unexpected gate {type(gate).__name__}")
+    moe_config = ffn.experts.moe_config
+    if moe_config.dp_size > 1 or moe_config.pcp_size > 1 or moe_config.is_sequence_parallel:
+        # The route consumes the gate call's own logits tensor and scratch.
+        raise ValueError("VLLM_TRY_ROUTER: the MoE runner dispatches the router logits")
+    reason = sm80_router_mma.supports(
+        router.global_num_experts, gate.weight.shape[1], router.top_k, router.renormalize,
+        router.routed_scaling_factor, router.gate_temp, router.image_sentinel_lo,
+    )
+    if reason is not None:
+        raise ValueError(f"VLLM_TRY_ROUTER: {reason}")
+    if envs.VLLM_SM80_CAPTURE_DIR and "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+        raise ValueError("VLLM_TRY_ROUTER: the hybrid capture records the FP32 gate GEMM; capture with it off")
+    gate.mma = True
+    router.mma_gate = gate
+    logger.info_once(
+        "DeepSeek-V4.1 sm_80: MoE gate and routing on the BF16 tensor cores for calls "
+        "of 1 to %d rows (VLLM_TRY_ROUTER=1)",
+        sm80_router_mma.MAX_ROWS,
+        scope="global",
+    )
 
 
 def adopt_moe(ffn: nn.Module, config) -> None:
@@ -212,6 +283,8 @@ def adopt_moe(ffn: nn.Module, config) -> None:
             "kernel (VLLM_DEEPSEEK_V41_FUSED_ROUTE=1)",
             scope="global",
         )
+    if os.environ.get("VLLM_TRY_ROUTER", "0") == "1":
+        _adopt_router_mma(ffn, router)
     if envs.VLLM_DEEPSEEK_V41_GATE_GEMV:
         gate = ffn.gate
         if not isinstance(gate, Sm80DeepseekV41Gate):
