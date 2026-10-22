@@ -345,6 +345,8 @@ class Resolved:
     dropped: list[str]
     ignored: list[str]
     fork_absent: list[str]
+    passthrough: dict[str, str]
+    absent_args: dict[str, str]
     not_validated: list[str]
     functional_sha256: str
     exe: str
@@ -436,7 +438,6 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
     harness_set = {normalize_arg_name(h) for h in harness_args}
     secret_names = declared_secrets(ms)
     check_knob_names(ms, classes, secret_names)
-    check_protected_spellings(ms, inp.arg_options)
     # runtime layer
     final.put("args.host", rt["host"], "runtime", f"defaults.toml[runtime.{run}]")
     for k, v in rt.get("location", {}).items():
@@ -451,6 +452,8 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
     # variants (user knobs that select a variant are read first)
     values = user_values(ms, inp)
     variants = selected_variants(ms, inp, values)
+    passthrough, absent_args = engine_declarations(files, variants, inp.capability)
+    check_protected_spellings(ms, inp.arg_options, absent_args)
     for v in variants:
         table = files.get(f"variant:{v}")
         if table is None:
@@ -508,9 +511,47 @@ def resolve(ms: ModelSettings, files: dict[str, dict], registry: Registry,
         when = rule.get("when", {})
         if when and all(str(final.get(k, "")) == str(v) for k, v in when.items()):
             raise Refusal(f"refused combination {when}: {rule.get('why', '')}".strip())
-    fork_absent = _check_env_names(final, registry, classes, inp.capability, secret_names)
-    return _render(final, ms, inp, rt, harness_set, amb, variants, fork_absent,
-                   secret_names, classes)
+    fork_absent = _check_env_names(final, registry, classes, inp.capability, secret_names, passthrough)
+    return _render(final, ms, inp, rt, harness_set, amb, variants, fork_absent, passthrough,
+                   absent_args, secret_names, classes)
+
+
+def engine_declarations(files: dict[str, dict], variants: list[str],
+                        capability: str) -> tuple[dict[str, str], dict[str, str]]:
+    """What the applied variants declare about a plain-upstream engine tree,
+    each name with its reason (NAME = "why" or { why = "..." }):
+
+    [passthrough]  environment names a package of that engine reads which
+                   its vllm/envs.py does not declare (a plugin's switches,
+                   the model code's own names): forwarded as functional
+                   switches, in the functional hash, never dropped;
+    [absent_args]  fixed or controlled arguments of the model that the
+                   engine's CLI does not declare.
+
+    Only a variant declares them, and only under capability plain-upstream:
+    the sm80 registry declares every name the fork reads."""
+    passthrough: dict[str, str] = {}
+    absent: dict[str, str] = {}
+    for v in variants:
+        table = files.get(f"variant:{v}") or {}
+        source = f"variants/{v}.toml"
+        for section, into in (("passthrough", passthrough), ("absent_args", absent)):
+            decl = table.get(section)
+            if decl is None:
+                continue
+            if capability != "plain-upstream":
+                raise Refusal(f"{source}: [{section}] applies only under capability plain-upstream")
+            if not isinstance(decl, dict):
+                raise Refusal(f"{source}: [{section}] is a table of NAME = \"why\"")
+            for name, why in decl.items():
+                if isinstance(why, dict) and set(why) == {"why"}:
+                    why = why["why"]
+                if not isinstance(why, str) or not why.strip():
+                    raise Refusal(f"{source}: [{section}] {name} needs its reason (a why string)")
+                if section == "passthrough" and not _ENV_NAME.match(name):
+                    raise Refusal(f"{source}: [passthrough] {name!r} is not an environment name")
+                into[normalize_arg_name(name) if section == "absent_args" else name] = why
+    return passthrough, absent
 
 
 def _check_harness_overlay(source: str, table: dict, harness_set: set[str]) -> None:
@@ -558,11 +599,13 @@ def _check_geometry(final: Final, hw: dict, layout: str) -> None:
 
 
 def _check_env_names(final: Final, registry: Registry, classes: ClassTable,
-                     capability: str, secrets: set[str]) -> list[str]:
+                     capability: str, secrets: set[str], passthrough: dict[str, str]) -> list[str]:
     """Settings env names: functional or secret class (declared secret
     targets: secret or unclassified); VLLM_* registered. Location names:
-    location class."""
+    location class. A [passthrough] name: functional or unclassified, not one
+    the engine tree declares, set by some layer."""
     fork_absent: list[str] = []
+    env_names = {key[4:] for key in final.entries if key.startswith("env.")}
     for key in list(final.entries):
         source = final.entries[key].source
         if key.startswith("loc."):
@@ -575,6 +618,15 @@ def _check_env_names(final: Final, registry: Registry, classes: ClassTable,
         if not key.startswith("env."):
             continue
         name = key[4:]
+        if name in passthrough:
+            cls = classes.classify(name)
+            if name in secrets or cls not in ("functional", "unclassified"):
+                raise Refusal(f"{source}: {name} is class {cls}; [passthrough] forwards "
+                              "functional switches only")
+            if cls == "functional" and not (name.upper().startswith("VLLM_") and registry.check(name)):
+                raise Refusal(f"{source}: {name} needs no [passthrough]: the engine tree declares it "
+                              "or its class is functional")
+            continue
         if name.upper().startswith("VLLM_"):
             problem = registry.check(name)
             if problem:
@@ -589,6 +641,9 @@ def _check_env_names(final: Final, registry: Registry, classes: ClassTable,
             continue                    # checked at load: secret or unclassified
         if cls not in ("functional", "secret"):
             raise Refusal(f"{source}: {name} is class {cls}; settings env holds functional switches only")
+    unset = sorted(set(passthrough) - env_names)
+    if unset:
+        raise Refusal(f"[passthrough] {', '.join(unset)}: no settings layer sets it")
     return fork_absent
 
 
@@ -657,7 +712,8 @@ def _checkpoint_fields(final: Final, ms: ModelSettings, inp: Inputs) -> dict[str
 
 
 def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set: set[str],
-            amb: dict, variants: list[str], fork_absent: list[str], secret_names: set[str],
+            amb: dict, variants: list[str], fork_absent: list[str], passthrough: dict[str, str],
+            absent_args: dict[str, str], secret_names: set[str],
             classes: ClassTable) -> Resolved:
     subst = {"home": inp.home, "venv": inp.venv, "tree": inp.tree,
              "models_dir": substitute(rt["models_dir"], {"home": inp.home}, "runtime")}
@@ -707,7 +763,8 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set:
     for key, e in final.entries.items():
         if key.startswith("env."):
             name = key[4:]
-            cls = "secret" if name in secret_names else classes.classify(name)
+            cls = "secret" if name in secret_names else \
+                "functional" if name in passthrough else classes.classify(name)
             child[name] = {"value": substitute(e.value, subst, key), "class": cls}
             if cls == "functional":
                 env_functional[name] = e.value
@@ -737,6 +794,7 @@ def _render(final: Final, ms: ModelSettings, inp: Inputs, rt: dict, harness_set:
         env_functional=env_functional, ambient_equal=amb["equal"],
         ambient_layer=sorted(amb["layer"]), dropped=amb["dropped"],
         ignored=amb["ignored"], fork_absent=fork_absent,
+        passthrough=dict(passthrough), absent_args=dict(absent_args),
         not_validated=list(amb["not_validated"]),
         functional_sha256=functional_sha256, exe=exe, secret_names=secret_names,
         checkpoint_refs=refs, checkpoint_files=checkpoint_files,
@@ -815,14 +873,24 @@ def reaches(name: str, guarded: set[str] | frozenset[str], opts: ArgOptions) -> 
     return None
 
 
-def check_protected_spellings(ms: ModelSettings, opts: ArgOptions) -> None:
+def check_protected_spellings(ms: ModelSettings, opts: ArgOptions,
+                              absent: dict[str, str] | None = None) -> None:
     """A fixed or controlled argument is declared by a full option name the
     engine tree declares (its own name or an alias), so it names exactly one
     destination; an abbreviation, a --no- form or a name the tree does not
-    declare is refused rather than resolved."""
+    declare is refused rather than resolved, unless a plain-upstream variant
+    declares it absent from this engine ([absent_args], with its reason)."""
     declared = [k[5:].split(".", 1)[0] for k in sorted(ms.fixed) if k.startswith("args.")]
     declared += sorted(ms.controlled_args)
-    bad = sorted({normalize_arg_name(a) for a in declared} - opts.options)
+    names = {normalize_arg_name(a) for a in declared}
+    absent = absent or {}
+    stale = sorted(set(absent) & opts.options)
+    if stale:
+        raise Refusal(f"[absent_args] {', '.join(stale)}: this engine tree declares it; drop the declaration")
+    foreign = sorted(set(absent) - names)
+    if foreign:
+        raise Refusal(f"[absent_args] {', '.join(foreign)}: not a fixed or controlled argument of this model")
+    bad = sorted(names - opts.options - set(absent))
     if bad:
         raise Refusal("model.toml: fixed and controlled arguments must be full option names of "
                       f"this engine tree; not {', '.join(bad)}")

@@ -387,6 +387,8 @@ def build(ns: argparse.Namespace, environ: dict[str, str]) -> dict:
         "dropped": res.dropped,
         "ignored": res.ignored,
         "fork_switches_absent": res.fork_absent,
+        "passthrough": res.passthrough,
+        "absent_args": res.absent_args,
         "resolved": {k: {"value": mask_resolved(k, e.value), "layer": e.layer,
                          "source": e.source, "why": e.why}
                      for k, e in res.final.entries.items()},
