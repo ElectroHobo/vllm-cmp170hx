@@ -51,12 +51,19 @@ def streams(monkeypatch):
     return SimpleNamespace(main=main, aux=aux, current=current, log=log, use=use)
 
 
-def layer():
+def layer(exl3=True):
+    """An Engram whose WKV projection is EXL3 (the auxiliary stream, which owns
+    the EXL3 scratch) or, with ``exl3=False``, an ordinary linear (a stream of
+    its own)."""
+    from vllm.sm80.kernels.exl3.quant import Exl3LinearMethod
+
     e = Engram.__new__(Engram)
     torch.nn.Module.__init__(e)
     e.use_sequence_parallel = False
     e._batch = None
     e.embed_tokens = SimpleNamespace(dp_size=1)
+    method = Exl3LinearMethod.__new__(Exl3LinearMethod) if exl3 else None
+    e.wkv = SimpleNamespace(quant_method=method)
     return e
 
 
@@ -134,6 +141,29 @@ def test_refuse_missing_aux_and_dp(monkeypatch, streams):
     monkeypatch.setattr(P, "aux_stream", lambda: None)
     with pytest.raises(ValueError, match="registered"):
         P.EarlyEngram.adopt(e)
+
+
+def test_ordinary_projection_runs_on_a_stream_of_its_own(monkeypatch, streams):
+    own = type(streams.main)("own")
+    made = []
+
+    def new_stream(device=None):
+        made.append(device)
+        return own
+
+    monkeypatch.setattr(P, "_STREAMS", {})
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "Stream", new_stream)
+    a, b = layer(exl3=False), layer(exl3=False)
+    P.EarlyEngram.adopt(a)
+    P.EarlyEngram.adopt(b)
+    # one stream per device, shared by the Engram layers, not the aux stream
+    assert a._prefetch_stream is b._prefetch_stream is own
+    assert made == [0]
+    # an EXL3 projection keeps the auxiliary stream
+    c = layer()
+    P.EarlyEngram.adopt(c)
+    assert c._prefetch_stream is streams.aux
 
 
 def test_refuse_microbatching():
