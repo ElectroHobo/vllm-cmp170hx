@@ -181,9 +181,9 @@ def greedy_cases(k: int = K) -> dict:
 
     # Every row live (a policy keeping every draft): the mask is applied but
     # adds nothing, and the step is the switch-off step.
-    state = _state(int(batch.cu_num_logits_np[-1]), num_reqs)
-    state.active = True
-    rm._STATE = state
+    every = _state(int(batch.cu_num_logits_np[-1]), num_reqs)
+    every.active = True
+    rm._STATE = every
     try:
         all_live = cap_drafts(batch.logits_indices, None)
     finally:
@@ -390,7 +390,7 @@ def test_grammar_and_mask_combine(monkeypatch):
     from vllm.sm80.spec_decode.dspark_row_mask_reject import cap_drafts
 
     state = _state(12, 2)
-    _apply_mask(state, [3, 1], K + 1)  # rows 4, 5 and 8..11 masked
+    _apply_mask(state, [3, 1], 6)  # 5-draft rows: 4, 5 and 8..11 masked
     monkeypatch.setattr(rm, "_STATE", state)
     indices = torch.tensor([0, 2, 4, 6, 8, 9], dtype=torch.int32)
     grammar = torch.tensor([False, True, False, False, False, True])

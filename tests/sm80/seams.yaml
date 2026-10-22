@@ -1550,7 +1550,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample
   why: outside batch-sharded sampling it calls self.model.compute_logits once, on the step's logits rows, before the grammar bitmask, the sampler and the rejection sampler read the logits; the fork runner (vllm/sm80/worker/graph_mem_worker.py) runs it inside target_argmax.step, and the sm_80 DeepSeek-V4.1 target's compute_logits returns the argmax rows during a greedy-only step
-  sha256: 5585f4a055cf63f8f30c423a6aa02f1ef86a5990bf94018750594e69b8aa0a32
+  sha256: 62c0bcc3433677ba37c10e65019a6cf5894f7a0d58f15643eec078961e391d9e
   signature: '(self, hidden_states: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, grammar_output: vllm.v1.core.sched.output.GrammarOutput | None) -> tuple[vllm.v1.worker.gpu.sample.output.SamplerOutput, torch.Tensor, torch.Tensor]'
 
 - id: dsv41-target-dummy-sampler-run
@@ -1573,6 +1573,7 @@ seams:
   why: a temperature-0 request needs no logits processing from these states (temperature and min-p are not applied by apply_sampling_params for it; its top-k/top-p, reset by SamplingParams, are stored as no filter, top_k = vocab_size and top_p = 1.0); target_argmax.greedy_only reads temperature.np, top_k.np, top_p.np and the sampler's needs_logits_processing this sets
   sha256: 3b14a9e897290c536b7e41f8b33217942c5b973a12ba75df670d78a0e6e72318
   signature: '(self, req_idx: int, sampling_params: vllm.sampling_params.SamplingParams) -> bool'
+
 - id: dsv41-dspark-propose-arguments
   kind: method
   target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator.propose

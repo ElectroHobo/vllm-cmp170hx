@@ -227,7 +227,8 @@ def _shard_stats_kernel(
             x = tl.load(logits_ptr + row * logits_stride + cols, mask=valid, other=0.0)
             e = tl.where(valid, tl.exp(x - m), 0.0)
             s += tl.sum(e, axis=0)
-            t += tl.sum(e * x, axis=0)
+            # A -inf column has e = 0 and adds nothing (not 0 * -inf).
+            t += tl.sum(tl.where(e > 0.0, e * x, 0.0), axis=0)
     lane = tl.arange(0, 16)
     word = lane // 4
     m_bits = m.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF

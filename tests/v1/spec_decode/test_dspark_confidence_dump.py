@@ -48,6 +48,7 @@ def _head():
 def make(monkeypatch, tmp_path):
     monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", _init_cpu)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", "")
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", str(tmp_path))
     monkeypatch.setenv("VLLM_DSPARK_CONFIDENCE_DUMP", str(tmp_path))
 
@@ -70,6 +71,7 @@ def test_flag_defaults_off_and_keeps_the_original_class(monkeypatch):
     assert FORK_ENV_VARS["VLLM_DSPARK_CONFIDENCE_DUMP"]() == ""
     monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", _init_cpu)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
+    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", "")
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", "")
     result = width_module.create_dspark_speculator(_config(), torch.device("cpu"))
     assert type(result) is upstream.DSparkSpeculator
