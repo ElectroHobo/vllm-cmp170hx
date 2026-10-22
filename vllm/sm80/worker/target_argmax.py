@@ -211,7 +211,7 @@ def argmax_rows(model, hidden_states: torch.Tensor) -> torch.Tensor:
     slots = shard_argmax.chunk_slots(cols, col_start, rank, tp_size, chunks)
     if tp_size > 1:
         slots = tensor_model_parallel_all_reduce(slots)
-    return out.scatter_(1, shard_argmax.pick(slots)[:, None], 0.0)
+    return out.scatter_(1, shard_argmax.pick(slots, vocab)[:, None], 0.0)
 
 
 def warm(runner, hidden_states: torch.Tensor | None = None) -> None:

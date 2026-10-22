@@ -113,7 +113,7 @@ def _chunk_slots_kernel(
 
 
 @triton.jit
-def _pick_kernel(slots_ptr, out_ptr, SLOTS: tl.constexpr, SLOTS_P2: tl.constexpr):
+def _pick_kernel(slots_ptr, out_ptr, vocab, SLOTS: tl.constexpr, SLOTS_P2: tl.constexpr):
     row = tl.program_id(0)
     s = tl.arange(0, SLOTS_P2)
     lane = tl.arange(0, 8)
@@ -128,7 +128,12 @@ def _pick_kernel(slots_ptr, out_ptr, SLOTS: tl.constexpr, SLOTS_P2: tl.constexpr
     key = tl.where(s < SLOTS, key, -1)
     best = tl.max(key, axis=0)
     first = tl.min(tl.where(key == best, s, SLOTS_P2), axis=0)
-    tl.store(out_ptr + row, tl.sum(tl.where(s == first, index, 0), axis=0))
+    token = tl.sum(tl.where(s == first, index, 0), axis=0)
+    # Summed slots always hold a column below vocab; a CUDA-graph warmup run
+    # inside the custom all-reduce's capture context gets an unwritten buffer
+    # back (custom_all_reduce.py: torch.empty_like), so keep its token a
+    # valid embedding row.
+    tl.store(out_ptr + row, tl.minimum(tl.maximum(token, 0), vocab - 1))
 
 
 def chunk_slots(
@@ -166,9 +171,10 @@ def chunk_slots(
     return slots
 
 
-def pick(slots: torch.Tensor) -> torch.Tensor:
+def pick(slots: torch.Tensor, vocab: int) -> torch.Tensor:
     """The token of each row of summed slots ([rows, slots * LANES] BF16):
-    the index in the slot with the largest key, the lowest slot on ties."""
+    the index in the slot with the largest key, the lowest slot on ties,
+    held in 0 .. vocab - 1 (see _pick_kernel)."""
     rows = slots.shape[0]
     num_slots = slots.shape[1] // LANES
     out = torch.empty(rows, dtype=torch.int64, device=slots.device)
@@ -176,6 +182,7 @@ def pick(slots: torch.Tensor) -> torch.Tensor:
         _pick_kernel[(rows,)](
             slots,
             out,
+            vocab,
             SLOTS=num_slots,
             SLOTS_P2=triton.next_power_of_2(num_slots),
             num_warps=1,
@@ -252,7 +259,7 @@ def sample_sequential(speculator, num_reqs: int, head_hidden: torch.Tensor) -> N
         slots = chunk_slots(logits_i, col_start, rank, tp_size, chunks)
         if tp_size > 1:
             slots = tensor_model_parallel_all_reduce(slots)
-        draft_sampled_i = pick(slots)
+        draft_sampled_i = pick(slots, model.logits_processor.org_vocab_size)
         s.draft_tokens[:num_reqs, i] = draft_sampled_i
         prev = draft_sampled_i
 

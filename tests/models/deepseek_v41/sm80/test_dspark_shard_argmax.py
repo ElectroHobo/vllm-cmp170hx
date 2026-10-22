@@ -66,7 +66,7 @@ def sharded_pick(full: torch.Tensor, tp: int, width: int) -> tuple[torch.Tensor,
         others = torch.cat([own[:, :rank], own[:, rank + 1 :]], dim=1)
         assert not others.float().any()
         per_rank.append(slots)
-    return sa.pick(_sum_slots(per_rank)), sa.pick(_sum_slots_bf16(per_rank))
+    return sa.pick(_sum_slots(per_rank), vocab), sa.pick(_sum_slots_bf16(per_rank), vocab)
 
 
 def _f32(bits: int) -> float:
@@ -125,7 +125,7 @@ def kernel_cases() -> dict:
     assert os.environ.get("TRITON_INTERPRET") == "1"
     from vllm.sm80.spec_decode import shard_argmax as sa
 
-    out = {"named": {}, "random": [], "empty_rank": None, "served": None}
+    out = {"named": {}, "random": [], "empty_rank": None, "served": None, "unwritten": None}
     served_block = sa.BLOCK
     sa.BLOCK = 8
     tp, width, vocab = 4, 25, 97  # 3 chunks per rank, last rank 22 columns
@@ -158,6 +158,16 @@ def kernel_cases() -> dict:
     rows[2] = -float("inf")
     got = sharded_pick(rows, tp, width)
     out["served"] = [g_.tolist() for g_ in got] + [torch.argmax(rows, -1).tolist()]
+    # Unwritten slots (a CUDA-graph warmup's all-reduce output): any bytes,
+    # NaN and infinities included, pick a token below the vocabulary.
+    chunks = -(-width // sa.BLOCK)
+    lanes = torch.randint(0, 256, (6, tp * chunks * sa.LANES), generator=g).float()
+    lanes[1] = float("nan")
+    lanes[2] = float("inf")
+    lanes[3] = -float("inf")
+    lanes[4] = 3.0e38
+    lanes[5] = 255.0
+    out["unwritten"] = sa.pick(lanes.to(torch.bfloat16), vocab).tolist()
     return out
 
 
@@ -307,6 +317,12 @@ def test_served_shape(kernels):
     assert want == [4095, 2 * 32320 + 4096 * 3, 0]
 
 
+def test_unwritten_slots_pick_a_vocabulary_token(kernels):
+    assert len(kernels["unwritten"]) == 6
+    assert all(0 <= t < 129280 for t in kernels["unwritten"])
+    assert kernels["unwritten"][5] == 129280 - 1  # every index byte 255
+
+
 def test_sampling_matches_the_gathered_path_on_four_ranks(tmp_path):
     ranks = _interpret(
         "import json; from tests.models.deepseek_v41.sm80.test_dspark_shard_argmax "
@@ -393,5 +409,5 @@ def test_kernels_compile_for_sm80():
           {"logits_ptr": "*fp32", "logits_stride": "i32", "slots_ptr": "*bf16",
            "n_cols": "i32", "col_start": "i32", "rank": "i32"},
           dict(TP=tp, TP_P2=4, CHUNKS=chunks, BLOCK=sa.BLOCK), 8)
-    build(sa._pick_kernel, {"slots_ptr": "*bf16", "out_ptr": "*i64"},
+    build(sa._pick_kernel, {"slots_ptr": "*bf16", "out_ptr": "*i64", "vocab": "i32"},
           dict(SLOTS=tp * chunks, SLOTS_P2=32), 1)
