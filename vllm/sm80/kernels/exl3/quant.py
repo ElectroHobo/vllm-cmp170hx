@@ -1468,7 +1468,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             bits_x2,
             self.swiglu_limit,
         )
-        decode_len = max_decode_query_len(vllm_config)
+        decode_len = _prefill_v2_decode_len(vllm_config)
         logger.info_once(
             "EXL3 MoE prefill v2 tensor-core path active "
             "(VLLM_DEEPSEEK_V41_MOE_PREFILL_TC): routed experts (bits_x2 6 or 4) "
@@ -1772,34 +1772,30 @@ def _prefill_layout_closed_reason(vllm_config) -> str | None:
 
 def _prefill_v2_layout_closed_reason(vllm_config) -> str | None:
     """Why moe_out_prefill_v2 must not serve this engine, or None: it is
-    validated at tensor parallel size 4 without pipeline parallelism, and a
-    drafter whose decode steps the prefill-step rule (step_phase) cannot read
-    (parallel drafting slots, DFlash, DSpark) is admitted only when no forward
-    pass of a decode step can carry MOE_PREFILL_MIN_ROWS rows
-    (step_phase.max_decode_step_rows): calls of fewer rows never take the
-    operator, so such decode steps never reach it."""
-    from vllm.sm80.kernels.exl3.ops import MOE_PREFILL_MIN_ROWS
-    from vllm.sm80.kernels.exl3.step_phase import max_decode_step_rows
-
+    validated at tensor parallel size 4 without pipeline parallelism."""
     parallel = vllm_config.parallel_config
     layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
     if layout != (4, 1):
         return f"(tensor, pipeline) parallel size {layout}, not (4, 1)"
-    spec = vllm_config.speculative_config
-    if (
-        spec is not None
-        and (
-            getattr(spec, "parallel_drafting", False)
-            or getattr(spec, "method", None) in ("dflash", "dspark")
-        )
-        and (rows := max_decode_step_rows(vllm_config)) >= MOE_PREFILL_MIN_ROWS
-    ):
-        return (
-            f"speculative method {spec.method} drafts with parallel slots and "
-            f"a decode step's forward pass can carry {rows} rows, at least "
-            f"the {MOE_PREFILL_MIN_ROWS} from which calls take the operator"
-        )
     return None
+
+
+def _prefill_v2_decode_len(vllm_config) -> int:
+    """The most tokens one request has in any forward pass of a decode step,
+    above which the prefill-step rule (step_phase) calls a step a prefill
+    step: 1 + k for the target, and for a drafter with parallel drafting slots
+    (DFlash, DSpark) its decode pass, 1 + k verified tokens plus k slots
+    (the per-request bound of step_phase.max_decode_step_rows)."""
+    from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len
+
+    decode_len = max_decode_query_len(vllm_config)
+    spec = vllm_config.speculative_config
+    if spec is not None and (
+        getattr(spec, "parallel_drafting", False)
+        or getattr(spec, "method", None) in ("dflash", "dspark")
+    ):
+        return 2 * decode_len - 1
+    return decode_len
 
 
 def _unaligned_trellis_reason(pointers) -> str | None:

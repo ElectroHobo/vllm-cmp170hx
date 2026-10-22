@@ -1073,8 +1073,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # calls of 65..2048 rows in prefill steps on the tensor cores
     # (csrc/exl3/moe_prefill_v2.cu, ops.moe_out_prefill_v2) at tensor parallel
     # size 4, with every routed matrix of a layer at bits_x2 6 or 4, codebook 2,
-    # and 16-byte-aligned trellis bases, when no decode step of a parallel
-    # drafter can carry 65 rows (vllm/sm80/kernels/exl3/quant.py). Other calls
+    # and 16-byte-aligned trellis bases; with a parallel drafter (DFlash,
+    # DSpark) a step counts as a prefill step only when some request has more
+    # than 1 + 2k tokens, its decode pass's widest query
+    # (vllm/sm80/kernels/exl3/quant.py _prefill_v2_decode_len). Other calls
     # and every call of a decode step keep their kernels. Results differ from
     # moe_out in the last bits. Default OFF: unset, prefill calls take moe_out.
     # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.

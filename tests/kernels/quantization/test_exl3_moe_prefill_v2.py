@@ -225,22 +225,9 @@ def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
     [
         (_config(tp=2), "(2, 1), not (4, 1)"),
         (_config(pp=2), "(4, 2), not (4, 1)"),
-        # 8 requests x (1 + 2 x 5) = 88 rows in a DSpark decode step.
-        (_config(spec=_dspark(5), k=5), "can carry 88 rows"),
-        (
-            _config(
-                spec=SimpleNamespace(
-                    method="dflash", parallel_drafting=True, num_speculative_tokens=8
-                ),
-                k=8,
-            ),
-            "dflash drafts with parallel slots",
-        ),
     ],
 )
-def test_gate_closes_outside_the_validated_layout_and_drafters(
-    monkeypatch, config, words
-):
+def test_gate_closes_outside_the_validated_layout(monkeypatch, config, words):
     from vllm.sm80.kernels.exl3 import quant
 
     warmed, required = [], []
@@ -255,23 +242,34 @@ def test_gate_closes_outside_the_validated_layout_and_drafters(
 
 
 @pytest.mark.parametrize(
-    "config",
+    "config, decode_len",
     [
-        _config(),
-        _config(spec=SimpleNamespace(method="mtp", num_speculative_tokens=3)),
-        # 8 requests x (1 + 2 x 3) = 56 rows: no DSpark decode step reaches 65.
-        _config(spec=_dspark(3)),
-        # 3 requests at k = 5 (33 rows) and k = 5 at batch 1..3 only.
-        _config(spec=_dspark(5), k=5, max_num_seqs=3),
+        (_config(), 4),
+        (_config(spec=SimpleNamespace(method="mtp", num_speculative_tokens=3)), 4),
+        # A DSpark decode pass carries 1 + k verified tokens and k parallel
+        # slots per request, so a step is a prefill step above 1 + 2k tokens.
+        (_config(spec=_dspark(3)), 7),
+        (_config(spec=_dspark(5), k=5, max_num_seqs=3), 11),
+        # 8 requests x (1 + 2 x 5) = 88 rows: open, by the per-request bound.
+        (_config(spec=_dspark(5), k=5), 11),
+        (
+            _config(
+                spec=SimpleNamespace(
+                    method="dflash", parallel_drafting=True, num_speculative_tokens=8
+                ),
+                k=8,
+            ),
+            17,
+        ),
     ],
-    ids=["no drafter", "mtp", "dspark k3 c8", "dspark k5 c3"],
+    ids=["no drafter", "mtp", "dspark k3 c8", "dspark k5 c3", "dspark k5 c8", "dflash"],
 )
-def test_gate_opens_for_the_served_layout_and_bounded_drafters(monkeypatch, config):
+def test_gate_opens_for_the_served_layout_and_parallel_drafters(
+    monkeypatch, config, decode_len
+):
     warmed, required = [], []
     method, layer = _method(monkeypatch, warmed, required, config=config)
-    bits, decode_len, workspace = method._moe_prefill_v2(layer, _meta(6), 2048, 7)
-    assert (bits, workspace) == (6, 2048000)
-    assert decode_len == 1 + config.num_speculative_tokens
+    assert method._moe_prefill_v2(layer, _meta(6), 2048, 7) == (6, decode_len, 2048000)
     assert len(warmed) == len(required) == 1
 
 
