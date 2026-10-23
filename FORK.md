@@ -361,7 +361,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_v2_fold.py` | 1,029 |
 | `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 594 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
-| `tests/kernels/quantization/test_exl3_moe_v2_switches.py` | 411 |
+| `tests/kernels/quantization/test_exl3_moe_v2_switches.py` | 415 |
 | `tests/kernels/quantization/test_exl3_placement.py` | 202 |
 | `tests/kernels/quantization/test_exl3_replicas.py` | 409 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 147 |
@@ -607,7 +607,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **283 files** | **120,206** |
+| **283 files** | **120,210** |
 
 #### `tools/`
 
