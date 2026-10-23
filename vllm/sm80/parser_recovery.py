@@ -21,10 +21,10 @@ text when no candidate is held. Special tokens the engine drops never enter
 the held text. The engine records the tool index of every committed
 candidate in ``recovered_tool_indexes``. In ``skip_tool_parsing`` mode (the
 reasoning pass of a delegating parser) no candidate is held: tool parsing
-belongs to the tool pass. Inside a Markdown code fence of the content (a line
-opening with three backticks or tildes, until the next such line) no
+belongs to the tool pass. Inside a Markdown code fence of the content (from a
+line opening with three or more backticks or tildes to its closing line) no
 candidate is held either: an opener there is a quoted example, so it stays
-text.
+content text.
 """
 
 from __future__ import annotations
@@ -39,8 +39,6 @@ from vllm.parser.engine.token_id_scanner import DROP_TERMINAL
 
 # Names are compact; a longer or multi-line "name" is prose quoting an opener.
 _NAME_LIMIT = 256
-# Markers of a Markdown code fence line (after up to three spaces).
-_FENCES = ("```", "~~~")
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +132,10 @@ class RecoveringParserEngine(StreamingParserEngine):
             if transition.held_only:
                 return self._emit_for_state(value, token_count)
             if transition.provisional:
-                if self._in_fence:
+                # Only content shows a fence; in the states after a DSML
+                # wrapper, text is not emitted, so the opener must still open
+                # a candidate there.
+                if self._fence is not None and self.state == ParserState.CONTENT:
                     return self._emit_for_state(value, token_count)
                 if not self.skip_tool_parsing:
                     return self._begin_hold(transition, value, token_count)
@@ -158,9 +159,10 @@ class RecoveringParserEngine(StreamingParserEngine):
     # ── Code fences ─────────────────────────────────────────────────
 
     def _clear_fences(self) -> None:
-        self._in_fence = False
-        # The current content line up to its first non-space characters, and
-        # whether that line has been classified (fence line or not).
+        # The open fence as (character, length of its run), or None.
+        self._fence: tuple[str, int] | None = None
+        # The current content line while it may still be a fence line, and
+        # whether that line has been classified.
         self._fence_line = ""
         self._fence_line_done = False
 
@@ -170,22 +172,41 @@ class RecoveringParserEngine(StreamingParserEngine):
             return
         for i, part in enumerate(text.split("\n")):
             if i:
+                if not self._fence_line_done:
+                    self._classify_fence_line(line_ended=True)
                 self._fence_line, self._fence_line_done = "", False
             if self._fence_line_done or not part:
                 continue
             self._fence_line += part
-            head = self._fence_line.lstrip(" ")
-            if len(self._fence_line) - len(head) > 3:
-                self._fence_line_done = True
-            elif len(head) >= 3:
-                if head.startswith(_FENCES):
-                    self._in_fence = not self._in_fence
-                self._fence_line_done = True
-            elif head and not any(fence.startswith(head) for fence in _FENCES):
-                self._fence_line_done = True
-            else:
-                # Too short to tell yet: keep only what can still decide it.
-                self._fence_line = self._fence_line[:8]
+            self._classify_fence_line(line_ended=False)
+
+    def _classify_fence_line(self, line_ended: bool) -> None:
+        """Markdown fences: an opening line has a run of three or more
+        backticks or tildes after up to three spaces (an info string may
+        follow); its closing line has a run of the same character at least as
+        long and nothing else. A line is classified as soon as it can be."""
+        line = self._fence_line
+        head = line.lstrip(" ")
+        if len(line) - len(head) > 3 or (head and head[0] not in "`~"):
+            self._fence_line_done = True
+            return
+        if not head:
+            return
+        char = head[0]
+        run = len(head) - len(head.lstrip(char))
+        rest = head[run:]
+        if not rest and not line_ended:
+            return  # the run may go on
+        if run < 3:
+            self._fence_line_done = True
+        elif self._fence is None:
+            self._fence = (char, run)
+            self._fence_line_done = True
+        elif char != self._fence[0] or run < self._fence[1] or rest.strip():
+            self._fence_line_done = True
+        elif line_ended:
+            self._fence = None
+            self._fence_line_done = True
 
     # ── Held candidate ──────────────────────────────────────────────
 

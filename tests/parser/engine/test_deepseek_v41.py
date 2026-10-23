@@ -835,3 +835,64 @@ def test_recovered_value_ends_at_its_own_closer():
         "path": "a.xml",
         "content": "<x></function_calls></x>",
     }
+
+
+def _calls_and_content(text, chunk_size, controls=None):
+    controls = controls or {"thinking": False}
+    if chunk_size is None:
+        _, content, calls = _parse(text, controls)
+        return [call.name for call in calls or []], content
+    _, output = _stream_calls(text, _WEATHER_TOOLS, chunk_size)
+    return [call["name"] for call in output.tool_calls], output.content
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_fence_before_a_wrapper_does_not_lose_the_call(chunk_size):
+    """After a DSML wrapper opens (here its near-miss spelling) no text is
+    emitted, so an open fence must not stop the call inside it from being
+    recovered: the call is not dropped."""
+    text = (
+        "Calling:\n```xml\n<｜DSML｜calls>\n<invoke name=\"get_weather\">\n"
+        '<parameter name="city">Seoul</parameter>\n</invoke>\n</｜DSML｜calls>'
+    )
+    calls, _ = _calls_and_content(text, chunk_size)
+    assert calls == ["get_weather"]
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_mixed_fence_characters_nest(chunk_size):
+    """A backtick line inside a tilde fence neither closes nor reopens it."""
+    text = (
+        "Example:\n~~~~\n```\n" + _XML_WEATHER.split("\n", 1)[1] + "\n```\n~~~~\nAfter."
+    )
+    calls, content = _calls_and_content(text, chunk_size)
+    assert not calls
+    assert content == text
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_shorter_or_info_string_line_does_not_close_a_fence(chunk_size):
+    text = "Example:\n````\n```x\n```\n" + _XML_WEATHER.split("\n", 1)[1] + "\n````\nAfter."
+    calls, content = _calls_and_content(text, chunk_size)
+    assert not calls
+    assert content == text
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_four_space_indented_backticks_are_not_a_fence(chunk_size):
+    text = "Example:\n    ```\n" + _XML_WEATHER
+    calls, _ = _calls_and_content(text, chunk_size)
+    assert calls == ["get_weather"]
+
+
+def test_fence_in_thinking_does_not_stop_recovery_in_the_answer():
+    text = "Plan: ```\nstill thinking</think>" + _XML_WEATHER
+    tokenizer, tokens = tokenizer_for(text, False)
+    parser = parser_for(tokenizer, {"thinking": True})
+    _, _, calls = parser.parse(
+        text,
+        _test_request(tools=_WEATHER_TOOLS),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    assert [call.name for call in calls] == ["get_weather"]
