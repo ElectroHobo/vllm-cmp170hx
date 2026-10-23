@@ -21,7 +21,10 @@ text when no candidate is held. Special tokens the engine drops never enter
 the held text. The engine records the tool index of every committed
 candidate in ``recovered_tool_indexes``. In ``skip_tool_parsing`` mode (the
 reasoning pass of a delegating parser) no candidate is held: tool parsing
-belongs to the tool pass.
+belongs to the tool pass. Inside a Markdown code fence of the content (a line
+opening with three backticks or tildes, until the next such line) no
+candidate is held either: an opener there is a quoted example, so it stays
+text.
 """
 
 from __future__ import annotations
@@ -36,6 +39,8 @@ from vllm.parser.engine.token_id_scanner import DROP_TERMINAL
 
 # Names are compact; a longer or multi-line "name" is prose quoting an opener.
 _NAME_LIMIT = 256
+# Markers of a Markdown code fence line (after up to three spaces).
+_FENCES = ("```", "~~~")
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,12 +104,14 @@ class RecoveringParserEngine(StreamingParserEngine):
         engine.shape_check = shape_check
         engine.recovered_tool_indexes = set()
         engine._clear_hold()
+        engine._clear_fences()
         return engine
 
     def reset(self, initial_state: ParserState | None = None) -> None:
         super().reset(initial_state)
         self.recovered_tool_indexes = set()
         self._clear_hold()
+        self._clear_fences()
 
     def finish(self) -> list[SemanticEvent]:
         if not self._held:
@@ -126,12 +133,16 @@ class RecoveringParserEngine(StreamingParserEngine):
         if isinstance(transition, RecoveryTransition):
             if transition.held_only:
                 return self._emit_for_state(value, token_count)
-            if transition.provisional and not self.skip_tool_parsing:
-                return self._begin_hold(transition, value, token_count)
+            if transition.provisional:
+                if self._in_fence:
+                    return self._emit_for_state(value, token_count)
+                if not self.skip_tool_parsing:
+                    return self._begin_hold(transition, value, token_count)
         return super()._on_terminal(terminal, value, token_count)
 
     def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
         if not self._held:
+            self._track_fences(text)
             return super()._emit_for_state(text, token_count)
         self._hold_raw += text
         self._hold_token_count += token_count
@@ -143,6 +154,38 @@ class RecoveringParserEngine(StreamingParserEngine):
             return self._abort_hold()
         self._hold_events.extend(super()._emit_for_state(text, token_count))
         return []
+
+    # ── Code fences ─────────────────────────────────────────────────
+
+    def _clear_fences(self) -> None:
+        self._in_fence = False
+        # The current content line up to its first non-space characters, and
+        # whether that line has been classified (fence line or not).
+        self._fence_line = ""
+        self._fence_line_done = False
+
+    def _track_fences(self, text: str) -> None:
+        """Follow fence lines through the content text as it is emitted."""
+        if self.state != ParserState.CONTENT:
+            return
+        for i, part in enumerate(text.split("\n")):
+            if i:
+                self._fence_line, self._fence_line_done = "", False
+            if self._fence_line_done or not part:
+                continue
+            self._fence_line += part
+            head = self._fence_line.lstrip(" ")
+            if len(self._fence_line) - len(head) > 3:
+                self._fence_line_done = True
+            elif len(head) >= 3:
+                if head.startswith(_FENCES):
+                    self._in_fence = not self._in_fence
+                self._fence_line_done = True
+            elif head and not any(fence.startswith(head) for fence in _FENCES):
+                self._fence_line_done = True
+            else:
+                # Too short to tell yet: keep only what can still decide it.
+                self._fence_line = self._fence_line[:8]
 
     # ── Held candidate ──────────────────────────────────────────────
 
@@ -249,4 +292,5 @@ class RecoveringParserEngine(StreamingParserEngine):
         self.tool_index = self._hold_prior_tool_index
         self._reset_args_state()
         self._clear_hold()
+        self._track_fences(raw)
         return super()._emit_for_state(raw, held_tokens)

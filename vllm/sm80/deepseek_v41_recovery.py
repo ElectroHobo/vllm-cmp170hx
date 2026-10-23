@@ -227,11 +227,18 @@ def _heal_params(raw_args: str, props: dict, required: list) -> str:
 
     for m in opens:
         start = m.end()
-        ends = [s for s in close_starts if s >= start]
-        ends += [s for s in open_starts if s > m.start()]
-        if call_close := _CALL_CLOSE.search(raw_args, start):
-            ends.append(call_close.start())
-        end = min(ends) if ends else len(raw_args)
+        # A value ends at its own closer when one comes before the next
+        # parameter opens, even past call-closer text inside the value (a
+        # value may quote markup); otherwise at the next opener or call closer.
+        close = next((s for s in close_starts if s >= start), None)
+        next_open = next((s for s in open_starts if s > m.start()), None)
+        if close is not None and (next_open is None or close < next_open):
+            end = close
+        else:
+            ends = [] if next_open is None else [next_open]
+            if call_close := _CALL_CLOSE.search(raw_args, start):
+                ends.append(call_close.start())
+            end = min(ends) if ends else len(raw_args)
         params[m.group(1)] = _healed_value(
             m.group(1), m.group(2), raw_args[start:end], props
         )

@@ -772,3 +772,66 @@ def test_headless_fragment_missing_a_required_parameter_stays_text(chunk_size):
         content, calls = output.content, output.tool_calls
     assert not calls
     assert content == text
+
+
+_FENCED_EXAMPLES = [
+    # A plain-XML call quoted in a fenced example, then more prose.
+    'Call it like this:\n```xml\n<invoke name="get_weather">\n'
+    '<parameter name="city">Seoul</parameter>\n</invoke>\n```\nThen read the reply.',
+    # A headless block in a tilde fence, indented fence line.
+    'Example:\n   ~~~\n<parameter name="city">Seoul</parameter>\n</invoke>\n   ~~~\nDone.',
+]
+
+
+@pytest.mark.parametrize("text", _FENCED_EXAMPLES)
+@pytest.mark.parametrize("chunk_size", [None, 1, 2, 7, 10000])
+def test_fenced_example_is_not_recovered_as_a_call(text, chunk_size):
+    """An opener inside a code fence is a quoted example: it stays content and
+    the text after the fence is kept."""
+    if chunk_size is None:
+        _, content, calls = _parse(text, {"thinking": False})
+    else:
+        _, output = _stream_calls(text, _WEATHER_TOOLS, chunk_size)
+        content, calls = output.content, output.tool_calls
+    assert not calls
+    assert content == text
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_call_after_a_closed_fence_is_recovered(chunk_size):
+    """A fence that has closed again does not stop recovery after it."""
+    text = "Example:\n```\nsome code\n```\n" + _XML_WEATHER
+    if chunk_size is None:
+        _, content, calls = _parse(text, {"thinking": False})
+        calls = [(call.name, call.arguments) for call in calls]
+    else:
+        _, output = _stream_calls(text, _WEATHER_TOOLS, chunk_size)
+        content = output.content
+        calls = [(call["name"], call["arguments"]) for call in output.tool_calls]
+    assert [(name, json.loads(args)) for name, args in calls] == [
+        ("get_weather", {"city": "Seoul"})
+    ]
+    assert content.strip() == "Example:\n```\nsome code\n```\nChecking."
+
+
+def test_inline_backticks_do_not_open_a_fence():
+    """Backticks inside a line are not a fence line: recovery still applies."""
+    text = "Use ```x``` here.\n" + _XML_WEATHER
+    _, content, calls = _parse(text, {"thinking": False})
+    assert [call.name for call in calls] == ["get_weather"]
+
+
+def test_recovered_value_ends_at_its_own_closer():
+    """A recovered parameter quoting a call closer keeps the text up to its own
+    closing tag."""
+    text = (
+        'Writing:\n<invoke name="write">\n'
+        '<parameter name="path">a.xml</parameter>\n'
+        '<parameter name="content"><x></function_calls></x></parameter>\n</invoke>'
+    )
+    _, content, calls = _parse(text, {"thinking": False}, _WRITE_TOOLS)
+    assert [call.name for call in calls] == ["write"]
+    assert json.loads(calls[0].arguments) == {
+        "path": "a.xml",
+        "content": "<x></function_calls></x>",
+    }
