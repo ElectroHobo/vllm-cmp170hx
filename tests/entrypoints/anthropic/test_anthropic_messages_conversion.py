@@ -1453,6 +1453,58 @@ class TestDetectMergeInlineSystem:
         )
         assert mock_logger.warning_once.called is expected
 
+    @pytest.mark.parametrize("accepts_inline_system", [True, False])
+    def test_probes_own_encoder_without_jinja_template(
+        self, monkeypatch, accepts_inline_system
+    ):
+        """A renderer with its own prompt encoder and no --chat-template is
+        probed through that encoder, not treated as system-first."""
+        import vllm.entrypoints.anthropic.serving as serving_mod
+
+        mock_logger = MagicMock()
+        monkeypatch.setattr(serving_mod, "logger", mock_logger)
+        seen = []
+
+        def apply_chat_template(messages, **kwargs):
+            seen.append([m["role"] for m in messages])
+            if not accepts_inline_system and any(
+                m["role"] == "system" for m in messages[1:]
+            ):
+                raise ValueError("system message must be first")
+            return "prompt"
+
+        renderer = SimpleNamespace(
+            tokenizer=SimpleNamespace(apply_chat_template=apply_chat_template)
+        )
+        online_renderer = SimpleNamespace(
+            renderer=renderer, chat_template=None, model_config=None
+        )
+        merge = AnthropicServingMessages._should_merge_inline_system(online_renderer)
+        assert merge is (not accepts_inline_system)
+        assert seen == [["system", "user", "system", "user"]]
+        assert mock_logger.warning_once.called is merge
+
+    @pytest.mark.parametrize(
+        ("template", "expected"),
+        [(PERMISSIVE_TEMPLATE, False), (Q35_TEMPLATE, True), (None, True)],
+    )
+    def test_own_encoder_with_cli_template_or_no_tokenizer(self, template, expected):
+        """A --chat-template given to a non-HF renderer is what gets probed;
+        without a tokenizer the template probe (or its default) decides."""
+        encoder = MagicMock(side_effect=AssertionError("encoder must not be probed"))
+        for tokenizer in (SimpleNamespace(apply_chat_template=encoder), None):
+            if tokenizer is not None and template is None:
+                continue
+            online_renderer = SimpleNamespace(
+                renderer=SimpleNamespace(tokenizer=tokenizer),
+                chat_template=template,
+                model_config=None,
+            )
+            assert (
+                AnthropicServingMessages._should_merge_inline_system(online_renderer)
+                is expected
+            )
+
 
 # ======================================================================
 # Full (non-streaming) response conversion: messages_full_converter
