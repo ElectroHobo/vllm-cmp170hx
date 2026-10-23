@@ -159,7 +159,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
 | `vllm/sm80/distributed/step_errors.py` | 166 |
-| `vllm/sm80/envs.py` | 1,659 |
+| `vllm/sm80/envs.py` | 1,671 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -219,7 +219,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 231 |
-| **76 files** | **22,008** |
+| **76 files** | **22,020** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -575,7 +575,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/attention/test_kpool_tail_padding_invariant.py` | 117 |
 | `tests/v1/attention/test_sm80_triton_mla_sparse_decode.py` | 76 |
 | `tests/v1/core/test_dflash_boundary_cache.py` | 478 |
-| `tests/v1/core/test_fair_prefill.py` | 689 |
+| `tests/v1/core/test_fair_prefill.py` | 938 |
 | `tests/v1/core/test_mamba_decode_progress.py` | 101 |
 | `tests/v1/core/test_mamba_inflight_states.py` | 291 |
 | `tests/v1/core/test_pp_spread_decodes.py` | 79 |
@@ -607,7 +607,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **283 files** | **120,210** |
+| **283 files** | **120,459** |
 
 #### `tools/`
 
@@ -689,7 +689,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/core/kv_cache_manager.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/core/kv_cache_planning.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/core/kv_cache_utils.py` | modified | 13 | 19 | 6 |
-| `vllm/v1/core/sched/scheduler.py` | modified | 457 | 15 | 46 |
+| `vllm/v1/core/sched/scheduler.py` | modified | 515 | 15 | 46 |
 | `vllm/v1/executor/multiproc_executor.py` | modified | 3 | 2 | 3 |
 | `vllm/v1/kv_cache_interface.py` | modified | 70 | 1 | 5 |
 | `vllm/v1/outputs.py` | modified | 6 | 0 | 2 |
@@ -710,7 +710,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu_model_runner.py` | modified | 7 | 0 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **82 files** | | **3,656** | **255** | **526** |
+| **82 files** | | **3,714** | **255** | **526** |
 
 ### Tests, docs and .github
 
@@ -749,9 +749,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 82 | 3,656 | 255 | 526 |
+| Product code | 82 | 3,714 | 255 | 526 |
 | Tests, docs and .github | 27 | 1,446 | 551 | 89 |
-| All | 109 | 5,102 | 806 | 615 |
+| All | 109 | 5,160 | 806 | 615 |
 
 ## 3. Fork environment variables
 
@@ -846,6 +846,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_EXL3_PLE_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_EXL3_PLE_READ_RETRIES` | `int` | `3` | `'3'` |
 | `VLLM_EXL3_PLE_TIMING` | `bool` | `False` | `'0'` |
+| `VLLM_FAIR_PREFILL_SHORT_BYPASS` | `bool` | `False` | `'0'` |
 | `VLLM_FLA_AUTOTUNE_SKIP_SPILLING` | `bool` | `False` | `'0'` |
 | `VLLM_FLA_PIN_AUTOTUNE` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_DECODE_IDX_GLUE_PARTS` | `str` | `'weights,glue,fwht,cache,moesum'` | `'weights,glue,fwht,cache,moesum'` |
@@ -911,7 +912,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **150 variables** | | | |
+| **151 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -935,11 +936,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 221 |
-| Fork-added product lines | 73,355 |
+| Fork-added product lines | 73,367 |
 | Patched upstream files | 109 |
-| Patched upstream lines | +5,102 / -806 |
+| Patched upstream lines | +5,160 / -806 |
 | Patched upstream product files | 82 |
-| Patched upstream product lines | +3,656 / -255 |
-| Product lines added (new files and patches) | 77,011 |
-| Fork environment variables (flags) | 150 |
+| Patched upstream product lines | +3,714 / -255 |
+| Product lines added (new files and patches) | 77,081 |
+| Fork environment variables (flags) | 151 |
 | Unreferenced fork definitions | 7 (59 lines) |
