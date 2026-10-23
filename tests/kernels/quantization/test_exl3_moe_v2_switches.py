@@ -185,12 +185,16 @@ def test_unchunked_prefill_warmup_adds_the_long_call(monkeypatch):
                         lambda x, *args, **kwargs: rows.append(x.shape[0]))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None, raising=False)
     ptrs = torch.zeros(h5120.LOCAL, 3, 3, dtype=torch.int64)
+    # The layer's stored formats: the warm-up checks them on the host first.
+    meta = torch.tensor(
+        [exl3_ops.moe_v2_expert_meta(h5120.HIDDEN, h5120.INTERMEDIATE, 6)] * h5120.LOCAL
+    )
     for switch in (False, True):
         monkeypatch.setattr(exl3_ops, "TRY_MOE_PREFILL", switch)
         monkeypatch.setattr(exl3_ops, "_moe_prefill_v2_warm", set())
         rows.clear()
         exl3_ops.warmup_moe_prefill_v2(
-            ptrs, "meta", "map", list(range(h5120.LOCAL)), h5120.HIDDEN,
+            ptrs, meta, "map", list(range(h5120.LOCAL)), h5120.HIDDEN,
             h5120.INTERMEDIATE, h5120.TOPK, 6,
         )  # fmt: skip
         assert rows == ([exl3_ops.MOE_PREFILL_MIN_ROWS, 1025] if switch
