@@ -457,6 +457,15 @@ class Scheduler(SchedulerInterface):
         self.fair_prefill = self.scheduler_config.enable_chunked_prefill and bool(
             self.prefill_chunk_with_decodes or self.max_num_partial_prefills
         )
+        # VLLM_FAIR_PREFILL_SHORT_BYPASS (default off): a prompt whose whole
+        # remaining prefill fits in `prefill_chunk_with_decodes` is scheduled
+        # in one step, outside the capped prefill budget and the split. Off ->
+        # `_short_prefill_bypass` is always False and nothing changes.
+        self.fair_prefill_short_bypass = (
+            self.fair_prefill
+            and self.prefill_chunk_with_decodes > 0
+            and envs.VLLM_FAIR_PREFILL_SHORT_BYPASS
+        )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -734,7 +743,14 @@ class Scheduler(SchedulerInterface):
 
         per_request = total
         if self.max_num_partial_prefills > 0:
-            num_running_prefills = sum(1 for r in self.running if r.is_prefill_chunk)
+            # Short prompts the bypass exempts do not draw on `total`, so they
+            # take no share of it.
+            num_running_prefills = sum(
+                1
+                for r in self.running
+                if r.is_prefill_chunk
+                and not self._short_prefill_bypass(r.num_tokens - r.num_computed_tokens)
+            )
             free_slots = max(
                 0,
                 self.max_num_active_reqs
@@ -746,6 +762,14 @@ class Scheduler(SchedulerInterface):
                 if self._pause_state == PauseState.UNPAUSED
                 else 0
             )
+            if self.fair_prefill_short_bypass and num_waiting:
+                # Before the prefix-cache lookup: a hit only shortens a prompt,
+                # so this can count a prompt that ends up short, never the
+                # other way round.
+                num_waiting = sum(
+                    not self._short_prefill_bypass(r.num_tokens - r.num_computed_tokens)
+                    for r in itertools.islice(self.waiting, num_waiting)
+                )
             num_prefills = min(
                 self.max_num_partial_prefills, num_running_prefills + num_waiting
             )
@@ -757,6 +781,25 @@ class Scheduler(SchedulerInterface):
         # any sane setting (the lookahead is a handful of tokens).
         floor = self.num_prefill_lookahead + 1
         return max(total, floor), max(per_request, floor)
+
+    def _short_prefill_bypass(self, num_remaining: int) -> bool:
+        """Whether a prefill with ``num_remaining`` prompt tokens left is
+        exempt from fair chunked prefill (VLLM_FAIR_PREFILL_SHORT_BYPASS).
+
+        A prompt that fits in ``prefill_chunk_with_decodes`` is scheduled
+        whole within the ordinary token budget instead of ``per_request``
+        slices, so a burst of short prompts beside a decoding stream is
+        admitted in one step rather than spread over several. It is not
+        charged to the capped prefill budget: a long prompt beside the burst
+        keeps its full share, and the burst costs one step's worth of its own
+        tokens rather than extra steps. Never on Mamba align-mode models,
+        whose chunk sizing is derived from the prefill limit.
+        """
+        return (
+            self.fair_prefill_short_bypass
+            and not self.need_mamba_block_aligned_split
+            and num_remaining <= self.prefill_chunk_with_decodes
+        )
 
     def _select_adaptive_k(self) -> tuple[int, int]:
         """Pick this step's verification width and the next drafting width.
@@ -1008,7 +1051,13 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = long_prefill_token_threshold
             # Fair chunked prefill leaves decode work outside this budget.
             req_is_prefill = request.is_prefill_chunk
-            is_prefill = self.fair_prefill and req_is_prefill
+            is_prefill = (
+                self.fair_prefill
+                and req_is_prefill
+                and not self._short_prefill_bypass(
+                    request.num_tokens - request.num_computed_tokens
+                )
+            )
             prefill_chunk_limit: int | None = None
             if is_prefill:
                 prefill_chunk_limit = min(prefill_chunk_cap, prefill_token_budget)
@@ -1144,7 +1193,13 @@ class Scheduler(SchedulerInterface):
                             token_budget += restored
                             input_budget += restored + draft_slots
                             if preempted_req.is_prefill_chunk:
-                                if self.fair_prefill:
+                                # Refund exactly what `is_prefill` charged.
+                                if self.fair_prefill and not (
+                                    self._short_prefill_bypass(
+                                        preempted_req.num_tokens
+                                        - preempted_req.num_computed_tokens
+                                    )
+                                ):
                                     prefill_token_budget += restored
                                 num_prefill_tokens -= restored
                                 num_prefill_reqs -= 1
@@ -1516,7 +1571,15 @@ class Scheduler(SchedulerInterface):
                     # already been folded into num_computed_tokens, so only the
                     # tokens actually recomputed are charged.
                     req_is_prefill = num_computed_tokens < request.num_tokens - 1
-                    is_prefill = self.fair_prefill and req_is_prefill
+                    # A short prompt the bypass exempts is neither capped nor
+                    # charged.
+                    is_prefill = (
+                        self.fair_prefill
+                        and req_is_prefill
+                        and not self._short_prefill_bypass(
+                            request.num_tokens - num_computed_tokens
+                        )
+                    )
                     if is_prefill:
                         prefill_chunk_limit = min(
                             prefill_chunk_cap, prefill_token_budget

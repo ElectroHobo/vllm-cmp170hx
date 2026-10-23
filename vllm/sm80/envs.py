@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     VLLM_THIN_GEMM_GLUON: bool = False
     VLLM_THIN_GEMM_GLUON_FORCE_M: int = 0
     VLLM_SHARED_EXPERT_REORDER: bool = False
+    VLLM_FAIR_PREFILL_SHORT_BYPASS: bool = False
     VLLM_PP_SPREAD_DECODES: bool = False
     VLLM_PP_PACKED_HOP: bool = False
     VLLM_PP_HOP_NO_METADATA: bool = False
@@ -650,6 +651,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Default OFF until it has its own A/B on the cards.
     "VLLM_SHARED_EXPERT_REORDER": lambda: bool(
         int(os.getenv("VLLM_SHARED_EXPERT_REORDER", "0"))
+    ),
+    # Fair chunked prefill (`--prefill-chunk-with-decodes CAP`): a prefill
+    # whose whole remaining prompt is at most CAP tokens is scheduled in full
+    # within the ordinary token budget, not in capped slices, and is not
+    # charged to the per-step prefill cap (long prompts keep their share). A
+    # burst of short prompts beside a decoding stream is then admitted in one
+    # step instead of several. Long prompts keep the cap. No effect without
+    # the cap or on Mamba align-mode models. Default OFF until measured on
+    # the cards.
+    "VLLM_FAIR_PREFILL_SHORT_BYPASS": lambda: bool(
+        int(os.getenv("VLLM_FAIR_PREFILL_SHORT_BYPASS", "0"))
     ),
     # Pipeline parallelism: cap each scheduling step at ceil(decoding
     # requests / pp_size) decode requests so the pp_size in-flight
