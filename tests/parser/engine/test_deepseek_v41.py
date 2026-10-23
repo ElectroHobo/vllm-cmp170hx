@@ -885,6 +885,14 @@ def test_four_space_indented_backticks_are_not_a_fence(chunk_size):
     assert calls == ["get_weather"]
 
 
+@pytest.mark.parametrize("chunk_size", [None, 1, 7, 10000])
+def test_backticks_in_the_info_string_are_inline_code_not_a_fence(chunk_size):
+    """A line opening with ```x``` is inline code: recovery still applies."""
+    text = "```x``` here\n" + _XML_WEATHER
+    calls, _ = _calls_and_content(text, chunk_size)
+    assert calls == ["get_weather"]
+
+
 def test_fence_in_thinking_does_not_stop_recovery_in_the_answer():
     text = "Plan: ```\nstill thinking</think>" + _XML_WEATHER
     tokenizer, tokens = tokenizer_for(text, False)

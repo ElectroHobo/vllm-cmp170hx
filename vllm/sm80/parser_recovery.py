@@ -183,8 +183,9 @@ class RecoveringParserEngine(StreamingParserEngine):
     def _classify_fence_line(self, line_ended: bool) -> None:
         """Markdown fences: an opening line has a run of three or more
         backticks or tildes after up to three spaces (an info string may
-        follow); its closing line has a run of the same character at least as
-        long and nothing else. A line is classified as soon as it can be."""
+        follow, without a backtick after a backtick run); its closing line has
+        a run of the same character at least as long and nothing else. A line
+        is classified as soon as it can be: a backtick opener at its end."""
         line = self._fence_line
         head = line.lstrip(" ")
         if len(line) - len(head) > 3 or (head and head[0] not in "`~"):
@@ -200,7 +201,10 @@ class RecoveringParserEngine(StreamingParserEngine):
         if run < 3:
             self._fence_line_done = True
         elif self._fence is None:
-            self._fence = (char, run)
+            if char == "`" and not line_ended:
+                return  # a backtick later in the line makes it inline code
+            if not (char == "`" and "`" in rest):
+                self._fence = (char, run)
             self._fence_line_done = True
         elif char != self._fence[0] or run < self._fence[1] or rest.strip():
             self._fence_line_done = True
