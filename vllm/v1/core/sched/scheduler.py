@@ -733,7 +733,8 @@ class Scheduler(SchedulerInterface):
         * ``per_request`` splits ``total`` evenly between up to
           ``max_num_partial_prefills`` prefill-phase requests (running chunks
           plus the waiting requests that could be admitted this step), so
-          several prompts advance together instead of one at a time.
+          several prompts advance together instead of one at a time. Prompts
+          `_short_prefill_bypass` exempts are not counted.
         """
         total = self.max_num_scheduled_tokens
         if self.prefill_chunk_with_decodes > 0 and any(
@@ -783,17 +784,11 @@ class Scheduler(SchedulerInterface):
         return max(total, floor), max(per_request, floor)
 
     def _short_prefill_bypass(self, num_remaining: int) -> bool:
-        """Whether a prefill with ``num_remaining`` prompt tokens left is
-        exempt from fair chunked prefill (VLLM_FAIR_PREFILL_SHORT_BYPASS).
-
-        A prompt that fits in ``prefill_chunk_with_decodes`` is scheduled
-        whole within the ordinary token budget instead of ``per_request``
-        slices, so a burst of short prompts beside a decoding stream is
-        admitted in one step rather than spread over several. It is not
-        charged to the capped prefill budget: a long prompt beside the burst
-        keeps its full share, and the burst costs one step's worth of its own
-        tokens rather than extra steps. Never on Mamba align-mode models,
-        whose chunk sizing is derived from the prefill limit.
+        """Whether a prefill with ``num_remaining`` tokens left is neither
+        capped nor charged to the prefill budget, so a long prompt beside a
+        short burst keeps its full share. Read per call (not folded into the
+        init flag) so align-mode Mamba, whose chunk sizing derives from the
+        prefill limit, is always excluded.
         """
         return (
             self.fair_prefill_short_bypass

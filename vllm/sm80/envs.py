@@ -655,11 +655,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Fair chunked prefill (`--prefill-chunk-with-decodes CAP`): a prefill
     # whose whole remaining prompt is at most CAP tokens is scheduled in full
     # within the ordinary token budget, not in capped slices, and is not
-    # charged to the per-step prefill cap (long prompts keep their share). A
-    # burst of short prompts beside a decoding stream is then admitted in one
-    # step instead of several. Long prompts keep the cap. No effect without
-    # the cap or on Mamba align-mode models. Default OFF until measured on
-    # the cards.
+    # charged to the per-step prefill cap or counted in the partial-prefill
+    # split (long prompts keep their share). A burst of short prompts beside a
+    # decoding stream is then admitted in one step instead of several. Long
+    # prompts keep the cap until their last <= CAP tokens. No effect without
+    # the cap or on Mamba align-mode models. Default OFF until measured.
     "VLLM_FAIR_PREFILL_SHORT_BYPASS": lambda: bool(
         int(os.getenv("VLLM_FAIR_PREFILL_SHORT_BYPASS", "0"))
     ),

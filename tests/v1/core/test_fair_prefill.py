@@ -905,15 +905,34 @@ def test_short_bypass_never_starves_decodes(monkeypatch, num_spec, max_batched):
 
 def test_short_bypass_leaves_the_mamba_aligned_split_alone(monkeypatch):
     """Align-mode Mamba sizes its chunks from the prefill limit, so the bypass
-    is inert there: the chunks are the ones the switch-off run produces."""
+    is inert there: two prompts splitting the cap, whose tails are within the
+    cap but above one share, get the chunks the switch-off run produces."""
     knobs = {"prefill_chunk_with_decodes": ODD_CAP, "max_num_partial_prefills": 2}
-    results = []
+    traces = []
     for bypass in (False, True):
         monkeypatch.setenv("VLLM_FAIR_PREFILL_SHORT_BYPASS", str(int(bypass)))
         scheduler = _mamba_scheduler(ODD_BLOCK, **knobs)
         assert scheduler.fair_prefill_short_bypass == bypass
-        results.append(_drive_long_prefill(scheduler))
-    assert results[0] == results[1]
-    steps, all_decode_steps, chunks = results[1]
-    assert max(chunks) <= ODD_CAP
-    assert all_decode_steps == steps
+        decodes = _start_decode_streams(scheduler, 3)
+        prompts = []
+        for i, num_tokens in enumerate((1000, 700)):
+            (request,) = create_requests(
+                num_requests=1,
+                num_tokens=num_tokens,
+                max_tokens=4,
+                block_size=scheduler.block_size,
+                req_ids=[f"m{i}"],
+            )
+            scheduler.add_request(request)
+            prompts.append(request)
+        trace = []
+        while any(r.is_prefill_chunk or r.num_computed_tokens == 0 for r in prompts):
+            output, prefill_tokens = _step(scheduler)
+            assert all(n > 0 for n in _decode_tokens(output, decodes))
+            assert prefill_tokens <= ODD_CAP
+            trace.append(
+                tuple(output.num_scheduled_tokens.get(r.request_id, 0) for r in prompts)
+            )
+            assert len(trace) < 100
+        traces.append(trace)
+    assert traces[0] == traces[1]
