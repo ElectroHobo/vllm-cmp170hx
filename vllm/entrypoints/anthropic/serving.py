@@ -59,9 +59,6 @@ from vllm.renderers.online_renderer import OnlineRenderer
 
 logger = init_logger(__name__)
 
-# Roles of the conversation that probes whether inline system messages render.
-_INLINE_SYSTEM_PROBE = ("system", "user", "system", "user")
-
 
 def _build_anthropic_usage(
     usage: UsageInfo | None,
@@ -244,18 +241,18 @@ class AnthropicServingMessages(OpenAIServingChat):
         """Probe the chat templates the renderer applies, not the CLI override.
 
         Both the tool and non-tool templates are checked since they may differ.
-        A renderer with its own prompt encoder and no Jinja template (e.g.
-        DeepSeek-V4.1's) is probed through that encoder.
+        A renderer with its own prompt encoder and no ``--chat-template``
+        skips the merge only when its tokenizer declares that the encoder
+        renders inline system messages in place
+        (``renders_inline_system_messages``, e.g. DeepSeek-V4.1's).
         """
         renderer = online_renderer.renderer
         tool_variants: tuple[list[dict[str, Any]] | None, ...] = (None, [])
-        if renderer.tokenizer is None:
-            merge = cls._detect_merge_inline_system(online_renderer.chat_template)
-        elif not isinstance(renderer, HfRenderer):
-            if online_renderer.chat_template is None:
-                merge = cls._detect_merge_inline_system_encoder(renderer.tokenizer)
-            else:
-                merge = cls._detect_merge_inline_system(online_renderer.chat_template)
+        if not isinstance(renderer, HfRenderer) or renderer.tokenizer is None:
+            merge = not (
+                online_renderer.chat_template is None
+                and getattr(renderer.tokenizer, "renders_inline_system_messages", False)
+            ) and cls._detect_merge_inline_system(online_renderer.chat_template)
         else:
             merge = any(
                 cls._detect_merge_inline_system(
@@ -280,24 +277,6 @@ class AnthropicServingMessages(OpenAIServingChat):
         return merge
 
     @staticmethod
-    def _detect_merge_inline_system_encoder(tokenizer: Any) -> bool:
-        """Auto-detect system-first ordering for a renderer's own encoder.
-
-        Renders the same [system, user, system, user] conversation as
-        :meth:`_detect_merge_inline_system` through the tokenizer's
-        ``apply_chat_template``; if it raises, merge.
-        """
-        try:
-            tokenizer.apply_chat_template(
-                [{"role": role, "content": "t"} for role in _INLINE_SYSTEM_PROBE],
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            return False
-        except Exception:
-            return True
-
-    @staticmethod
     def _detect_merge_inline_system(chat_template: str | None) -> bool:
         """Auto-detect whether the chat template requires system-first ordering.
 
@@ -315,7 +294,10 @@ class AnthropicServingMessages(OpenAIServingChat):
             )
             env.from_string(chat_template).render(
                 messages=[
-                    {"role": role, "content": "t"} for role in _INLINE_SYSTEM_PROBE
+                    {"role": "system", "content": "t"},
+                    {"role": "user", "content": "t"},
+                    {"role": "system", "content": "t"},
+                    {"role": "user", "content": "t"},
                 ],
                 add_generation_prompt=False,
             )

@@ -1453,57 +1453,48 @@ class TestDetectMergeInlineSystem:
         )
         assert mock_logger.warning_once.called is expected
 
-    @pytest.mark.parametrize("accepts_inline_system", [True, False])
-    def test_probes_own_encoder_without_jinja_template(
-        self, monkeypatch, accepts_inline_system
+    @pytest.mark.parametrize(
+        ("declared", "template", "expected"),
+        [
+            (True, None, False),  # DeepSeek-V4.1: rendered in place
+            (False, None, True),  # an encoder that does not declare it
+            (True, PERMISSIVE_TEMPLATE, False),  # a CLI template is probed
+            (True, Q35_TEMPLATE, True),
+        ],
+    )
+    def test_own_encoder_merges_unless_it_declares_inline_system(
+        self, monkeypatch, declared, template, expected
     ):
-        """A renderer with its own prompt encoder and no --chat-template is
-        probed through that encoder, not treated as system-first."""
+        """A renderer with its own prompt encoder keeps inline system messages
+        in place only when its tokenizer declares the encoder renders them;
+        the encoder is never called to find out."""
         import vllm.entrypoints.anthropic.serving as serving_mod
 
         mock_logger = MagicMock()
         monkeypatch.setattr(serving_mod, "logger", mock_logger)
-        seen = []
-
-        def apply_chat_template(messages, **kwargs):
-            seen.append([m["role"] for m in messages])
-            if not accepts_inline_system and any(
-                m["role"] == "system" for m in messages[1:]
-            ):
-                raise ValueError("system message must be first")
-            return "prompt"
-
-        renderer = SimpleNamespace(
-            tokenizer=SimpleNamespace(apply_chat_template=apply_chat_template)
+        tokenizer = SimpleNamespace(
+            apply_chat_template=MagicMock(side_effect=AssertionError("not probed"))
         )
+        if declared:
+            tokenizer.renders_inline_system_messages = True
         online_renderer = SimpleNamespace(
-            renderer=renderer, chat_template=None, model_config=None
+            renderer=SimpleNamespace(tokenizer=tokenizer),
+            chat_template=template,
+            model_config=None,
         )
         merge = AnthropicServingMessages._should_merge_inline_system(online_renderer)
-        assert merge is (not accepts_inline_system)
-        assert seen == [["system", "user", "system", "user"]]
-        assert mock_logger.warning_once.called is merge
+        assert merge is expected
+        assert mock_logger.warning_once.called is expected
 
-    @pytest.mark.parametrize(
-        ("template", "expected"),
-        [(PERMISSIVE_TEMPLATE, False), (Q35_TEMPLATE, True), (None, True)],
-    )
-    def test_own_encoder_with_cli_template_or_no_tokenizer(self, template, expected):
-        """A --chat-template given to a non-HF renderer is what gets probed;
-        without a tokenizer the template probe (or its default) decides."""
-        encoder = MagicMock(side_effect=AssertionError("encoder must not be probed"))
-        for tokenizer in (SimpleNamespace(apply_chat_template=encoder), None):
-            if tokenizer is not None and template is None:
-                continue
-            online_renderer = SimpleNamespace(
-                renderer=SimpleNamespace(tokenizer=tokenizer),
-                chat_template=template,
-                model_config=None,
-            )
-            assert (
-                AnthropicServingMessages._should_merge_inline_system(online_renderer)
-                is expected
-            )
+    def test_deepseek_v41_tokenizer_declares_inline_system(self):
+        from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
+
+        class Base:
+            def get_added_vocab(self):
+                return {}
+
+        wrapped = get_deepseek_v41_tokenizer(Base())
+        assert wrapped.renders_inline_system_messages is True
 
 
 # ======================================================================
