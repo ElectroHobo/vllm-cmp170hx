@@ -147,7 +147,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/attention/__init__.py` | 2 |
 | `vllm/sm80/attention/triton_mla_sparse.py` | 386 |
 | `vllm/sm80/capture.py` | 573 |
-| `vllm/sm80/deepseek_v41_recovery.py` | 337 |
+| `vllm/sm80/deepseek_v41_recovery.py` | 344 |
 | `vllm/sm80/dev_ab.py` | 1,697 |
 | `vllm/sm80/dev_ab_batch.py` | 367 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
@@ -192,7 +192,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/layers/moe/runner.py` | 177 |
 | `vllm/sm80/layers/moe/shared_experts.py` | 134 |
 | `vllm/sm80/model_registry.py` | 78 |
-| `vllm/sm80/parser_recovery.py` | 252 |
+| `vllm/sm80/parser_recovery.py` | 321 |
 | `vllm/sm80/platform.py` | 156 |
 | `vllm/sm80/plugin.py` | 330 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
@@ -219,7 +219,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 231 |
-| **76 files** | **21,932** |
+| **76 files** | **22,008** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -639,6 +639,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/config/speculative.py` | modified | 59 | 0 | 5 |
 | `vllm/config/vllm.py` | modified | 47 | 5 | 4 |
 | `vllm/engine/arg_utils.py` | modified | 14 | 0 | 5 |
+| `vllm/entrypoints/anthropic/serving.py` | modified | 8 | 1 | 2 |
 | `vllm/entrypoints/openai/chat_completion/protocol.py` | modified | 4 | 0 | 2 |
 | `vllm/entrypoints/openai/responses/protocol.py` | modified | 3 | 0 | 3 |
 | `vllm/envs.py` | modified | 7 | 0 | 2 |
@@ -680,6 +681,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/third_party/flash_linear_attention/ops/solve_tril.py` | modified | 5 | 3 | 5 |
 | `vllm/third_party/flash_linear_attention/ops/utils.py` | modified | 38 | 9 | 9 |
 | `vllm/third_party/flash_linear_attention/ops/wy_fast.py` | modified | 3 | 1 | 3 |
+| `vllm/tokenizers/deepseek_v41.py` | modified | 4 | 0 | 1 |
 | `vllm/tokenizers/deepseek_v41_encoding.py` | modified | 8 | 0 | 3 |
 | `vllm/v1/attention/backends/mla/indexer.py` | modified | 6 | 2 | 4 |
 | `vllm/v1/attention/backends/recoverssm_metadata.py` | modified | 5 | 0 | 2 |
@@ -708,7 +710,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu_model_runner.py` | modified | 7 | 0 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **80 files** | | **3,644** | **254** | **523** |
+| **82 files** | | **3,656** | **255** | **526** |
 
 ### Tests, docs and .github
 
@@ -727,8 +729,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `docs/features/quantization/README.md` | modified | 64 | 0 | 2 |
 | `docs/features/speculative_decoding/README.md` | modified | 3 | 0 | 2 |
 | `tests/conftest.py` | modified | 9 | 0 | 3 |
+| `tests/entrypoints/anthropic/test_anthropic_messages_conversion.py` | modified | 43 | 0 | 1 |
 | `tests/models/kimi_k3/test_kda_metadata.py` | modified | 4 | 2 | 2 |
-| `tests/parser/engine/test_deepseek_v41.py` | modified | 627 | 1 | 4 |
+| `tests/parser/engine/test_deepseek_v41.py` | modified | 759 | 1 | 4 |
 | `tests/test_envs.py` | modified | 62 | 0 | 3 |
 | `tests/tokenizers_/test_deepseek_v41.py` | modified | 57 | 0 | 1 |
 | `tests/v1/core/test_kv_cache_utils.py` | modified | 2 | 0 | 2 |
@@ -740,15 +743,15 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 9 | 1 | 5 |
 | `tests/v1/worker/test_grammar_invalid_drafts.py` | modified | 6 | 0 | 2 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **26 files** | | **1,271** | **551** | **88** |
+| **27 files** | | **1,446** | **551** | **89** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 80 | 3,644 | 254 | 523 |
-| Tests, docs and .github | 26 | 1,271 | 551 | 88 |
-| All | 106 | 4,915 | 805 | 611 |
+| Product code | 82 | 3,656 | 255 | 526 |
+| Tests, docs and .github | 27 | 1,446 | 551 | 89 |
+| All | 109 | 5,102 | 806 | 615 |
 
 ## 3. Fork environment variables
 
@@ -932,11 +935,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 221 |
-| Fork-added product lines | 73,279 |
-| Patched upstream files | 106 |
-| Patched upstream lines | +4,915 / -805 |
-| Patched upstream product files | 80 |
-| Patched upstream product lines | +3,644 / -254 |
-| Product lines added (new files and patches) | 76,923 |
+| Fork-added product lines | 73,355 |
+| Patched upstream files | 109 |
+| Patched upstream lines | +5,102 / -806 |
+| Patched upstream product files | 82 |
+| Patched upstream product lines | +3,656 / -255 |
+| Product lines added (new files and patches) | 77,011 |
 | Fork environment variables (flags) | 150 |
 | Unreferenced fork definitions | 7 (59 lines) |
